@@ -201,6 +201,7 @@ impl FaceApp {
                 self.state.on_observation(&o, now);
             }
         }
+        self.state.tick(now);
         if self.state.attends != self.attends_seen {
             self.attends_seen = self.state.attends;
             if let Some(attend) = self.state.attend {

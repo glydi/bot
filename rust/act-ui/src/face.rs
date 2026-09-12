@@ -1117,9 +1117,14 @@ const FLAP_WANDER: f32 = 0.8;
 /// change, and the width less than the height.
 fn talk_mouth(open: f32, t: f32) -> Lips {
     let open = open.clamp(0.0, 1.0);
+    // No synthetic flap: the level arrives 50 times a second from the
+    // audio actually playing, so the syllables are already in it. A
+    // 6 Hz oscillation on top ran free of the voice -- the mouth moved
+    // when the sound did not, which is what "not matching" looks like.
+    // (Kept at a hair so a held vowel is not frozen.)
     let phase = TAU * (FLAP_HZ * t + FLAP_WANDER * (TAU * 0.23 * t).sin() / TAU);
     let flap = 0.5 + 0.5 * phase.sin();
-    let h = open * (1.0 - 0.45 * open * (1.0 - flap));
+    let h = open * (1.0 - 0.06 * open * (1.0 - flap));
     Lips {
         centre: vec2(0.5, 0.688),
         half_w: 0.054 + 0.024 * h,
@@ -1712,8 +1717,10 @@ mod tests {
             let min = hs.iter().copied().fold(1.0, f32::min);
             (max - min) / max
         };
-        assert!(swing(1.0) > 0.35, "{}", swing(1.0));
-        assert!(swing(0.15) < 0.08, "{}", swing(0.15));
+        // No synthetic flap any more: the opening is the level's. A hair
+        // of motion on a held vowel, nothing on a quiet one.
+        assert!(swing(1.0) < 0.1, "{}", swing(1.0));
+        assert!(swing(0.15) < 0.02, "{}", swing(0.15));
         // The outline stays on the shell and inside the design's mouth
         // box at any opening.
         for open in [0.0, 0.5, 1.0] {

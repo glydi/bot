@@ -6,9 +6,7 @@
 //! and the real window cannot drift apart.
 
 use std::collections::VecDeque;
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::{Command, Observation, Payload};
 use smol_str::SmolStr;
@@ -24,6 +22,18 @@ pub const RECENT_COMMANDS: usize = 50;
 /// in act-speaker, whose default this is). Only its `audio_level` moves
 /// the mouth.
 pub const SPEAKER_SOURCE: &str = "speaker";
+
+/// How long the speaker's levels are held before they move the mouth:
+/// the output device's latency after the block leaves the speaker's ring.
+/// `GLYDI_LIP_SYNC_MS` overrides it (raise it for Bluetooth headphones,
+/// lower it if the lips lag the voice). Default 40 ms, measured against
+/// the built-in speakers of a `MacBook Air`.
+pub fn lip_sync_delay() -> Duration {
+    std::env::var("GLYDI_LIP_SYNC_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(Duration::from_millis(40), Duration::from_millis)
+}
 
 /// One line in the debug panel's command list.
 #[derive(Clone, Debug)]
@@ -79,6 +89,10 @@ pub struct UiState {
     pub attends: u64,
     /// Commands consumed since start.
     pub seen: u64,
+    /// Speaker levels waiting out the output latency, with when each is due.
+    pending_levels: VecDeque<(Instant, f32)>,
+    /// See [`lip_sync_delay`].
+    lip_sync: Duration,
 }
 
 impl UiState {
@@ -90,6 +104,19 @@ impl UiState {
             attend: None,
             attends: 0,
             seen: 0,
+            pending_levels: VecDeque::with_capacity(16),
+            lip_sync: lip_sync_delay(),
+        }
+    }
+
+    /// Per frame: release the speaker levels whose moment has come.
+    pub fn tick(&mut self, now: Instant) {
+        while let Some(&(due, l)) = self.pending_levels.front() {
+            if due > now {
+                break;
+            }
+            self.pending_levels.pop_front();
+            self.face.set_level(l, due);
         }
     }
 
@@ -156,17 +183,15 @@ impl UiState {
             "audio_level" => {
                 if let Payload::Level(l) = o.payload {
                     if o.source == SPEAKER_SOURCE {
-                        self.face.set_level(l, now);
+                        // Held for the output device's own latency (the
+                        // speaker stamps a level when its block leaves the
+                        // ring, not when the sound leaves the speaker):
+                        // built-in speakers add tens of ms, Bluetooth
+                        // headphones 150-250. See `lip_sync_delay`.
+                        self.pending_levels.push_back((now + self.lip_sync, l));
                     } else {
                         self.face.set_mic_level(l);
                     }
-                }
-            }
-            // A sentence is about to start playing: it precedes the audio
-            // by the device queue, so the mouth can open just ahead of it.
-            "spoke" => {
-                if o.source == SPEAKER_SOURCE {
-                    self.face.anticipate(now);
                 }
             }
             // Someone else talking.
@@ -291,6 +316,10 @@ mod tests {
         let mic = |p: Payload| Observation::new("mic0", "audio_level", now).with_payload(p);
         s.on_observation(&speaker("self_speaking", Payload::Bool(true)), now);
         s.on_observation(&speaker("audio_level", Payload::Level(0.2)), now);
+        // Held for the output latency: nothing yet, then released by tick.
+        assert!(s.face.mouth_open(now) < 0.05);
+        let now = now + lip_sync_delay();
+        s.tick(now);
         let open = s.face.mouth_open(now);
         assert!(open > 0.9, "{open}");
         // The muted mic's zero, which used to shut the mouth between the
@@ -301,12 +330,13 @@ mod tests {
         s.on_observation(&mic(Payload::Level(0.4)), now);
         assert!((s.face.mic_level() - 0.4).abs() < 1e-6);
         assert!((s.face.mouth_open(now) - open).abs() < 1e-6);
-        // `spoke` opens the mouth ahead of the audio.
+        // `spoke` no longer opens the mouth ahead of the audio: motion
+        // without sound read as mismatch. Only levels move it.
         s.on_observation(&speaker("self_speaking", Payload::Bool(false)), now);
         s.on_observation(&speaker("self_speaking", Payload::Bool(true)), now);
         assert!(s.face.mouth_open(now) < 1e-6);
         s.on_observation(&speaker("spoke", Payload::Text("Hi.".into())), now);
-        assert!(s.face.mouth_open(now + Duration::from_millis(80)) > 0.2);
+        assert!(s.face.mouth_open(now + Duration::from_millis(80)) < 1e-6);
     }
 
     #[test]
