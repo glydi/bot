@@ -34,6 +34,15 @@ pub const RECOGNITION_MODALITIES: [&str; 2] = ["face", "voice_identity"];
 /// backchannel is warranted.
 pub const LONG_SPEECH: Duration = Duration::from_secs(4);
 
+/// A stranger gone this long is dropped from the table. Known people are
+/// kept absent forever (ARCHITECTURE.md: expiry is a transition, never a
+/// deletion) because they can come back and be RETURNED; a stranger
+/// cannot. Their key is a track number, the tracker never reuses one, and
+/// the mapping is dropped at LEFT, so nothing can ever touch the entity
+/// again -- while every tick walks the whole table (belief decay) and a
+/// day of faces crossing a room leaves thousands of them.
+pub const STRANGER_TTL: Duration = Duration::from_secs(60);
+
 /// A bearing older than this no longer says where someone is: the camera
 /// refreshes it at 10 Hz while it can see them, and a presence that old
 /// has expired anyway ([`PRESENCE_TTL`]).
@@ -507,6 +516,14 @@ impl World {
             entities
                 .get(id)
                 .is_some_and(|e| e.status == Status::Present || e.is_known())
+        });
+        // And the strangers themselves, once nothing can bring them back
+        // (see `STRANGER_TTL`). Silent: their LEFT was already logged.
+        self.entities.retain(|id, e| {
+            !id.is_track()
+                || e.status == Status::Present
+                || e.absent_since
+                    .is_none_or(|t| now.saturating_duration_since(t) < STRANGER_TTL)
         });
         self.refresh_engagement(now);
         out

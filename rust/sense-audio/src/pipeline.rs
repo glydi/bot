@@ -87,6 +87,16 @@ pub const MAX_DEFERRALS: usize = 3;
 /// which is as fast as the face's mouth needs and cheap enough to ignore.
 const LEVEL_EVERY_FRAMES: u64 = 3;
 
+/// Voiced frames between repeats of the `voice_activity` start edge while
+/// one run of speech lasts: 31 x 32 ms = 992 ms. The mind keeps a speaker
+/// "active" for 1.5 s past the last start it saw (`mind::SPEAKING_TTL`,
+/// ported from a Python loop fed per frame) and wants 4 s of unbroken
+/// speech before a backchannel, so a start edge alone reads as silence
+/// after 1.5 s of talking. One repeat a second keeps the run alive with
+/// room for a dropped ring slot, and stays under the 1 s clips the tests
+/// assert exact edges on.
+pub const VOICE_REASSERT_FRAMES: u64 = 31;
+
 /// Counters a caller can read for a debug panel. All relaxed: they are
 /// informational.
 #[derive(Debug, Default)]
@@ -303,6 +313,8 @@ impl Pipeline {
         let mut utterance: Vec<f32> = Vec::with_capacity(self.max_utterance_samples);
         let mut speaking = false;
         let mut frames: u64 = 0;
+        // Voiced frames since the last `voice_activity` start was sent.
+        let mut since_start: u64 = 0;
         // Bookkeeping for speculation: when the last voiced frame arrived,
         // how long `utterance` was at that point (the quiet frames after it
         // are appended too, but are not worth transcribing), the id of the
@@ -377,6 +389,7 @@ impl Pipeline {
             if state == State::Speaking {
                 if !speaking {
                     speaking = true;
+                    since_start = 0;
                     for f in preroll.drain(..) {
                         utterance.extend_from_slice(&f);
                     }
@@ -389,6 +402,14 @@ impl Pipeline {
                 if quiet == 0 {
                     last_voiced_at = self.clock.now();
                     voiced_len = utterance.len();
+                    // Still talking: say so again every second, or the
+                    // mind's speaking TTL ends the run under them (see
+                    // `VOICE_REASSERT_FRAMES`).
+                    since_start += 1;
+                    if since_start >= VOICE_REASSERT_FRAMES {
+                        since_start = 0;
+                        self.emit(self.obs("voice_activity").with_payload(Payload::Bool(true)));
+                    }
                     if live_spec.take().is_some() {
                         // The pause was a pause. Whatever the worker made
                         // of it describes half a sentence; forget it (a

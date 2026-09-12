@@ -53,6 +53,41 @@ fn vad_starts_and_stops_on_a_tone() {
     assert!(obs.iter().all(|o| o.source == "mic0"));
 }
 
+/// The mind expires a run of speech `SPEAKING_TTL` (1.5 s) after the last
+/// `voice_activity` start it saw, and its long-speech backchannel needs
+/// 4 s of unbroken speech (`mind::rules::BackchannelAfterLongSpeech`):
+/// with a start edge alone, anyone talking for more than 1.5 s reads as
+/// silent to the mind. So a run that lasts is re-asserted about once a
+/// second while it lasts, and still ends with exactly one stop edge.
+#[test]
+fn a_long_run_of_speech_re_asserts_its_start() {
+    let cfg = AudioConfig::default().without_models();
+    let src = MockInput::tone_with_silence(0.2, 4.0, 1.0, 0.3);
+    let obs = run_to_end(cfg, Box::new(src));
+    let ev = events(&obs);
+    let starts = ev
+        .iter()
+        .filter(|e| e.0 == "voice_activity" && e.1 == Some(true))
+        .count();
+    // The edge, then one per ~1 s of the remaining ~3.9 s.
+    assert!((4..=5).contains(&starts), "{starts} starts: {ev:?}");
+    let stops = ev
+        .iter()
+        .filter(|e| e.0 == "voice_activity" && e.1 == Some(false))
+        .count();
+    assert_eq!(stops, 1, "{ev:?}");
+    assert_eq!(
+        &ev[ev.len() - 2..],
+        [
+            ("voice_activity".to_string(), Some(false)),
+            ("turn_ended".to_string(), Some(true)),
+        ],
+        "{ev:?}"
+    );
+    // Nothing is re-asserted after the speech ends.
+    assert!(ev.iter().all(|e| e.0 != "voice_activity" || e.1.is_some()));
+}
+
 #[test]
 fn a_blip_is_not_a_turn() {
     // 50 ms of tone is under start_frames (3 x 32 ms): nothing happens.
@@ -180,7 +215,11 @@ fn silero_ignores_a_tone_and_hears_speech() {
             .unwrap_or_else(|e| panic!("{e}"))
             .with_trailing_silence(1.0);
     let obs = run_to_end(cfg, Box::new(src));
-    let ev = events(&obs);
+    let mut ev = events(&obs);
+    // The clip is 3 s of speech: the start edge repeats every second
+    // (`VOICE_REASSERT_FRAMES`); the edges themselves are what is under
+    // test here.
+    ev.dedup();
     assert_eq!(
         ev,
         vec![

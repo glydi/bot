@@ -209,3 +209,36 @@ fn empty_room_is_nobody() {
     let v = WorldView::snapshot(&w, FakeClock::new().now());
     assert_eq!(v.describe(&|_| Vec::new()), mind::NOBODY);
 }
+
+/// A long session: the tracker hands out a fresh number for every face it
+/// loses and re-finds, so strangers arrive by the thousand over a day.
+/// Their entities must not stay behind once they are gone -- every tick
+/// walks the whole table, and the fast path is budgeted in microseconds.
+/// (Known people are kept: their return is worth a "welcome back".)
+#[test]
+fn absent_strangers_are_forgotten_and_known_people_are_kept() {
+    let clock = FakeClock::new();
+    let mut w = World::new();
+    w.fold(&face_known(clock.at_secs(0.0), "john"));
+    for t in 0..1000u32 {
+        w.fold(&face(
+            clock.at_secs(f64::from(t) * 0.01),
+            EntityHint::Track(t),
+        ));
+    }
+    assert_eq!(w.present().count(), 1001);
+    // Everyone left 10 s in: LEFT for all, then the tick keeps running.
+    w.tick(clock.at_secs(20.0));
+    assert_eq!(w.present().count(), 0);
+    let mut t = 20.0;
+    while t < 200.0 {
+        t += 0.1;
+        w.tick(clock.at_secs(t));
+    }
+    let strangers = w.entities().filter(|e| e.id.is_track()).count();
+    assert!(strangers < 100, "{strangers} absent strangers still held");
+    assert!(w.get(&john()).is_some(), "a known person is never dropped");
+    // The house rule stands for people: John comes back as RETURNED.
+    let evs = w.fold(&face_known(clock.at_secs(300.0), "john"));
+    assert_eq!(kinds(&evs), ["RETURNED"]);
+}

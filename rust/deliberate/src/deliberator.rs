@@ -1,11 +1,10 @@
 //! The slow path: one LLM turn per utterance, on its own runtime.
 //!
-//! The reflex thread hands us a copy of every observation through a
-//! capacity-1 channel with `try_send`. While a turn is running that channel
-//! fills and later observations are dropped -- and that is correct: the
-//! newest one supersedes the rest, and the only observation we must not
-//! miss mid-turn is "someone started talking", which is exactly the one the
-//! sense keeps repeating.
+//! The reflex thread hands us a copy of every observation through a small
+//! bounded channel with `try_send`. A turn in progress drains and discards
+//! what arrives (all but "someone started talking", which cancels it); a
+//! stalled session lets the channel fill and later observations drop --
+//! and that is correct: the newest one supersedes the rest.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +37,12 @@ pub const VOICE_ACTIVITY: &str = "voice_activity";
 /// How long voice activity must last during a turn before it cancels the
 /// turn. Same figure as `mind::rules::BargeInStop::SUSTAIN`.
 pub const BARGE_IN_SUSTAIN: Duration = Duration::from_millis(400);
+
+/// Observations the runtime side of the bridge can hold. The same figure
+/// as the binary's sync side: the `voice_activity` edge that cancels a
+/// turn arrives a few microseconds behind a level from the same mic frame,
+/// and one slot lost it (see `glydi::app::DELIBERATE_BACKLOG`).
+pub const OBSERVATION_BACKLOG: usize = 16;
 
 /// Bounds the tool-call loop. Without it a model that keeps calling tools
 /// can spin forever while the person waits in silence.
@@ -834,6 +839,9 @@ impl Session {
                     None => text.to_owned(),
                 };
                 self.conversation.push(Message::user(line));
+                // The reflex showed "thinking" when their turn ended; this
+                // is the end of that turn, so release the face.
+                self.ui("idle");
                 continue;
             }
             let token = shutdown.child_token();
@@ -1005,11 +1013,10 @@ impl Deliberator {
         let current: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
         let session = Session::new(backend, config, snapshot, facts, cmd_queue, clock);
 
-        // Bridge the sync channel onto the runtime. The async side is also
-        // capacity 1 with `try_send`, so the lossy policy holds end to end:
-        // a busy session sees the newest observation or none, never a
-        // backlog.
-        let (tx, rx) = mpsc::channel::<Observation>(1);
+        // Bridge the sync channel onto the runtime. The async side is
+        // bounded and `try_send` too, so the lossy policy holds end to end:
+        // a stalled session drops, and never holds up the reflex.
+        let (tx, rx) = mpsc::channel::<Observation>(OBSERVATION_BACKLOG);
         let bridge_shutdown = shutdown.clone();
         std::thread::Builder::new()
             .name("glydi-deliberate-obs".into())
@@ -1971,7 +1978,9 @@ mod tests {
     /// Drive [`Session::run`] with one utterance from John, optionally
     /// paired with the mind's `ignore_utterance`, then a second utterance
     /// so the request that follows shows what the history kept.
-    async fn run_with_optional_ignore(ignore: bool) -> Vec<ChatRequest> {
+    async fn run_with_optional_ignore(
+        ignore: bool,
+    ) -> (Vec<ChatRequest>, Vec<(String, String, String)>) {
         let r = rig(
             vec![Script::text(&["Right."]), Script::text(&["Still here."])],
             vec![person("john", true)],
@@ -1981,6 +1990,7 @@ mod tests {
             llm,
             obs_tx,
             obs_rx,
+            commands,
             ..
         } = r;
         let (itx, irx) = mpsc::unbounded_channel::<Command>();
@@ -2029,7 +2039,7 @@ mod tests {
         }
         shutdown.cancel();
         task.await.unwrap();
-        llm.requests()
+        (llm.requests(), drain(&commands))
     }
 
     #[test]
@@ -2064,10 +2074,19 @@ mod tests {
 
     #[tokio::test]
     async fn ignore_utterance_intent_keeps_the_words_but_skips_the_turn() {
-        let reqs = run_with_optional_ignore(true).await;
+        let (reqs, cmds) = run_with_optional_ignore(true).await;
         // One request: the second utterance. The first cost no prompt and
         // no speech, but its text is in the history the second turn sent.
         assert_eq!(reqs.len(), 1, "ignored utterance still reached the model");
+        // The reflex put the face into "thinking" when the turn ended;
+        // declining the utterance is the end of that turn too, so the face
+        // is released before the answered turn's own thinking/idle pair.
+        let ui: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c.0 == "ui")
+            .map(|c| c.1.as_str())
+            .collect();
+        assert_eq!(ui, ["idle", "thinking", "idle"], "{cmds:?}");
         let users: Vec<&str> = reqs[0]
             .messages
             .iter()
@@ -2081,7 +2100,7 @@ mod tests {
 
     #[tokio::test]
     async fn utterance_without_ignore_intent_is_answered() {
-        let reqs = run_with_optional_ignore(false).await;
+        let (reqs, _) = run_with_optional_ignore(false).await;
         assert_eq!(reqs.len(), 2);
         assert!(
             reqs[0]

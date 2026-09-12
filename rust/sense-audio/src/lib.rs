@@ -23,7 +23,7 @@
 //! | modality         | payload              | when                          |
 //! |------------------|----------------------|-------------------------------|
 //! | `audio_level`    | `Level(rms)`         | ~10 Hz, always (even muted)   |
-//! | `voice_activity` | `Bool(true/false)`   | VAD start / end               |
+//! | `voice_activity` | `Bool(true/false)`   | VAD start / end; the start repeats every ~1 s of continuing speech (`pipeline::VOICE_REASSERT_FRAMES`) |
 //! | `turn_ended`     | `Bool(complete)`     | after each VAD end; confidence is the model's probability |
 //! | `voice_identity` | `Embedding`, entity `Known(id)` if matched | per utterance >= 1 s |
 //! | `utterance`      | `Text`, entity from the latest voice match | per transcribed utterance |

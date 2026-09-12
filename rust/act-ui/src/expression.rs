@@ -159,6 +159,15 @@ const ANTICIPATE_OPEN: f32 = 0.30;
 /// face's "nobody around for a while".
 pub const SLEEP_AFTER: Duration = Duration::from_secs(180);
 
+/// A `thinking` older than this, with nothing having followed it, has
+/// stopped meaning anything: the reflex raises it at every turn end on
+/// the guess that a reply is coming, and when the transcript is blank or
+/// the mind declines the utterance nothing ever clears it. The deliberate
+/// path re-raises it when it starts the turn and its first sentence
+/// switches the face to speaking; a local model past ten seconds with no
+/// sentence is the timeout case anyway.
+pub const THINKING_TTL: Duration = Duration::from_secs(10);
+
 /// An explicit `expression` command sticks for this long before the
 /// automatic mapping takes back over, so a `greeting` is seen and then
 /// yields to what the bot is actually doing.
@@ -172,8 +181,9 @@ pub struct FaceState {
     speaking: bool,
     /// Someone else is talking (`voice_activity`, or a present speaker).
     hearing: bool,
-    /// The LLM is working (`thinking` command).
-    thinking: bool,
+    /// The LLM is working (`thinking` command): when it was last said, or
+    /// `None`. Expires after [`THINKING_TTL`], see there.
+    thinking: Option<Instant>,
     /// Something failed (`expression error`, cleared by any transition).
     broken: bool,
     /// Speech level, 0..1 raw RMS, and the running peak it is scaled by.
@@ -204,7 +214,7 @@ impl FaceState {
         Self {
             speaking: false,
             hearing: false,
-            thinking: false,
+            thinking: None,
             broken: false,
             level: 0.0,
             peak: PEAK_FLOOR,
@@ -222,7 +232,7 @@ impl FaceState {
     /// The bot started or stopped talking.
     pub fn set_speaking(&mut self, on: bool, now: Instant) {
         if on {
-            self.thinking = false;
+            self.thinking = None;
             self.broken = false;
         }
         self.speaking = on;
@@ -249,7 +259,7 @@ impl FaceState {
 
     /// The LLM started (or finished) working.
     pub fn set_thinking(&mut self, on: bool, now: Instant) {
-        self.thinking = on;
+        self.thinking = on.then_some(now);
         if on {
             self.broken = false;
         }
@@ -259,7 +269,7 @@ impl FaceState {
     /// Back to nothing in particular: clears thinking, hearing and any
     /// override.
     pub fn set_idle(&mut self, now: Instant) {
-        self.thinking = false;
+        self.thinking = None;
         self.hearing = false;
         self.override_to = None;
         self.activity_at = now;
@@ -414,7 +424,10 @@ impl FaceState {
                 return e;
             }
         }
-        if self.thinking {
+        if self
+            .thinking
+            .is_some_and(|at| now.saturating_duration_since(at) < THINKING_TTL)
+        {
             return Expression::Thinking;
         }
         if self.hearing {
@@ -484,6 +497,33 @@ mod tests {
         f.set_speaking(false, now);
         f.set_idle(now);
         assert_eq!(f.expression(now), Expression::Idle);
+    }
+
+    /// The reflex puts the face into `thinking` the moment a turn ends,
+    /// before it knows whether a transcript (and so a reply, and so an
+    /// `idle`) will ever follow. A blank transcript or an utterance the
+    /// mind declines to answer leaves nothing to clear it: the face must
+    /// not sit "thinking" until the next conversation.
+    #[test]
+    fn thinking_expires_when_no_turn_follows() {
+        let now = t0();
+        let mut f = FaceState::new(now);
+        f.set_thinking(true, now);
+        assert_eq!(f.expression(now), Expression::Thinking);
+        assert_eq!(
+            f.expression(now + THINKING_TTL.saturating_sub(Duration::from_millis(1))),
+            Expression::Thinking
+        );
+        assert_eq!(f.expression(now + THINKING_TTL), Expression::Idle);
+        // A fresh `thinking` (the deliberate path picking the turn up)
+        // starts the clock again.
+        let later = now + THINKING_TTL.saturating_sub(Duration::from_secs(1));
+        f.set_thinking(true, later);
+        assert_eq!(f.expression(now + THINKING_TTL), Expression::Thinking);
+        assert_eq!(f.expression(later + THINKING_TTL), Expression::Idle);
+        // Expired thinking does not hide a live listening state.
+        f.set_hearing(true, later + THINKING_TTL);
+        assert_eq!(f.expression(later + THINKING_TTL), Expression::Listening);
     }
 
     #[test]

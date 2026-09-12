@@ -48,6 +48,17 @@ use crate::tee::{self, Recorder, TeeHandle};
 /// seconds of backlog: only a stalled consumer ever fills it.
 const RING_CAPACITY: usize = 256;
 
+/// Observations the deliberate path can have waiting. Not one: the mic
+/// emits its `audio_level` and, on the same frame, the `voice_activity`
+/// start edge microseconds apart, and with a single slot the edge -- the
+/// one observation a turn must not miss -- was the one dropped whenever
+/// the bridge thread had not yet taken the level (measured: the reply ran
+/// on after the reflex `stop` in 2 of 9 interruptions,
+/// `tests/scenarios.rs`). A busy turn drains and discards whatever is
+/// queued, so this is never a backlog of stale utterances, only a few
+/// milliseconds of levels.
+const DELIBERATE_BACKLOG: usize = 16;
+
 /// Events between the reflex and the memory worker. Fact extraction is an
 /// LLM call, so the worker can lag by a turn; a full channel drops events
 /// (reflex `try_send`), and 1024 is minutes of room activity.
@@ -220,9 +231,9 @@ impl App {
         let memory = worker.spawn(tap_rx).context("spawning memory worker")?;
 
         // -- reflex -----------------------------------------------------
-        // Capacity 1: the deliberate path sees the newest observation or
-        // none. A backlog of stale utterances is worse than a miss.
-        let (delib_tx, delib_rx) = crossbeam_channel::bounded::<Observation>(1);
+        // A few slots, not one: see `DELIBERATE_BACKLOG`. A stalled
+        // deliberate path still drops, never blocks the reflex.
+        let (delib_tx, delib_rx) = crossbeam_channel::bounded::<Observation>(DELIBERATE_BACKLOG);
         let reflex = Reflex::with_rules(session_id.as_str(), epoch, cognitive_rules())
             .with_event_tap(Some(tap_tx))
             .spawn(Arc::clone(&clock), reflex_rx, queue.clone(), Some(delib_tx))

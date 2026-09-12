@@ -499,3 +499,144 @@ fn leave_and_return_is_remembered() {
         started.elapsed()
     );
 }
+
+// ------------------------------------------------- not addressed to us
+
+/// John has been looking away from the camera for over a second when he
+/// speaks: the mind's `ignore_utterance` intent and the utterance itself
+/// travel on different channels (three thread hops against one), and the
+/// deliberate path must pair them before it answers. Run under CPU load,
+/// because that is when the intent lands late.
+#[test]
+fn utterance_from_someone_looking_away_is_not_answered() {
+    let started = Instant::now();
+    let rig = Rig::build(
+        temp_db("away"),
+        vec![Script::text(&["Should never be said."])],
+    );
+    let john = EntityHint::Known(EntityId::new("john"));
+    // Something else is hogging the machine: a release build, a model
+    // loading. Eight spinners on top of the loop's own threads.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinners: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    std::hint::black_box(x);
+                }
+            })
+        })
+        .collect();
+
+    // A face turned away (facing 0.1 < AWAY_MAX) at the camera's 10 Hz,
+    // for the whole scene: the gate needs a second of history and a
+    // sample under a second old.
+    let camera = std::thread::spawn({
+        let tx = rig.app.observations();
+        let clock = rig.app.clock();
+        let stop = Arc::clone(&stop);
+        let john = john.clone();
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.send(
+                    Observation::new("cam0", "face", clock.now())
+                        .with_confidence(0.9)
+                        .with_entity(john.clone())
+                        .with_payload(Payload::Direction { azimuth_deg: 0.0 }),
+                );
+                tx.send(
+                    Observation::new("cam0", "facing", clock.now())
+                        .with_entity(john.clone())
+                        .with_payload(Payload::Level(0.1)),
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    for i in 0..5 {
+        rig.utterance(john.clone(), &format!("so anyway I told him no {i}"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let answered = wait_for(Duration::from_millis(700), || {
+        !rig.llm.requests().is_empty()
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        let _ = s.join();
+    }
+    let _ = camera.join();
+    assert!(
+        !answered,
+        "an utterance not addressed to us reached the model: {} requests, spoken = {:?}",
+        rig.llm.requests().len(),
+        rig.spoken()
+    );
+    rig.finish();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+// ------------------------------------------------- barge-in delivery
+
+/// The microphone emits its `audio_level` and, on the same frame, the
+/// `voice_activity` start edge, microseconds apart. The copy the reflex
+/// forwards to the deliberate path goes through a one-slot channel: if
+/// the level is still in the slot when the edge arrives, the edge is the
+/// one dropped, the turn is never cancelled, and after the reflex `stop`
+/// the rest of the reply is spoken as if nothing happened. Three replies,
+/// each interrupted the way the mic does it.
+#[test]
+fn voice_edge_right_behind_a_level_still_cancels_the_reply() {
+    let started = Instant::now();
+    let sentences: Vec<String> = (1..=12).map(|i| format!("S{i}.")).collect();
+    let refs: Vec<&str> = sentences.iter().map(String::as_str).collect();
+    let reply = || Script::text(&refs).with_delay(Duration::from_millis(150));
+    let rig = Rig::build(temp_db("edge"), vec![reply(), reply(), reply()]);
+    let john = EntityHint::Known(EntityId::new("john"));
+    let mut late = Vec::new();
+    for round in 0..3 {
+        let before = rig.synth.timeline().len();
+        rig.utterance(john.clone(), "tell me a story");
+        assert!(
+            wait_for(Duration::from_secs(2), || rig.synth.timeline().len()
+                > before),
+            "reply {round} never started: {} requests, spoken = {:?}, speaking = {}",
+            rig.llm.requests().len(),
+            rig.spoken(),
+            rig.app.is_speaking()
+        );
+        // One mic frame: the level, then the edge.
+        rig.push(
+            Observation::new("mic0", "audio_level", rig.now()).with_payload(Payload::Level(0.2)),
+        );
+        let edge_at = Instant::now();
+        rig.voice(true);
+        std::thread::sleep(Duration::from_millis(1100));
+        rig.voice(false);
+        // Anything synthesised more than 700 ms after the edge (400 ms of
+        // sustain plus generous slack) was spoken after the interruption.
+        let stray: Vec<String> = rig.synth.timeline()[before..]
+            .iter()
+            .filter(|s| s.started.saturating_duration_since(edge_at) > Duration::from_millis(700))
+            .map(|s| s.text.clone())
+            .collect();
+        if !stray.is_empty() {
+            late.push((round, stray));
+        }
+        assert!(wait_for(Duration::from_secs(3), || !rig.app.is_speaking()));
+    }
+    assert!(late.is_empty(), "spoken after the interruption: {late:?}");
+    rig.finish();
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "{:?}",
+        started.elapsed()
+    );
+}
