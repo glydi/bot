@@ -72,6 +72,16 @@ pub trait FactSource: Send + Sync {
         Err("no gallery to attach that name to".to_owned())
     }
 
+    /// Memory's one line about their last visit -- "last visit 2 days
+    /// ago: talked about the Rust parser" -- for the moment they come
+    /// back (see `crate::voice::Proactive::note`). The default has no
+    /// episodes; the memory crate's store has `returned_context` and
+    /// overrides this with it.
+    fn returned_context(&self, entity: &EntityId) -> Option<String> {
+        let _ = entity;
+        None
+    }
+
     /// Delete `entity` and every trace of them. `false` if unknown.
     fn forget(&self, entity: &EntityId) -> bool {
         let _ = entity;

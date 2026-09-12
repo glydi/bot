@@ -20,6 +20,8 @@
 //!   streaming client ([`OpenAiBackend`]).
 //! * [`sentence`]: token stream to sentences.
 //! * [`condense`]: summarising trimmed turns in the background.
+//! * [`voice`]: Glydi's own lines -- the proactive moments as `[note]`s,
+//!   and the generic / repetition filters every reply goes through.
 //! * [`deliberator`]: the turn loop, cancellation, and [`Deliberator::spawn`].
 
 #![forbid(unsafe_code)]
@@ -32,6 +34,7 @@ pub mod mock;
 pub mod prompt;
 pub mod sentence;
 pub mod tools;
+pub mod voice;
 
 pub use backend::{ChatBackend, ChatEvent, ChatRequest, EventStream, LlmError, OpenAiBackend};
 pub use deliberator::{
@@ -39,10 +42,11 @@ pub use deliberator::{
     MAX_TOOL_ROUNDS, SET_NAME_KIND, SET_NAME_TARGET, Session, Snapshot, TurnEnd,
 };
 pub use prompt::{
-    Conversation, EARLIER, LOCAL_SYSTEM_PROMPT, MARKER, MAX_HISTORY, Message, Role, SYSTEM_PROMPT,
-    TRIM_SLACK, ToolCall,
+    Conversation, EARLIER, EXAMPLES, LOCAL_SYSTEM_PROMPT, MARKER, MAX_HISTORY, Message, Role,
+    SYSTEM_PROMPT, TRIM_SLACK, ToolCall,
 };
 pub use sentence::{SentenceSplitter, ends_sentence};
 pub use tools::{
     FactSource, InMemoryFacts, ToolSpec, Tools, full_tool_specs, memory_tool_specs, tool_specs,
 };
+pub use voice::{Moment, NoteContext, PROACTIVE_DEADLINE, Proactive, Said};

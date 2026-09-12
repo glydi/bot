@@ -26,10 +26,16 @@ use crate::backend::{ChatBackend, ChatEvent, ChatRequest, LlmError, OpenAiBacken
 use crate::condense::condense;
 use crate::prompt::{
     Conversation, LOCAL_SYSTEM_PROMPT, Message, NOTE_ABSENT_PERSON, NOTE_ALREADY_GREETED,
-    NOTE_ONLY_NAME, NOTE_REACT_FIRST, NOTE_STRANGER_SPEAKING, ToolCall,
+    NOTE_ONLY_NAME, NOTE_REACT_FIRST, NOTE_STRANGER_SPEAKING, Role, ToolCall,
 };
 use crate::sentence::SentenceSplitter;
 use crate::tools::{FactSource, REMEMBER_NAME, SystemRunner, ToolPolicy, Tools};
+use crate::voice::{
+    GREETING_WINDOW, Moment, NOTE_RECENT, NoteContext, PROACTIVE_DEADLINE, PROACTIVE_MAX_TOKENS,
+    PROACTIVE_TEMPERATURE, Proactive, RETRY_DIFFERENTLY, RETRY_GENERIC, RETRY_REPEAT, Said,
+    clean_reply, fallback_opener, first_sentence, is_generic, local_time, reply_budget,
+    same_words_streak, strip_leading_greeting,
+};
 
 /// Modality of a transcribed utterance.
 pub const UTTERANCE: &str = "utterance";
@@ -100,7 +106,122 @@ struct Intent {
     /// the novelty key the question is about.
     #[serde(default)]
     about: Option<String>,
+    /// Any spoken intent: the person's recent mood, in a word or two,
+    /// when the mind has one ("tired", "cheerful"). Nothing emits it yet;
+    /// the note carries it when it arrives.
+    #[serde(default)]
+    mood: Option<String>,
+    /// Crowd fields, on any intent and on the `crowd` intent: how many
+    /// people are in front of us.
+    #[serde(default)]
+    people_present: Option<usize>,
+    /// Names (or labels) of people waiting to talk while someone else
+    /// has the floor.
+    #[serde(default)]
+    waiting: Option<Vec<String>>,
+    /// How long the one talking has been going, in seconds.
+    #[serde(default)]
+    talker_seconds: Option<u64>,
 }
+
+impl Intent {
+    /// The crowd fields, when any is set.
+    fn crowd(&self) -> Option<Crowd> {
+        if self.people_present.is_none() && self.waiting.is_none() && self.talker_seconds.is_none()
+        {
+            return None;
+        }
+        Some(Crowd {
+            people_present: self.people_present,
+            waiting: self.waiting.clone().unwrap_or_default(),
+            talker_seconds: self.talker_seconds,
+        })
+    }
+}
+
+/// How long a `crowd` intent's picture of the room stays on the note.
+/// The mind re-sends while it holds; past this the picture is stale.
+pub const CROWD_TTL: Duration = Duration::from_secs(30);
+
+/// Seconds of one person talking after which the note asks for a
+/// gentle wrap-up ("hold that thought -- who's next?"), when others are
+/// waiting.
+pub const LONG_TALKER: u64 = 60;
+
+/// The mind's picture of the crowd, from the fields `people_present`,
+/// `waiting` and `talker_seconds` on any intent (a `{"decision":"crowd",
+/// ...}` intent carries nothing else). Rendered onto the note by
+/// [`Crowd::line`] so the model addresses a room, not one person.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Crowd {
+    /// `people_present`: how many are in front of us.
+    pub people_present: Option<usize>,
+    /// `waiting`: who is waiting to talk.
+    pub waiting: Vec<String>,
+    /// `talker_seconds`: how long the one talking has been going.
+    pub talker_seconds: Option<u64>,
+}
+
+impl Crowd {
+    /// The note line: how many are here, who is waiting, and -- when
+    /// one person has talked past [`LONG_TALKER`] with others waiting --
+    /// the instruction to wrap up and turn to who's next.
+    pub fn line(&self) -> String {
+        let mut s = String::new();
+        if let Some(n) = self.people_present {
+            let _ = write!(s, "There are {n} people here.");
+        }
+        if !self.waiting.is_empty() {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            let _ = write!(s, "Waiting to talk to you: {}.", self.waiting.join(", "));
+        }
+        if let Some(t) = self.talker_seconds {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            let _ = write!(s, "The one talking has been going for {t} seconds.");
+            if t >= LONG_TALKER && !self.waiting.is_empty() {
+                s.push_str(
+                    " Wrap it up lightly (\"hold that thought\") and turn to whoever is next.",
+                );
+            }
+        }
+        s
+    }
+}
+
+/// What an intent came to: a line the planner chose the words for
+/// (spoken as is), or a moment for the model to speak into.
+#[derive(Clone, Debug)]
+pub enum Planned {
+    /// Spoken verbatim: the planner's own question or remark.
+    Line(String),
+    /// A model turn with a canned fallback.
+    Turn(Proactive),
+}
+
+impl Planned {
+    /// The words without a model: the line itself, or the fallback.
+    pub fn canned(&self) -> &str {
+        match self {
+            Self::Line(l) => l,
+            Self::Turn(p) => &p.canned,
+        }
+    }
+}
+
+/// The line added to the room note when the utterance comes from nobody
+/// we can name and nobody known is visible: the model has nothing to go
+/// on, and left alone it fills the gap with "How are you doing today?".
+/// Told what it does not know and what to ask, it leads instead. The
+/// six-hello session in `data/launch.log` (camera dark, no voice match)
+/// is the case; see `tests/proactive_live.rs` for the measured lines.
+pub const NOTE_NOTHING_KNOWN: &str = "You know nothing about who is talking: no name, no facts, and \
+the camera shows you nobody; it is one voice, alone, nobody waiting. Never make up a name for \
+them. Do not ask how they are. React to the exact words they said, then ask ONE concrete thing \
+you can remember them by: their name, what they are working on, or where they came from.";
 
 /// Minimum gap between two curiosity remarks about the same thing
 /// (`about`). The mind asks once per key per hour; this is the guard
@@ -245,6 +366,11 @@ pub struct Config {
     pub system_prompt: String,
     /// Tool-call rounds per utterance.
     pub max_tool_rounds: usize,
+    /// Let the reply ceiling follow the utterance (see
+    /// [`crate::voice::reply_budget`]); off, every turn gets
+    /// `max_tokens`. On by default; the live test turns it off to
+    /// measure it.
+    pub adaptive_brevity: bool,
 }
 
 impl Default for Config {
@@ -258,6 +384,7 @@ impl Default for Config {
             request_timeout: Duration::from_secs(60),
             system_prompt: LOCAL_SYSTEM_PROMPT.to_owned(),
             max_tool_rounds: MAX_TOOL_ROUNDS,
+            adaptive_brevity: true,
         }
     }
 }
@@ -329,6 +456,24 @@ pub struct Session {
     /// [`Session::run`]): any voice cancels it at once, and a cancelled
     /// early turn leaves no trace in the history.
     early: bool,
+    /// The last lines we said, for the repetition guard and the
+    /// proactive note (see [`crate::voice`]).
+    said: Said,
+    /// Token ceiling for the turn in flight (see
+    /// [`crate::voice::reply_budget`]).
+    turn_budget: u32,
+    /// See [`Config::adaptive_brevity`].
+    adaptive_brevity: bool,
+    /// How many times in a row the person has just said these same
+    /// words ("Hello." for the fourth time is 4); 1 for anything new.
+    streak: usize,
+    /// The mind's latest picture of the crowd, and when it came; good
+    /// for [`CROWD_TTL`] (see [`Crowd`]).
+    crowd: Option<(Crowd, Instant)>,
+    /// When we last said hello to each person, stamped once the line is
+    /// out; inside [`GREETING_WINDOW`] the next line to them carries no
+    /// greeting word.
+    greeted_at: HashMap<EntityId, Instant>,
 }
 
 impl Session {
@@ -370,7 +515,35 @@ impl Session {
             memory_request: false,
             holding_until: None,
             early: false,
+            said: Said::default(),
+            turn_budget: config.max_tokens,
+            adaptive_brevity: config.adaptive_brevity,
+            streak: 1,
+            crowd: None,
+            greeted_at: HashMap::new(),
         }
+    }
+
+    /// A moment's line is out: a hello is remembered per person, for
+    /// [`GREETING_WINDOW`].
+    fn spoke_moment(&mut self, p: &Proactive, line: String) {
+        if p.moment.kind() == "greet" {
+            if let Some(id) = &p.entity {
+                self.greeted_at.insert(id.clone(), self.clock.now());
+            }
+        }
+        self.speak_line(line);
+    }
+
+    /// The crowd picture the mind sent inside [`CROWD_TTL`], if any.
+    fn crowd_now(&self) -> Option<Crowd> {
+        let (c, at) = self.crowd.as_ref()?;
+        (self.clock.now().saturating_duration_since(*at) < CROWD_TTL).then(|| c.clone())
+    }
+
+    /// The lines we have said lately, oldest first.
+    pub fn said(&self) -> &Said {
+        &self.said
     }
 
     /// Whether the person asked us to wait less than [`HOLD_WINDOW`] ago.
@@ -403,49 +576,103 @@ impl Session {
         self.prefetched.get(entity).map(Vec::as_slice)
     }
 
-    /// Act on a command routed to us. Only [`INTENT_KIND`] is understood;
-    /// anything else is a wiring mistake and is logged, not acted on.
+    /// Act on a command routed to us without a model: what
+    /// [`Session::plan_intent`] decides is spoken as its canned line. The
+    /// loop goes through [`Session::on_intent`] instead, which gives the
+    /// model the moment first; this is the path for tests and for a
+    /// session with no model behind it.
+    pub fn handle_intent(&mut self, cmd: &Command) {
+        match self.plan_intent(cmd) {
+            Some(Planned::Line(line)) => self.speak_line(line),
+            Some(Planned::Turn(p)) => {
+                let line = p.canned.clone();
+                self.spoke_moment(&p, line);
+            }
+            None => {}
+        }
+    }
+
+    /// Decide what a command routed to us comes to. Only [`INTENT_KIND`]
+    /// is understood; anything else is a wiring mistake and is logged,
+    /// not acted on. `None` when there is nothing to say: a gate held it
+    /// (see [`INTENT_SAY_GAP`], [`CURIOUS_GAP`], the hold), or it was a
+    /// bookkeeping intent.
     ///
-    /// * `ask` / `say` with text: spoken as is, no model round trip -- the
-    ///   planner already chose the words -- at most once per
-    ///   [`INTENT_SAY_GAP`] per entity. What was said goes into the
-    ///   history so the model knows it asked.
+    /// * `ask` / `say` with text: the planner's own words, spoken as is
+    ///   ([`Planned::Line`]) -- except the greeting and the lights-out
+    ///   line, which are moments for the model with the planner's words
+    ///   as the fallback. At most once per [`INTENT_SAY_GAP`] per entity
+    ///   and kind.
     /// * `ignore_utterance`: the person who just spoke was not talking to
     ///   us; the utterance arriving with it is kept as context but not
     ///   answered (see [`Session::run`]).
     /// * `recall`: look the person up now and hold the facts for the next
-    ///   prompt's room note.
-    /// * `greet_pair`: "Hi Ada, hi Bob." from the room's names, as one
-    ///   greeting keyed on the first of them.
-    /// * `remind`: "You asked me to remind you to {text}." -- the words
-    ///   are theirs; the wiring marks the row done as the intent goes by.
-    /// * `curious`: the mind's question about something new, spoken as
-    ///   given, once per [`CURIOUS_GAP`] per `about`, and never while
-    ///   holding.
+    ///   prompt's room note; raised for a greeting, it is the greeting.
+    /// * `greet`, `greet_pair`, `ask_name`, `remind`, `curious`: moments
+    ///   ([`Planned::Turn`]), each with the canned line it used to be.
+    ///   `curious` is once per [`CURIOUS_GAP`] per `about`, and never
+    ///   while holding.
     /// * `small_talk`, `check_in`, `answer` are model turns and are taken
     ///   by the loop (see [`Session::run`]); here they are logged only.
-    pub fn handle_intent(&mut self, cmd: &Command) {
-        let Some(intent) = parse_intent(cmd) else {
-            return;
-        };
+    pub fn plan_intent(&mut self, cmd: &Command) -> Option<Planned> {
+        let planned = self.plan(cmd)?;
+        Some(match planned {
+            Planned::Turn(mut p) => {
+                p.crowd = self.crowd_now();
+                Planned::Turn(p)
+            }
+            line @ Planned::Line(_) => line,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn plan(&mut self, cmd: &Command) -> Option<Planned> {
+        let intent = parse_intent(cmd)?;
         let entity = intent.entity.as_deref().map(EntityId::new);
+        let mood = intent.mood.clone();
+        if let Some(c) = intent.crowd() {
+            self.crowd = Some((c, self.clock.now()));
+        }
         match intent.decision.as_str() {
+            // The picture alone: nothing to say, kept for the next note.
+            "crowd" => None,
             "ask" | "say" => {
                 let Some(line) = intent.text.filter(|t| !t.trim().is_empty()) else {
                     tracing::warn!(decision = intent.decision, "intent without text");
-                    return;
+                    return None;
                 };
-                let kind = if intent.decision == "ask" {
-                    "ask"
-                } else {
-                    "say"
-                };
-                self.proactive(entity, kind, line);
+                match intent.goal.as_deref() {
+                    Some("greet") if !self.holding() => {
+                        self.gate(entity.clone(), "greet")?;
+                        let mut p = Proactive::new(Moment::Arrival, line);
+                        p.name = self.name_of(entity.as_ref());
+                        p.entity = entity;
+                        p.mood = mood;
+                        Some(Planned::Turn(p))
+                    }
+                    Some("greet") => {
+                        tracing::info!("greet intent suppressed: holding");
+                        None
+                    }
+                    Some("scene") => {
+                        self.gate(None, "scene")?;
+                        Some(Planned::Turn(Proactive::new(Moment::LightsOut, line)))
+                    }
+                    _ => {
+                        let kind = if intent.decision == "ask" {
+                            "ask"
+                        } else {
+                            "say"
+                        };
+                        self.gate(entity, kind)?;
+                        Some(Planned::Line(line))
+                    }
+                }
             }
             "recall" => {
                 let Some(id) = entity else {
                     tracing::warn!("recall intent without an entity");
-                    return;
+                    return None;
                 };
                 let facts = self.facts.recall(&id);
                 tracing::info!(%id, n = facts.len(), "prefetched for the next prompt");
@@ -453,31 +680,44 @@ impl Session {
                 // A recall raised for a greeting is a greeting: the person
                 // walked in and the world has no name for them yet. Say
                 // hello now rather than after they speak first.
-                if intent.goal.as_deref() == Some("greet") && !self.holding() {
-                    self.proactive(Some(id), "greet", "Hi there.".to_owned());
+                if intent.goal.as_deref() != Some("greet") || self.holding() {
+                    return None;
                 }
+                self.gate(Some(id.clone()), "greet")?;
+                let mut p = Proactive::new(Moment::Arrival, "Hi there.");
+                p.name = self.name_of(Some(&id));
+                p.entity = Some(id);
+                p.mood = mood;
+                Some(Planned::Turn(p))
             }
             "greet" if self.holding() => {
                 // They asked us to wait; a hello now is exactly the
                 // interruption they asked not to have. The planner raises
                 // it again once the world changes.
                 tracing::info!("greet intent suppressed: holding");
+                None
             }
             "greet" => {
-                self.greet(entity, intent.name.as_deref(), intent.returned_after_secs);
+                let mut p =
+                    self.greet(entity, intent.name.as_deref(), intent.returned_after_secs)?;
+                p.mood = mood;
+                Some(Planned::Turn(p))
             }
             "ask_name" => {
-                if self.proactive(entity.clone(), "ask_name", ASK_NAME_LINE.to_owned()) {
-                    self.pending_name = Some((entity, self.clock.now()));
-                }
+                self.gate(entity.clone(), "ask_name")?;
+                self.pending_name = Some((entity.clone(), self.clock.now()));
+                let mut p = Proactive::new(Moment::StrangerSettled, ASK_NAME_LINE);
+                p.entity = entity;
+                Some(Planned::Turn(p))
             }
             "ignore_utterance" => {
                 let Some(id) = entity else {
                     tracing::warn!("ignore_utterance intent without an entity");
-                    return;
+                    return None;
                 };
                 tracing::info!(%id, "mind says: not addressed, do not answer");
                 self.ignore.insert(id, self.clock.now());
+                None
             }
             "greet_pair" => {
                 let ids: Vec<EntityId> = intent
@@ -488,56 +728,66 @@ impl Session {
                     .collect();
                 if ids.is_empty() {
                     tracing::warn!("greet_pair intent without entities");
-                    return;
+                    return None;
                 }
                 if self.holding() {
                     tracing::info!("greet_pair intent suppressed: holding");
-                    return;
+                    return None;
                 }
-                self.greet_pair(&ids);
+                self.greet_pair(&ids).map(Planned::Turn)
             }
             "remind" => {
                 let Some(text) = intent.text.filter(|t| !t.trim().is_empty()) else {
                     tracing::warn!("remind intent without text");
-                    return;
+                    return None;
                 };
-                let text = text.trim().trim_end_matches('.');
+                let text = text.trim().trim_end_matches('.').to_owned();
                 tracing::info!(id = ?intent.id, text, "reminder due");
-                self.proactive(
-                    entity,
-                    "remind",
+                self.gate(entity.clone(), "remind")?;
+                let mut p = Proactive::new(
+                    Moment::Reminder,
                     format!("You asked me to remind you to {text}."),
                 );
+                p.name = self.name_of(entity.as_ref());
+                p.entity = entity;
+                p.about = Some(text);
+                p.mood = mood;
+                Some(Planned::Turn(p))
             }
             "curious" => {
                 let Some(text) = intent.text.filter(|t| !t.trim().is_empty()) else {
                     tracing::warn!("curious intent without text");
-                    return;
+                    return None;
                 };
                 if self.holding() {
                     tracing::info!("curious intent suppressed: holding");
-                    return;
+                    return None;
                 }
-                self.curious(intent.about.unwrap_or_default(), text);
+                self.curious(intent.about.unwrap_or_default(), text)
+                    .map(Planned::Turn)
             }
             "small_talk" | "check_in" | "answer" => {
                 tracing::debug!(
                     decision = intent.decision,
-                    "turn intent reached handle_intent"
+                    "turn intent reached plan_intent"
                 );
+                None
             }
-            other => tracing::warn!(decision = other, "unknown intent decision"),
+            other => {
+                tracing::warn!(decision = other, "unknown intent decision");
+                None
+            }
         }
     }
 
-    /// Say something the planner decided on, without an LLM round-trip.
-    /// One line per entity per [`INTENT_SAY_GAP`] and never over the bot's
-    /// own voice; returns whether it was said. Pushed into history as an
-    /// assistant turn so the model knows it already greeted.
-    /// The gap is per (entity, kind): a greeting and then a question to the
-    /// same person seconds later is a conversation; the same greeting twice
-    /// is a stutter.
-    fn proactive(&mut self, entity: Option<EntityId>, kind: &'static str, line: String) -> bool {
+    /// The gate on a spoken intent: one per (entity, kind) per
+    /// [`INTENT_SAY_GAP`]. The planner re-decides on every tick and will
+    /// repeat itself until the world changes; the gap is per kind so a
+    /// greeting and then a question to the same person seconds later is
+    /// a conversation, and the same greeting twice a stutter. Records
+    /// the moment as said (the line follows at once, canned or from the
+    /// model).
+    fn gate(&mut self, entity: Option<EntityId>, kind: &'static str) -> Option<()> {
         let now = self.clock.now();
         let key = (entity, kind);
         let recently = self
@@ -546,18 +796,34 @@ impl Session {
             .is_some_and(|t| now.saturating_duration_since(*t) < INTENT_SAY_GAP);
         if recently {
             tracing::debug!(entity = ?key.0, kind, "intent suppressed: said that to them recently");
-            return false;
+            return None;
         }
         self.last_intent_say.insert(key, now);
-        self.speak_line(line);
-        true
+        Some(())
     }
 
-    /// A planner `greet`: "Hi John.", or after a real absence "Welcome
-    /// back, John. You were gone about 11 minutes." plus what they were
-    /// last talking about, if memory has it (the most recent fact is the
-    /// most relevant thing to pick up).
-    fn greet(&mut self, entity: Option<EntityId>, name: Option<&str>, returned_after: Option<u64>) {
+    /// The display name for a line of ours: the room's label when they
+    /// are in it and known; nothing for a stranger or an id we cannot
+    /// place, so the note never says "hi track:3".
+    fn name_of(&self, entity: Option<&EntityId>) -> Option<String> {
+        let id = entity?;
+        if id.is_track() {
+            return None;
+        }
+        let view = (self.snapshot)();
+        Some(display_name(&view, id))
+    }
+
+    /// A planner `greet`: the arrival, or after a real absence the
+    /// return, with the canned line it used to be as the fallback: "Hi
+    /// John.", or "Welcome back, John. You were gone about 11 minutes."
+    /// plus what they were last talking about, if memory has it.
+    fn greet(
+        &mut self,
+        entity: Option<EntityId>,
+        name: Option<&str>,
+        returned_after: Option<u64>,
+    ) -> Option<Proactive> {
         let line = match (name, returned_after) {
             (Some(n), Some(away)) => {
                 let ago = if away >= 3600 {
@@ -577,13 +843,26 @@ impl Session {
             }
             _ => line,
         };
-        self.proactive(entity, "greet", line);
+        self.gate(entity.clone(), "greet")?;
+        let moment = if returned_after.is_some() {
+            Moment::Return
+        } else {
+            Moment::Arrival
+        };
+        let mut p = Proactive::new(moment, line);
+        p.name = name
+            .map(str::to_owned)
+            .or_else(|| self.name_of(entity.as_ref()));
+        p.away = returned_after.map(Duration::from_secs);
+        p.entity = entity;
+        Some(p)
     }
 
-    /// "Hi Ada, hi Bob.": one hello for people who arrived together,
-    /// keyed on the first so the gap applies, and recorded for the others
-    /// so a `greet` for one of them a moment later is not a second hello.
-    fn greet_pair(&mut self, ids: &[EntityId]) {
+    /// People who arrived together: one hello for both ("Hi Ada, hi
+    /// Bob." as the fallback), keyed on the first so the gap applies, and
+    /// recorded for the others so a `greet` for one of them a moment
+    /// later is not a second hello.
+    fn greet_pair(&mut self, ids: &[EntityId]) -> Option<Proactive> {
         let view = (self.snapshot)();
         let names: Vec<String> = ids.iter().map(|id| display_name(&view, id)).collect();
         let line = format!(
@@ -596,19 +875,23 @@ impl Session {
                 .join(", ")
         );
         let now = self.clock.now();
-        if self.proactive(ids.first().cloned(), "greet", line) {
-            for id in ids.iter().skip(1) {
-                self.last_intent_say
-                    .insert((Some(id.clone()), "greet"), now);
-            }
+        self.gate(ids.first().cloned(), "greet")?;
+        for id in ids.iter().skip(1) {
+            self.last_intent_say
+                .insert((Some(id.clone()), "greet"), now);
         }
+        let mut p = Proactive::new(Moment::Pair, line);
+        p.entity = ids.first().cloned();
+        p.names = names;
+        Some(p)
     }
 
     /// The mind's question about something new, once per `about` per
-    /// [`CURIOUS_GAP`]. Not through `proactive`: its gap is per (entity,
-    /// kind), and two questions about two different things a few seconds
-    /// apart are both wanted; the per-`about` map is the only guard.
-    fn curious(&mut self, about: String, text: String) {
+    /// [`CURIOUS_GAP`]. Not through [`Session::gate`]: its gap is per
+    /// (entity, kind), and two questions about two different things a
+    /// few seconds apart are both wanted; the per-`about` map is the
+    /// only guard. The mind's own words are the fallback.
+    fn curious(&mut self, about: String, text: String) -> Option<Proactive> {
         let now = self.clock.now();
         let recently = self
             .last_curious
@@ -619,10 +902,12 @@ impl Session {
                 about,
                 "curious intent suppressed: asked about that recently"
             );
-            return;
+            return None;
         }
         self.last_curious.insert(about, now);
-        self.speak_line(text);
+        let mut p = Proactive::new(Moment::Novelty, text.clone());
+        p.about = Some(text);
+        Some(p)
     }
 
     /// Say a line of our own, ungated, and keep it in the history as an
@@ -630,7 +915,145 @@ impl Session {
     fn speak_line(&mut self, line: String) {
         tracing::info!(line, "proactive");
         self.conversation.push(Message::assistant(&line));
+        self.said.push(&line);
         self.say(line);
+    }
+
+    /// What the proactive note draws on for `p`: memory's line about
+    /// their last visit and their facts (prefetched by a `recall` when
+    /// there was one), whether we greeted them inside
+    /// [`GREETING_WINDOW`], our last [`NOTE_RECENT`] lines, and the time.
+    fn note_context(&self, p: &Proactive) -> NoteContext {
+        let now = self.clock.now();
+        let (facts, returned_context, greeted_recently) = match &p.entity {
+            Some(id) => (
+                self.prefetched
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| self.facts.recall(id)),
+                self.facts.returned_context(id),
+                // `greeted_at`, not the say-gate: the gate for this very
+                // moment was stamped a moment ago and would read as a
+                // hello already said.
+                self.greeted_at
+                    .get(id)
+                    .is_some_and(|t| now.saturating_duration_since(*t) < GREETING_WINDOW),
+            ),
+            None => (Vec::new(), None, false),
+        };
+        NoteContext {
+            facts,
+            returned_context,
+            greeted_recently,
+            recent_lines: self
+                .said
+                .recent(NOTE_RECENT)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            time: local_time(),
+        }
+    }
+
+    /// Speak first, into a moment: the model gets the `[note]` from
+    /// [`Proactive::note`] on top of the conversation and writes one
+    /// sentence in character. The canned line is said instead when the
+    /// model fails, says nothing, or is not done inside
+    /// [`PROACTIVE_DEADLINE`] from the start of the turn -- the person
+    /// just walked in, and a hello that comes three seconds late is
+    /// worse than a plain one. A line that repeats one of ours or is
+    /// generic gets one more try with the remaining time. Voice during
+    /// the turn abandons it: someone speaking is not a moment for us.
+    ///
+    /// Only the line goes into the history, as an assistant turn; the
+    /// note does not (an old note is not something anyone said).
+    pub async fn proactive_turn(
+        &mut self,
+        p: Proactive,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: CancellationToken,
+    ) -> Result<TurnEnd, LlmError> {
+        let started = self.clock.now();
+        let deadline = tokio::time::Instant::now() + PROACTIVE_DEADLINE;
+        let cx = self.note_context(&p);
+        let note = p.note(&cx);
+        let base = self.conversation.prepare("", None);
+        self.start_condense();
+        let mut hint: Option<&str> = None;
+        let mut line: Option<String> = None;
+        for attempt in 0..2 {
+            let mut messages = base.clone();
+            let content = match hint {
+                Some(h) => format!("{note}\n\n{h}"),
+                None => note.clone(),
+            };
+            messages.push(Message::user(content));
+            let stream = self.backend.chat(ChatRequest {
+                messages,
+                tools: Vec::new(),
+                max_tokens: PROACTIVE_MAX_TOKENS,
+                temperature: PROACTIVE_TEMPERATURE,
+                json_object: false,
+            });
+            match collect_line(stream, deadline, obs, &cancel).await {
+                LineEnd::Cancelled => {
+                    tracing::info!(kind = p.moment.kind(), "proactive turn abandoned: voice");
+                    return Ok(TurnEnd::Cancelled);
+                }
+                LineEnd::Late => {
+                    tracing::info!(
+                        kind = p.moment.kind(),
+                        ms = PROACTIVE_DEADLINE.as_millis(),
+                        attempt,
+                        "proactive line late: saying the canned line"
+                    );
+                    break;
+                }
+                LineEnd::Failed(e) => {
+                    tracing::warn!(error = %e, kind = p.moment.kind(), "proactive line failed");
+                    break;
+                }
+                LineEnd::Text(t) => {
+                    // The greeting goes before the sentence is picked:
+                    // "Hi there! What's your name?" is the question.
+                    let mut t = clean_reply(&t);
+                    if cx.greeted_recently || p.moment == Moment::StrangerSettled {
+                        t = strip_leading_greeting(&t);
+                    }
+                    let s = first_sentence(&t);
+                    if s.is_empty() {
+                        tracing::info!(kind = p.moment.kind(), "proactive line empty");
+                        break;
+                    }
+                    if is_generic(&s) {
+                        tracing::info!(line = s, "proactive line generic: asking again");
+                        hint = Some(RETRY_GENERIC);
+                        continue;
+                    }
+                    if self.said.repeats(&s) {
+                        tracing::info!(line = s, "proactive line repeats: asking again");
+                        hint = Some(RETRY_DIFFERENTLY);
+                        continue;
+                    }
+                    line = Some(s);
+                    break;
+                }
+            }
+        }
+        let fallback = line.is_none();
+        let line = line.unwrap_or_else(|| p.canned.clone());
+        tracing::info!(
+            kind = p.moment.kind(),
+            fallback,
+            ms = self
+                .clock
+                .now()
+                .saturating_duration_since(started)
+                .as_millis(),
+            "proactive turn"
+        );
+        self.spoke_moment(&p, line);
+        Ok(TurnEnd::Done)
     }
 
     /// After a tool ran: a successful `remember_name` has attached a name
@@ -753,6 +1176,23 @@ impl Session {
                 .map_or_else(|| id.to_string(), mind::ViewEntity::label)
         });
         // The turn's own hints, after the note proper (see the constants).
+        let nobody_known = speaker.is_none() && view.people.iter().all(|p| !p.is_known());
+        if nobody_known && !self.lull && view.people.is_empty() {
+            note.push('\n');
+            note.push_str(NOTE_NOTHING_KNOWN);
+            if self.streak >= 2 {
+                let _ = write!(
+                    note,
+                    " That is the same thing from them {} times in a row now; say so, lightly, \
+                     and ask them something.",
+                    self.streak
+                );
+            }
+        }
+        if let Some(c) = self.crowd_now().filter(|_| !self.lull) {
+            note.push('\n');
+            note.push_str(&c.line());
+        }
         if !view.people.is_empty() {
             let stranger_talking = speaker.is_none() && view.people.iter().any(|p| !p.is_known());
             if stranger_talking {
@@ -825,6 +1265,26 @@ impl Session {
             content.push_str("\n\n");
             content.push_str(&Self::self_note(&(self.snapshot)()));
         }
+        // The reply follows the length of what it answers; a lull note
+        // asks for one sentence and gets the budget for one.
+        self.turn_budget = if self.adaptive_brevity {
+            reply_budget(text, self.lull, self.max_tokens)
+        } else {
+            self.max_tokens
+        };
+        self.streak = if self.lull {
+            1
+        } else {
+            same_words_streak(
+                text,
+                self.conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .filter(|m| m.role == Role::User)
+                    .map(|m| utterance_of(&m.content)),
+            )
+        };
         self.conversation.push(Message::user(content));
         self.absent_hint = names_someone_absent(text, &(self.snapshot)());
         self.memory_request = asks_to_be_forgotten(text);
@@ -911,9 +1371,20 @@ impl Session {
         // the first request is later than FIRST_TOKEN_GRACE. A tool round
         // that follows is not the person's wait starting over.
         let mut thought_aloud = false;
-        for round in 0..=self.max_tool_rounds {
+        // Every sentence goes through the generic and repetition filters
+        // before the speaker hears it (see `crate::voice`). When they
+        // leave nothing of a reply, the model gets one more try with the
+        // hint that fits, and a request past that gets `fallback_opener`
+        // for a generic reply and silence for a repeated one.
+        let mut retry_hint: Option<&'static str> = None;
+        let mut retried = false;
+        let mut round = 0;
+        loop {
             let (view, note, name) = self.room(speaker);
-            let messages = self.conversation.prepare(&note, name.as_deref());
+            let mut messages = self.conversation.prepare(&note, name.as_deref());
+            if let Some(h) = retry_hint.take() {
+                messages.push(Message::user(h));
+            }
             // A trim may have just happened; summarise what fell off while
             // the model works on the turn.
             self.start_condense();
@@ -924,7 +1395,7 @@ impl Session {
                 // enrol a stranger (`remember_name`) and not just note
                 // facts, plus the reach tools the policy allows.
                 tools: self.tools.specs(),
-                max_tokens: self.max_tokens,
+                max_tokens: self.turn_budget,
                 temperature: self.temperature,
                 json_object: false,
             });
@@ -932,6 +1403,7 @@ impl Session {
             let mut spoken = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut cancelled = false;
+            let mut dropped = Dropped::default();
             // Voice that has started but not yet lasted `BARGE_IN_SUSTAIN`.
             // A bell or a cough raises voice_activity too; only speech
             // that keeps going cancels the turn (see mind's BargeInStop).
@@ -1006,9 +1478,7 @@ impl Session {
                                 // of sentence one overlaps generation of
                                 // sentence two.
                                 if let Some(s) = splitter.push(&t) {
-                                    spoken.push_str(&s);
-                                    spoken.push(' ');
-                                    self.say(s);
+                                    self.emit(s, &mut spoken, &mut dropped);
                                 }
                             }
                         }
@@ -1038,16 +1508,41 @@ impl Session {
                 return Ok(TurnEnd::Cancelled);
             }
             if let Some(s) = splitter.finish() {
-                spoken.push_str(&s);
-                self.say(s);
+                self.emit(s, &mut spoken, &mut dropped);
             }
             let said = spoken.trim().to_owned();
             if !said.is_empty() {
-                self.conversation.push(Message::assistant(said));
+                self.conversation.push(Message::assistant(said.clone()));
             }
-            if calls.is_empty() || round >= self.max_tool_rounds {
+            if calls.is_empty() {
+                if said.is_empty() && dropped.any() {
+                    if !retried {
+                        retried = true;
+                        // A repeat is the worse fault: the generic
+                        // sentence is stripped either way.
+                        retry_hint = Some(if dropped.repeat {
+                            RETRY_REPEAT
+                        } else {
+                            RETRY_GENERIC
+                        });
+                        tracing::info!(?dropped, "reply filtered out: asking again");
+                        continue;
+                    }
+                    if dropped.generic {
+                        let facts = speaker.map_or_else(Vec::new, |id| self.facts.recall(id));
+                        let line = fallback_opener(name.as_deref(), &facts);
+                        tracing::info!(line, "generic twice: specific opener");
+                        self.speak_line(line);
+                    } else {
+                        tracing::info!("repeated twice: dropped");
+                    }
+                }
                 return Ok(TurnEnd::Done);
             }
+            if round >= self.max_tool_rounds {
+                return Ok(TurnEnd::Done);
+            }
+            round += 1;
 
             // Record the calls, run them, hand back the results, and let
             // the model finish its turn with what it learned.
@@ -1075,7 +1570,26 @@ impl Session {
                 self.conversation.push(r);
             }
         }
-        Ok(TurnEnd::Done)
+    }
+
+    /// One finished sentence of a reply: spoken unless it is generic or
+    /// repeats a recent line of ours, in which case `dropped` records
+    /// why. What is spoken is appended to `spoken` and remembered.
+    fn emit(&mut self, sentence: String, spoken: &mut String, dropped: &mut Dropped) {
+        if is_generic(&sentence) {
+            tracing::info!(sentence, "generic sentence dropped");
+            dropped.generic = true;
+            return;
+        }
+        if self.said.repeats(&sentence) {
+            tracing::info!(sentence, "repeated sentence dropped");
+            dropped.repeat = true;
+            return;
+        }
+        spoken.push_str(&sentence);
+        spoken.push(' ');
+        self.said.push(&sentence);
+        self.say(sentence);
     }
 
     /// Kick off a condense job if turns are waiting and none is running.
@@ -1382,7 +1896,18 @@ impl Session {
         current: &Arc<Mutex<Option<CancellationToken>>>,
     ) {
         let Some(turn) = turn_intent(&cmd) else {
-            self.handle_intent(&cmd);
+            match self.plan_intent(&cmd) {
+                Some(Planned::Line(line)) => self.speak_line(line),
+                Some(Planned::Turn(p)) => {
+                    let token = shutdown.child_token();
+                    *current.lock() = Some(token.clone());
+                    if let Err(e) = self.proactive_turn(p, obs, token).await {
+                        tracing::warn!(error = %e, "proactive turn failed");
+                    }
+                    *current.lock() = None;
+                }
+                None => {}
+            }
             return;
         };
         if self.holding() && !matches!(turn, TurnIntent::Answer { .. }) {
@@ -1422,6 +1947,70 @@ impl Session {
             .retain(|_, at| now.saturating_duration_since(*at) < IGNORE_TTL);
         self.ignore.remove(id).is_some()
     }
+}
+
+/// Why sentences of a reply were not spoken (see [`Session::emit`]).
+#[derive(Debug, Default)]
+struct Dropped {
+    generic: bool,
+    repeat: bool,
+}
+
+impl Dropped {
+    fn any(&self) -> bool {
+        self.generic || self.repeat
+    }
+}
+
+/// How collecting a proactive line ended.
+enum LineEnd {
+    /// The whole reply.
+    Text(String),
+    /// Voice, or the handle's cancel.
+    Cancelled,
+    /// The deadline passed first.
+    Late,
+    /// The backend failed.
+    Failed(LlmError),
+}
+
+/// Read a whole reply off `stream` by `deadline`, abandoning it on voice
+/// (any `voice_activity` start: a proactive line must not talk over
+/// anyone) or on `cancel`. Tool calls are ignored: none are offered.
+async fn collect_line(
+    mut stream: crate::backend::EventStream,
+    deadline: tokio::time::Instant,
+    obs: &mut mpsc::Receiver<Observation>,
+    cancel: &CancellationToken,
+) -> LineEnd {
+    let mut text = String::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return LineEnd::Cancelled,
+            () = tokio::time::sleep_until(deadline) => return LineEnd::Late,
+            o = obs.recv() => {
+                if let Some(o) = o {
+                    if barge_in(&o) {
+                        return LineEnd::Cancelled;
+                    }
+                }
+            }
+            ev = stream.next() => match ev {
+                None => return LineEnd::Text(text),
+                Some(Err(e)) => return LineEnd::Failed(e),
+                Some(Ok(ChatEvent::Text(t))) => text.push_str(&t),
+                Some(Ok(ChatEvent::Call(_))) => {}
+            }
+        }
+    }
+}
+
+/// The words a person said, out of a stored user message: after the
+/// `[room]` note and its blank line, without the "Ada says:" prefix.
+fn utterance_of(content: &str) -> &str {
+    let said = content.rsplit_once("\n\n").map_or(content, |(_, s)| s);
+    said.split_once(" says: ").map_or(said, |(_, s)| s)
 }
 
 /// Drain what queued during a turn and keep only the newest utterance.
@@ -1821,7 +2410,7 @@ mod tests {
 
     use super::*;
     use crate::mock::{MockLlm, Script};
-    use crate::prompt::{MARKER, Role};
+    use crate::prompt::{MARKER, MAX_HISTORY};
     use crate::tools::InMemoryFacts;
 
     fn person(id: &str, speaking: bool) -> ViewEntity {
@@ -1926,7 +2515,8 @@ mod tests {
             reqs[0].tools.len(),
             crate::tools::full_tool_specs_with(ToolPolicy::from_env()).len()
         );
-        assert_eq!(reqs[0].max_tokens, 300);
+        // "hello" is a short remark: one short sentence's worth of tokens.
+        assert_eq!(reqs[0].max_tokens, crate::voice::BUDGET_SHORT);
 
         let cmds = drain(&r.commands);
         assert_eq!(
@@ -3035,7 +3625,9 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let (reqs, cmds) = l.stop().await;
-        assert_eq!(reqs.len(), 1);
+        // The answer, then the greeting's own model turn (unscripted, so
+        // the mock says nothing and the canned line is spoken).
+        assert_eq!(reqs.len(), 2);
         assert!(
             reqs[0]
                 .messages
@@ -3460,6 +4052,402 @@ mod tests {
             last_user.content
         );
         assert_eq!(says(&cmds), ["Great, glad it's done."]);
+    }
+
+    // ------------------------------------------------------ own voice
+
+    #[tokio::test]
+    async fn greet_is_a_model_turn_with_the_note_and_the_canned_fallback() {
+        let l = start(
+            vec![Script::text(&["Two days, John.", " Long ones?"])],
+            vec![person("john", false)],
+        );
+        l.llm.push(Script::text(&[]));
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","returned_after_secs":172800,"entity":"john","goal":"greet","mood":"tired"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        // Again for Ada, unscripted: the mock says nothing, the canned
+        // line is spoken so the moment is not lost.
+        l.clock.advance(INTENT_SAY_GAP);
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"Ada","entity":"ada","goal":"greet"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        let note = reqs[0].messages.last().unwrap().content.clone();
+        assert!(note.starts_with("[note] "), "{note}");
+        assert!(note.contains("John is back after 2 days away."), "{note}");
+        assert!(note.contains("seemed tired lately"), "{note}");
+        assert!(note.contains("ONE sentence"), "{note}");
+        assert!(note.contains("Time: "), "{note}");
+        // No tools, hotter sampling, a one-sentence ceiling.
+        assert!(reqs[0].tools.is_empty());
+        assert!((reqs[0].temperature - PROACTIVE_TEMPERATURE).abs() < f32::EPSILON);
+        assert_eq!(reqs[0].max_tokens, PROACTIVE_MAX_TOKENS);
+        // The note is not in the history: only the line is (the second
+        // request's own note is its last message).
+        let n = reqs[1].messages.len();
+        assert!(
+            reqs[1].messages[..n - 1]
+                .iter()
+                .all(|m| !m.content.contains("[note] Nobody said"))
+        );
+        // One sentence spoken, the second dropped; then the fallback.
+        assert_eq!(says(&cmds), ["Two days, John.", "Hi Ada."]);
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content == "Two days, John.")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_proactive_line_falls_back_to_the_canned_one() {
+        let l = start(
+            vec![
+                Script::text(&["Slow", " hello."])
+                    .with_delay(PROACTIVE_DEADLINE + Duration::from_millis(200)),
+            ],
+            vec![person("john", false)],
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+            ))
+            .unwrap();
+        let started = Instant::now();
+        assert!(l.requests_reach(1).await);
+        tokio::time::sleep(PROACTIVE_DEADLINE + Duration::from_millis(100)).await;
+        l.idle().await;
+        let took = started.elapsed();
+        let (_, cmds) = l.stop().await;
+        assert_eq!(says(&cmds), ["Hi John."]);
+        assert!(
+            took < PROACTIVE_DEADLINE + Duration::from_secs(1),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_proactive_line_falls_back_and_voice_abandons_it() {
+        let l = start(
+            vec![
+                Script::failing("boom"),
+                Script::text(&["Never", " said."]).with_delay(Duration::from_millis(300)),
+            ],
+            vec![person("john", false)],
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"remind","text":"call mum","id":7,"entity":"john","goal":"remind"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        // A second moment, with voice arriving while the model streams.
+        l.itx
+            .send(intent(
+                r#"{"decision":"curious","about":"object:cup","text":"What's that cup for?"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(2).await);
+        l.voice(true).await;
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(says(&cmds), ["You asked me to remind you to call mum."]);
+        let note = reqs[1].messages.last().unwrap().content.clone();
+        assert!(
+            note.contains("Your first thought was: What's that cup for?"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_name_line_loses_its_hello_and_arms_the_answer() {
+        let l = start(
+            vec![
+                Script::text(&["Hi there! What should I call you?"]),
+                Script::text(&["Nice to meet you, Ada."])
+                    .calling("remember_name", r#"{"name":"Ada"}"#),
+            ],
+            vec![],
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"ask_name","entity":"track:7","goal":"ask_name"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        l.obs_tx
+            .send(
+                Observation::new("mic0", UTTERANCE, Instant::now())
+                    .with_payload(Payload::Text("Ada".into())),
+            )
+            .await
+            .unwrap();
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(says(&cmds)[0], "What should I call you?");
+        let note = reqs[0].messages.last().unwrap().content.clone();
+        assert!(note.contains("Ask their name"), "{note}");
+        assert!(
+            user_turns(&reqs[1])
+                .last()
+                .unwrap()
+                .contains(NAME_ANSWER_HINT)
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_sentences_are_stripped_and_twice_gets_a_specific_opener() {
+        let mut r = rig(
+            vec![
+                Script::text(&[
+                    "Nice to see you, John. ",
+                    "How are you doing today? ",
+                    "Is there anything I can help with?",
+                ]),
+                // Turn two: only generic, twice.
+                Script::text(&["How can I help you today?"]),
+                Script::text(&["What can I do for you?"]),
+            ],
+            vec![person("john", true)],
+        );
+        r.facts
+            .remember(&EntityId::new("john"), "John is building a robot.");
+        let john = EntityId::new("john");
+        r.session
+            .handle_utterance("hey", Some(&john), &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(says(&drain(&r.commands)), ["Nice to see you, John."]);
+        assert_eq!(
+            r.session.conversation().history().last().unwrap().content,
+            "Nice to see you, John."
+        );
+        r.session
+            .handle_utterance(
+                "hey again",
+                Some(&john),
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let reqs = r.llm.requests();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[2].messages.last().unwrap().content, RETRY_GENERIC);
+        assert_eq!(
+            says(&drain(&r.commands)),
+            ["john, last I heard John is building a robot. Still the case?"]
+        );
+    }
+
+    /// The session in `data/launch.log`: "Hello." six times, the same
+    /// "Hello! I noticed you back after a while. How are you doing
+    /// today?" six times. Now: the wellbeing line is never spoken, a
+    /// repeat is asked again with the hint, and six hellos get six
+    /// different lines.
+    #[tokio::test]
+    async fn six_hellos_get_six_different_lines() {
+        let canned = [
+            "Hello! ",
+            "I noticed you back after a while. ",
+            "How are you doing today?",
+        ];
+        let mut scripts = vec![Script::text(&canned)];
+        for i in 2..=6 {
+            scripts.push(Script::text(&canned));
+            scripts.push(Script::text(&[&format!(
+                "Hello number {i}, still here, still listening."
+            )]));
+        }
+        let mut r = rig(scripts, vec![]);
+        let mut lines = Vec::new();
+        for _ in 0..6 {
+            r.session
+                .handle_utterance("Hello.", None, &mut r.obs_rx, CancellationToken::new())
+                .await
+                .unwrap();
+            lines.push(says(&drain(&r.commands)).join(" "));
+        }
+        assert_eq!(lines[0], "Hello! I noticed you back after a while.");
+        let distinct: std::collections::HashSet<&String> = lines.iter().collect();
+        assert_eq!(distinct.len(), 6, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| !l.contains("How are you")),
+            "{lines:?}"
+        );
+        // The repeat was asked again with the hint, the note told the
+        // model it has nothing to go on and counted the hellos.
+        let reqs = r.llm.requests();
+        assert_eq!(reqs[2].messages.last().unwrap().content, RETRY_REPEAT);
+        let last = reqs
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && m.content.starts_with(MARKER))
+            .unwrap();
+        assert!(
+            last.content.contains(NOTE_NOTHING_KNOWN),
+            "{}",
+            last.content
+        );
+        assert!(
+            last.content.contains("6 times in a row"),
+            "{}",
+            last.content
+        );
+        // Every line said stays in the history across the turns.
+        let hist = r.session.conversation().history();
+        for l in &lines {
+            assert!(
+                hist.iter()
+                    .any(|m| m.role == Role::Assistant && &m.content == l),
+                "{l}"
+            );
+        }
+        // The ring is per sentence: two from the first turn, one each after.
+        assert_eq!(r.session.said().all().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn repeated_twice_is_dropped_not_spoken() {
+        let mut r = rig(
+            vec![
+                Script::text(&["I'm Glydi."]),
+                Script::text(&["I'm Glydi."]),
+                Script::text(&["I'm Glydi."]),
+            ],
+            vec![person("john", true)],
+        );
+        let john = EntityId::new("john");
+        for _ in 0..2 {
+            r.session
+                .handle_utterance(
+                    "who are you?",
+                    Some(&john),
+                    &mut r.obs_rx,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        // First answer spoken; the second (and its retry, the same line
+        // again) dropped: nothing generic, so no opener either.
+        assert_eq!(says(&drain(&r.commands)), ["I'm Glydi."]);
+        assert_eq!(r.llm.requests().len(), 3);
+    }
+
+    /// Why the six hellos got the same reply: not lost history. The lines
+    /// we say stay in the conversation across turns, trims and a retract
+    /// of a later turn, so the model always sees what it said.
+    #[tokio::test]
+    async fn own_lines_survive_turns_trims_and_retracts() {
+        let scripts = (0..30)
+            .map(|i| Script::text(&[&format!("Reply {i}.")]))
+            .collect();
+        let mut r = rig(scripts, vec![person("john", true)]);
+        let john = EntityId::new("john");
+        for i in 0..30 {
+            r.session
+                .handle_utterance(
+                    &format!("q{i}"),
+                    Some(&john),
+                    &mut r.obs_rx,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let hist = r.session.conversation().history();
+        let replies: Vec<&str> = hist
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.content.as_str())
+            .collect();
+        // The tail is intact and in order; the head was condensed, not lost.
+        assert!(replies.len() >= MAX_HISTORY / 2, "{replies:?}");
+        assert_eq!(*replies.last().unwrap(), "Reply 29.");
+        assert!(replies.windows(2).all(|w| w[0] < w[1]));
+        assert!(!r.session.conversation().pending().is_empty());
+        // Retracting the last turn removes only that turn.
+        let mut c = Conversation::local();
+        c.push(Message::user("one"));
+        c.push(Message::assistant("Hi John."));
+        c.push(Message::user("two"));
+        c.push(Message::assistant("half"));
+        c.retract_last_turn();
+        assert!(c.history().iter().any(|m| m.content == "Hi John."));
+    }
+
+    #[test]
+    fn crowd_fields_are_read_and_rendered() {
+        let mut r = rig(vec![], vec![person("ada", false)]);
+        r.session.handle_intent(&intent(
+            r#"{"decision":"crowd","people_present":4,"waiting":["Sam","Leo"],"talker_seconds":90}"#,
+        ));
+        assert!(drain(&r.commands).is_empty());
+        let (_, note, _) = r.session.room(None);
+        assert!(note.contains("There are 4 people here."), "{note}");
+        assert!(note.contains("Waiting to talk to you: Sam, Leo."), "{note}");
+        assert!(note.contains("hold that thought"), "{note}");
+        // On a proactive moment too, and gone after the TTL.
+        let p = r.session.plan_intent(&intent(
+            r#"{"decision":"greet","name":"Ada","entity":"ada","goal":"greet","people_present":3}"#,
+        ));
+        let Some(Planned::Turn(p)) = p else {
+            panic!("{p:?}");
+        };
+        assert_eq!(p.crowd.as_ref().and_then(|c| c.people_present), Some(3));
+        assert!(
+            p.note(&NoteContext::default())
+                .contains("There are 3 people here.")
+        );
+        let clock = Arc::new(FakeClock::new());
+        let mut s = Session::new(
+            MockLlm::new(vec![]),
+            Config::default(),
+            room_with(vec![]),
+            Arc::new(InMemoryFacts::new()),
+            Arc::new(CommandQueue::new()),
+            clock.clone(),
+        );
+        s.handle_intent(&intent(r#"{"decision":"crowd","people_present":2}"#));
+        clock.advance(CROWD_TTL);
+        assert!(!s.room(None).1.contains("people here"));
+        assert_eq!(Crowd::default().line(), "");
+        assert_eq!(
+            Crowd {
+                people_present: None,
+                waiting: vec!["Sam".into()],
+                talker_seconds: Some(10)
+            }
+            .line(),
+            "Waiting to talk to you: Sam. The one talking has been going for 10 seconds."
+        );
+    }
+
+    #[test]
+    fn utterance_is_recovered_from_a_stored_message() {
+        assert_eq!(
+            utterance_of("[room] People visible:\n- john\n\njohn says: hello"),
+            "hello"
+        );
+        assert_eq!(utterance_of("plain"), "plain");
+        assert_eq!(utterance_of("[room] x\n\nhello"), "hello");
     }
 
     // ------------------------------------------------------ self-model
