@@ -84,6 +84,13 @@ impl Transcriber for Whisper {
         params.set_n_threads(self.threads);
         params.set_language(Some("en"));
         params.set_translate(false);
+        // Conversation, not transcription of a room: drop the bracketed
+        // sound descriptions ("(whistling)", "[Music]") at the token level,
+        // treat a segment the model itself rates as probably-not-speech as
+        // silence, and never split one utterance into several segments.
+        params.set_suppress_nst(true);
+        params.set_no_speech_thold(0.6);
+        params.set_single_segment(true);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
@@ -95,10 +102,68 @@ impl Transcriber for Whisper {
             text.push_str(&seg.to_str_lossy()?);
         }
         let text = text.trim();
-        if text == BLANK_AUDIO {
+        if text == BLANK_AUDIO || is_non_speech(text) {
             return Ok(String::new());
         }
         // A longer transcript can still carry the sentinel inline.
         Ok(text.replace(BLANK_AUDIO, "").trim().to_string())
+    }
+}
+
+/// Whisper describes sounds it recognises but cannot transcribe as a
+/// bracketed note: `(whistling)`, `[Music]`, `(bell dings)`. Answering those
+/// as if they were said is wrong twice over -- the bot replies to a bell,
+/// and the reply it was already giving gets cancelled by the "speech" that
+/// turned out to be a bell. A transcript that is nothing but such notes is
+/// treated as blank.
+fn is_non_speech(text: &str) -> bool {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return true;
+    }
+    while !rest.is_empty() {
+        let (open, close) = match rest.as_bytes()[0] {
+            b'(' => ('(', ')'),
+            b'[' => ('[', ']'),
+            b'*' => ('*', '*'),
+            _ => return false,
+        };
+        let Some(end) = rest[open.len_utf8()..].find(close) else {
+            return false;
+        };
+        rest = rest[open.len_utf8() + end + close.len_utf8()..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == '-');
+    }
+    true
+}
+
+#[cfg(test)]
+mod non_speech_tests {
+    use super::is_non_speech;
+
+    #[test]
+    fn bracketed_notes_are_blank() {
+        for t in [
+            "(whistling)",
+            "[Music]",
+            "(bell dings)",
+            "[Music] (laughs)",
+            "*sighs*",
+            "",
+        ] {
+            assert!(is_non_speech(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn speech_is_not() {
+        for t in [
+            "Hello.",
+            "[Music] What can you see?",
+            "(laughs) yes",
+            "What (really)?",
+        ] {
+            assert!(!is_non_speech(t), "{t}");
+        }
     }
 }

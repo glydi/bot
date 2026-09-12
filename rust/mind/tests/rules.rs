@@ -53,20 +53,30 @@ fn barge_in_stop() {
 
     r.on_observation(&self_speaking(clock.at_secs(1.0), true));
     assert!(r.world().bot_speaking());
-    // Unidentified voice while the bot talks: stop, even with nobody to attend to.
+    // Unidentified voice while the bot talks: not yet -- a bell raises
+    // voice_activity too. Sustained for SUSTAIN, it is an interruption,
+    // even with nobody to attend to.
     let cmds = r.on_observation(&voice(clock.at_secs(1.5), None, true));
-    assert_eq!(kinds(&cmds), ["speaker/stop"]);
+    assert!(cmds.is_empty(), "{:?}", kinds(&cmds));
+    assert!(r.tick(clock.at_secs(1.8)).is_empty());
+    assert_eq!(kinds(&r.tick(clock.at_secs(1.95))), ["speaker/stop"]);
+    // Once. The next tick does not repeat it.
+    assert!(r.tick(clock.at_secs(2.1)).is_empty());
 
-    // Identified: stop first (it is pushed before attend), then attend.
-    r.on_observation(&face_known(clock.at_secs(1.6), "john"));
-    let cmds = r.on_observation(&voice(clock.at_secs(1.7), Some("john"), true));
-    assert_eq!(kinds(&cmds), ["speaker/stop", "ui/attend"]);
+    // A short noise: voice stops before SUSTAIN, no stop is ever issued.
+    r.on_observation(&voice(clock.at_secs(2.2), None, true));
+    r.on_observation(&voice(clock.at_secs(2.4), None, false));
+    assert!(r.tick(clock.at_secs(2.7)).is_empty());
+
+    // Identified: attend on the edge, stop once the voice has lasted.
+    r.on_observation(&face_known(clock.at_secs(3.0), "john"));
+    let cmds = r.on_observation(&voice(clock.at_secs(3.1), Some("john"), true));
+    assert_eq!(kinds(&cmds), ["ui/attend"]);
+    assert_eq!(kinds(&r.tick(clock.at_secs(3.6))), ["speaker/stop"]);
 
     r.world_mut().set_bot_speaking(false);
-    assert!(
-        r.on_observation(&voice(clock.at_secs(2.0), None, true))
-            .is_empty()
-    );
+    r.on_observation(&voice(clock.at_secs(4.0), None, true));
+    assert!(r.tick(clock.at_secs(4.5)).is_empty());
 }
 
 /// One second of the conversation: a voiced frame (keeps the run alive,

@@ -115,6 +115,7 @@ fn main() -> anyhow::Result<()> {
 fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
     let headless = parts.headless;
     let mut app = App::build(config, parts)?;
+    exit::install_fast_exit();
 
     let (ctrlc_tx, ctrlc_rx) = crossbeam_channel::bounded::<()>(1);
     let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -149,4 +150,35 @@ fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
     }
     app.stop();
     Ok(())
+}
+
+/// Leaving the process without running C++ static destructors.
+///
+/// whisper.cpp's Metal backend keeps a process-wide device behind a static
+/// with a destructor, and that destructor aborts if a whisper context is
+/// still alive when it runs -- which is every exit that did not first tear
+/// the app down: an `AppKit` `terminate:` (Quit from the Dock, an `AppleScript`
+/// quit) calls `exit()` straight from the event loop, and the OS then
+/// reports "GLYDI quit unexpectedly". The clean paths (window close, Cmd-Q
+/// in the window, Ctrl-C) stop everything in order first; for the rest,
+/// an `atexit` handler registered *after* the models are loaded runs before
+/// their destructors and ends the process there.
+mod exit {
+    #![allow(unsafe_code)]
+
+    extern "C" fn fast_exit() {
+        // SAFETY: `_exit` takes an int and never returns; there is nothing
+        // left worth flushing at this point that `exit` had not already done.
+        unsafe { libc::_exit(0) }
+    }
+
+    pub fn install_fast_exit() {
+        // SAFETY: `atexit` registers a plain `extern "C" fn()`; registration
+        // order is what makes this run before the static destructors that
+        // were registered earlier, when the models loaded.
+        let rc = unsafe { libc::atexit(fast_exit) };
+        if rc != 0 {
+            tracing::warn!("could not register the exit hook; a Dock quit may report a crash");
+        }
+    }
 }

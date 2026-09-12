@@ -53,6 +53,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 cpal = { workspace = true }
 ctrlc = "3"
+libc = "0.2"
 
 [dev-dependencies]
 # The headless test reads the `sessions` table straight from the file: the
@@ -60,5 +61,21 @@ ctrlc = "3"
 # the memory worker actually committed, not what the store thinks it did.
 rusqlite = { workspace = true }
 
-[lints]
-workspace = true
+[lints.rust]
+# Deny, not the workspace forbid: `main.rs` has one `atexit`/`_exit` pair.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+unwrap_used = "deny"
+expect_used = "deny"

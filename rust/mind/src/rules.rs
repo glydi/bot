@@ -48,8 +48,39 @@ impl Rule for AttendToSpeaker {
 /// matter — an unidentified voice interrupts just the same — and the
 /// deliberate path's queued sentences are cleared by the consumer of this
 /// `stop` (see `CommandQueue::clear`).
+///
+/// Sustained voice, not any sound: a bell, a cough, a door -- the energy VAD
+/// raises `voice_activity` for all of them, and a bot that stops talking at
+/// every noise in the room is distracted, not polite. Speech that means to
+/// interrupt keeps going; the stop is issued once the voice has lasted
+/// [`BargeInStop::SUSTAIN`], evaluated from the reflex tick. Measured on a
+/// live run: "(bell dings)", "(whistling)" and "[Music]" each cancelled a
+/// reply the person was waiting for.
 #[derive(Debug, Default)]
-pub struct BargeInStop;
+pub struct BargeInStop {
+    /// When the current voice started, while the bot was talking.
+    armed: Cell<Option<Instant>>,
+}
+
+impl BargeInStop {
+    /// How long a voice must last before it counts as an interruption.
+    /// Bell dings and coughs are under 300 ms; a spoken word or two is over.
+    pub const SUSTAIN: Duration = Duration::from_millis(400);
+
+    fn check(&self, now: Instant, w: &World, out: &mut Commands) {
+        let Some(since) = self.armed.get() else {
+            return;
+        };
+        if !w.bot_speaking() || !w.anyone_speaking() {
+            self.armed.set(None);
+            return;
+        }
+        if now.saturating_duration_since(since) >= Self::SUSTAIN {
+            self.armed.set(None);
+            out.push(Command::new("speaker", "stop", Priority::Reflex));
+        }
+    }
+}
 
 impl Rule for BargeInStop {
     fn name(&self) -> &'static str {
@@ -57,9 +88,20 @@ impl Rule for BargeInStop {
     }
 
     fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
-        if voice_started(o) && w.bot_speaking() {
-            out.push(Command::new("speaker", "stop", Priority::Reflex));
+        if o.modality == VOICE_ACTIVITY {
+            if voice_started(o) && w.bot_speaking() {
+                if self.armed.get().is_none() {
+                    self.armed.set(Some(o.at));
+                }
+            } else if !voice_started(o) {
+                self.armed.set(None);
+            }
         }
+        self.check(o.at, w, out);
+    }
+
+    fn on_tick(&self, now: Instant, w: &World, out: &mut Commands) {
+        self.check(now, w, out);
     }
 }
 
@@ -132,7 +174,7 @@ impl Rule for BackchannelAfterLongSpeech {
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
-    v.push(Box::new(BargeInStop));
+    v.push(Box::new(BargeInStop::default()));
     v.push(Box::new(AttendToSpeaker));
     v.push(Box::new(BackchannelAfterLongSpeech::new()));
     v

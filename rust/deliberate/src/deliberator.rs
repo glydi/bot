@@ -32,6 +32,9 @@ use crate::tools::{FactSource, REMEMBER_NAME, Tools, full_tool_specs};
 pub const UTTERANCE: &str = "utterance";
 /// Modality of a voice-activity edge; `Bool(true)` means someone started.
 pub const VOICE_ACTIVITY: &str = "voice_activity";
+/// How long voice activity must last during a turn before it cancels the
+/// turn. Same figure as `mind::rules::BargeInStop::SUSTAIN`.
+pub const BARGE_IN_SUSTAIN: Duration = Duration::from_millis(400);
 
 /// Bounds the tool-call loop. Without it a model that keeps calling tools
 /// can spin forever while the person waits in silence.
@@ -348,6 +351,7 @@ impl Session {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn respond(
         &mut self,
         speaker: Option<&EntityId>,
@@ -374,20 +378,37 @@ impl Session {
             let mut spoken = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut cancelled = false;
+            // Voice that has started but not yet lasted `BARGE_IN_SUSTAIN`.
+            // A bell or a cough raises voice_activity too; only speech
+            // that keeps going cancels the turn (see mind's BargeInStop).
+            let mut voice_since: Option<tokio::time::Instant> = None;
 
             loop {
+                let sustain = async {
+                    match voice_since {
+                        Some(t) => tokio::time::sleep_until(t + BARGE_IN_SUSTAIN).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
                         cancelled = true;
                         break;
                     }
+                    () = sustain => {
+                        tracing::info!("sustained voice during turn: cancelling");
+                        cancelled = true;
+                        break;
+                    }
                     o = obs.recv() => {
                         if let Some(o) = o {
-                            if barge_in(&o) {
-                                tracing::info!("voice activity during turn: cancelling");
-                                cancelled = true;
-                                break;
+                            if o.modality == VOICE_ACTIVITY {
+                                if barge_in(&o) {
+                                    voice_since.get_or_insert_with(tokio::time::Instant::now);
+                                } else {
+                                    voice_since = None;
+                                }
                             }
                             tracing::trace!(modality = %o.modality, "busy; observation dropped");
                         }
@@ -1002,7 +1023,7 @@ mod tests {
         let mut r = rig(
             vec![
                 Script::text(&["One.", " Two.", " Three.", " Four.", " Five."])
-                    .with_delay(Duration::from_millis(20)),
+                    .with_delay(Duration::from_millis(200)),
             ],
             vec![],
         );
@@ -1024,14 +1045,49 @@ mod tests {
             .filter(|c| c.1 == "say")
             .map(|c| c.2)
             .collect();
-        // Two sentences were due by 50 ms (20, 40); the third at 60 ms must
-        // not appear, nor anything after.
+        // Voice from 50 ms cancels at ~450 ms (BARGE_IN_SUSTAIN): the
+        // sentences due at 200 and 400 ms may appear, the one at 600 must
+        // not, nor anything after.
         assert!(!says.is_empty() && says.len() <= 3, "{says:?}");
         assert!(says.len() < 5);
         // The partial transcript is kept.
         let hist = r.session.conversation().history();
         assert_eq!(hist.last().unwrap().role, Role::Assistant);
         assert_eq!(hist.last().unwrap().content, says.join(" "));
+    }
+
+    #[tokio::test]
+    async fn short_noise_does_not_cancel() {
+        // A bell: voice_activity true then false 100 ms later. The turn
+        // must run to the end.
+        let mut r = rig(
+            vec![
+                Script::text(&["One.", " Two.", " Three."]).with_delay(Duration::from_millis(150)),
+            ],
+            vec![],
+        );
+        let tx = r.obs_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let on = Observation::new("mic0", VOICE_ACTIVITY, Instant::now())
+                .with_payload(Payload::Bool(true));
+            tx.send(on).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let off = Observation::new("mic0", VOICE_ACTIVITY, Instant::now())
+                .with_payload(Payload::Bool(false));
+            tx.send(off).await.unwrap();
+        });
+        let end = r
+            .session
+            .handle_utterance("go", None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(end, TurnEnd::Done), "{end:?}");
+        let says = drain(&r.commands)
+            .into_iter()
+            .filter(|c| c.1 == "say")
+            .count();
+        assert_eq!(says, 3);
     }
 
     #[tokio::test]
