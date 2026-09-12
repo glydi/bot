@@ -138,20 +138,9 @@ impl Curiosity {
                     format!("What's that {class} for?"),
                 ))
             }
-            "gesture" => {
-                let g = text.unwrap_or("gesture");
-                Some(thing(
-                    smol(&["gesture:", g]),
-                    format!("What does that {g} mean?"),
-                ))
-            }
-            "scene" => {
-                let s = text.unwrap_or("change");
-                Some(thing(
-                    smol(&["scene:", s]),
-                    format!("Did something change in here? It looks {s}."),
-                ))
-            }
+            // Gestures and scene changes fall through to the wildcard on
+            // purpose: WaveHello and RoomInventory already react to them,
+            // and a curious question on top would be a second remark.
             "face" => {
                 let e = o.entity.as_ref().and_then(|h| w.resolve(h))?;
                 Some(if e.is_known() {

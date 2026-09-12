@@ -409,6 +409,7 @@ impl App {
             &clock,
             &obs_tx,
             &self_speaking,
+            speaker.as_ref().map(act_speaker::SpeakerHandle::far_end),
         );
 
         // -- vision -----------------------------------------------------
@@ -1070,12 +1071,32 @@ fn spawn_audio(
     clock: &Arc<dyn Clock>,
     tx: &RingSender,
     self_speaking: &Arc<AtomicBool>,
+    far_end: Option<act_speaker::FarEnd>,
 ) -> Option<AudioSenseHandle> {
     if parts.no_mic {
         tracing::info!("microphone off (--no-mic)");
         return None;
     }
     let mut cfg = AudioConfig::with_models_dir(&config.models_dir);
+    // Echo cancellation: the speaker's far-end blocks let the mic stay
+    // open while the bot talks. The two crates keep their own block
+    // types (sense-audio must not depend on act-speaker), mapped here.
+    cfg.aec = std::env::var("GLYDI_AEC")
+        .ok()
+        .is_none_or(|v| v.trim() != "0");
+    if let Some(far) = far_end {
+        cfg.far_end = Some(Arc::new(move || {
+            far.pull().map(|b| {
+                let (at, rate, samples) = b.into_parts();
+                sense_audio::aec::FarBlock { at, rate, samples }
+            })
+        }));
+    }
+    tracing::info!(
+        aec = cfg.aec,
+        far_end = cfg.far_end.is_some(),
+        "audio echo control"
+    );
     cfg.device.clone_from(&config.mic_device);
     cfg.ort_lib.clone_from(&config.ort_lib);
     cfg.gallery = Some(store);

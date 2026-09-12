@@ -249,19 +249,16 @@ fn curiosity_fires_once_per_key_and_not_while_anyone_speaks() {
     r.tick(clock.at_secs(6070.0));
     assert!(intents(&r.on_observation(&voice(clock.at_secs(6080.0), None, false))).is_empty());
 
-    // A scene change and a gesture are novelties too; a stranger's face
-    // is the planner's business first (the name question).
+    // A scene change is the inventory rule's remark ("It's dark in
+    // here."), not a curiosity: one thing said about it, not two. A
+    // stranger's face is the planner's business first (the name question).
     let scene = Observation::new("cam0", "scene", clock.at_secs(7000.0))
         .with_payload(Payload::Text("dark".into()));
-    // The lights going out is said by the inventory rule first ("It's
-    // dark in here."), on the same pass; curiosity yields to it and asks
-    // its question on the next quiet tick.
     let i = intents(&r.on_observation(&scene));
     assert_eq!(i.len(), 1);
     assert!(i[0].contains(r#""goal":"scene""#), "{}", i[0]);
     let i = intents(&r.tick(clock.at_secs(7000.5)));
-    assert_eq!(i.len(), 1);
-    assert!(i[0].contains(r#""about":"scene:dark""#), "{}", i[0]);
+    assert!(i.is_empty(), "{i:?}");
     let i = intents(&r.on_observation(&face(clock.at_secs(7100.0), EntityHint::Track(3))));
     assert!(i.is_empty(), "{i:?}");
 }
