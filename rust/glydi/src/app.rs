@@ -573,7 +573,33 @@ fn backends(
     }
     let open = |model: &str| -> Option<Arc<dyn ChatBackend>> {
         match OpenAiBackend::new(&config.local_llm_url, model, None, config.llm_timeout) {
-            Ok(b) => Some(Arc::new(b)),
+            Ok(b) => {
+                let b = Arc::new(b);
+                // The first turn otherwise pays the model load (~7 s
+                // measured on qwen2.5:3b): warm it now, off the build
+                // path, with the real prompt and tools so the prefix is
+                // cached too.
+                let warm = Arc::clone(&b);
+                let model = model.to_owned();
+                if let Err(e) = spawn_named("glydi-llm-warm", move || {
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    match rt.block_on(warm.warm(
+                        deliberate::LOCAL_SYSTEM_PROMPT,
+                        deliberate::full_tool_specs(),
+                    )) {
+                        Ok(took) => tracing::info!(model, ms = took.as_millis(), "llm warm"),
+                        Err(e) => tracing::warn!(model, error = %e, "llm warm-up failed"),
+                    }
+                }) {
+                    tracing::warn!(error = %e, "llm warm-up thread not started");
+                }
+                Some(b)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, model, "llm client not built");
                 None
