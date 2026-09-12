@@ -438,6 +438,27 @@ impl Session {
         result
     }
 
+    /// The room has gone quiet with someone we know in it: a turn with no
+    /// utterance behind it. The note stands in for what was said, so the
+    /// model has something to answer; it is what makes the difference
+    /// between a companion and a kiosk that waits to be addressed.
+    pub async fn small_talk(
+        &mut self,
+        entity: Option<&EntityId>,
+        name: &str,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: CancellationToken,
+    ) -> Result<TurnEnd, LlmError> {
+        let note = format!(
+            "[note] {name} is here and nobody has said anything for a while. Say one short \
+             thing to {name}: pick up something you know about them from the [room] note, or \
+             something from earlier in this conversation, and remark on it or ask about it. \
+             Do not greet them again. One sentence."
+        );
+        tracing::info!(name, "small talk");
+        self.handle_utterance(&note, entity, obs, cancel).await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn respond(
         &mut self,
@@ -653,7 +674,19 @@ impl Session {
                     continue;
                 }
                 Some(cmd) = intents.recv() => {
-                    self.handle_intent(&cmd);
+                    if let Some((entity, name)) = small_talk_target(&cmd) {
+                        let token = shutdown.child_token();
+                        *current.lock() = Some(token.clone());
+                        if let Err(e) = self
+                            .small_talk(entity.as_ref(), &name, &mut obs, token)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "small talk failed");
+                        }
+                        *current.lock() = None;
+                    } else {
+                        self.handle_intent(&cmd);
+                    }
                     continue;
                 }
                 o = obs.recv() => match o {
@@ -687,6 +720,27 @@ impl Session {
         }
         tracing::info!("deliberate loop exiting");
     }
+}
+
+/// The `small_talk` intent from the mind's lull rule: who to talk to.
+fn small_talk_target(cmd: &Command) -> Option<(Option<EntityId>, String)> {
+    if cmd.kind != INTENT_KIND {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(cmd.payload.as_text()?).ok()?;
+    if v.get("decision").and_then(serde_json::Value::as_str) != Some("small_talk") {
+        return None;
+    }
+    let entity = v
+        .get("entity")
+        .and_then(serde_json::Value::as_str)
+        .map(EntityId::new);
+    let name = v
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("them")
+        .to_owned();
+    Some((entity, name))
 }
 
 /// Whether an observation is someone starting to talk. A `voice_activity`
@@ -1662,5 +1716,48 @@ mod tests {
             .find(|m| m.role == Role::User)
             .unwrap();
         assert!(!last_user.content.contains(NAME_ANSWER_HINT));
+    }
+
+    #[tokio::test]
+    async fn small_talk_runs_a_turn_from_the_note() {
+        let mut r = rig(
+            vec![Script::text(&["How's the Rust project going?"])],
+            vec![person("john", true)],
+        );
+        r.session
+            .small_talk(
+                Some(&EntityId::new("john")),
+                "John",
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let req = &r.llm.requests()[0];
+        let last_user = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(
+            last_user.content.contains("nobody has said anything"),
+            "{}",
+            last_user.content
+        );
+        assert!(last_user.content.contains("John"));
+        let says: Vec<String> = drain(&r.commands)
+            .into_iter()
+            .filter(|c| c.1 == "say")
+            .map(|c| c.2)
+            .collect();
+        assert_eq!(says, ["How's the Rust project going?"]);
+        assert!(
+            small_talk_target(&intent(
+                r#"{"decision":"small_talk","name":"John","entity":"john","goal":"small_talk"}"#
+            ))
+            .is_some()
+        );
+        assert!(small_talk_target(&intent(r#"{"decision":"greet","entity":"john"}"#)).is_none());
     }
 }

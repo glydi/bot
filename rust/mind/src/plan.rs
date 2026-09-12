@@ -401,6 +401,8 @@ mod tests {
         cmds.iter()
             .filter(|c| c.target == INTENT_TARGET && c.kind == INTENT_KIND)
             .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
+            // The lull rule's opening lines are another rule's business.
+            .filter(|t| !t.contains("\"small_talk\""))
             .collect()
     }
 

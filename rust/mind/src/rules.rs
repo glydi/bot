@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use common::{Command, Observation, Payload, Priority};
+use common::{Command, EntityId, Observation, Payload, Priority};
 use smallvec::SmallVec;
 
 use crate::reflex::{Commands, Rule};
@@ -171,6 +171,121 @@ impl Rule for BackchannelAfterLongSpeech {
     }
 }
 
+/// Nobody has said anything for a while and someone we know is here: say
+/// something to them. A companion that only ever answers is a kiosk; one
+/// that picks up a thread on its own ("how's the Rust project going?") is
+/// company. Emitted as a `deliberate/intent` with `decision: small_talk`
+/// so the deliberate path can phrase it from memory; at most once per
+/// [`Lull::MIN_GAP`] per person, and never while anyone (the bot included)
+/// is talking or within [`Lull::SILENCE`] of the last voice.
+#[derive(Debug)]
+pub struct Lull {
+    /// Last time anyone spoke or the bot did; the lull is measured from it.
+    last_voice: Cell<Option<Instant>>,
+    /// Per entity, when we last started small talk with them.
+    last: std::cell::RefCell<SmallVec<[(EntityId, Instant); 4]>>,
+}
+
+impl Default for Lull {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Lull {
+    /// Silence before the bot speaks up. Long enough that a pause for
+    /// thought is not interrupted; short enough that the room does not go
+    /// dead.
+    pub const SILENCE: Duration = Duration::from_secs(25);
+    /// Minimum time between two unprompted openings to the same person.
+    pub const MIN_GAP: Duration = Duration::from_secs(180);
+    /// Someone must have been here this long first: an opening line ten
+    /// seconds after a greeting is two greetings.
+    pub const SETTLE: Duration = Duration::from_secs(40);
+
+    /// A new rule.
+    pub fn new() -> Self {
+        Self {
+            last_voice: Cell::new(None),
+            last: std::cell::RefCell::new(SmallVec::new()),
+        }
+    }
+
+    fn check(&self, now: Instant, w: &World, out: &mut Commands) {
+        if w.bot_speaking() || w.anyone_speaking() {
+            return;
+        }
+        let Some(quiet_since) = self.last_voice.get() else {
+            return;
+        };
+        if now.saturating_duration_since(quiet_since) < Self::SILENCE {
+            return;
+        }
+        // The known, named person who has been here longest.
+        let Some(who) = w
+            .present()
+            .filter(|e| !e.id.is_track() && e.name.is_some())
+            .filter(|e| now.saturating_duration_since(e.first_seen) >= Self::SETTLE)
+            .min_by_key(|e| e.first_seen)
+        else {
+            return;
+        };
+        let recently =
+            self.last.borrow().iter().any(|(id, at)| {
+                *id == who.id && now.saturating_duration_since(*at) < Self::MIN_GAP
+            });
+        if recently {
+            return;
+        }
+        {
+            let mut last = self.last.borrow_mut();
+            last.retain(|(id, _)| *id != who.id);
+            if last.len() >= 4 {
+                last.remove(0);
+            }
+            last.push((who.id.clone(), now));
+        }
+        // Counts as a voice: the next lull is measured from here even if
+        // the deliberate path decides to say nothing.
+        self.last_voice.set(Some(now));
+        let name = who.display_name();
+        let json = format!(
+            "{{\"decision\":\"small_talk\",\"name\":\"{}\",\"entity\":\"{}\",\"goal\":\"small_talk\"}}",
+            name.replace('"', ""),
+            who.id.as_str()
+        );
+        out.push(
+            Command::new(
+                crate::plan::INTENT_TARGET,
+                crate::plan::INTENT_KIND,
+                Priority::Reflex,
+            )
+            .with_payload(Payload::Text(json)),
+        );
+    }
+}
+
+impl Rule for Lull {
+    fn name(&self) -> &'static str {
+        "lull"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        match o.modality.as_str() {
+            "voice_activity" | "utterance" | "self_speaking" => self.last_voice.set(Some(o.at)),
+            // Someone arriving restarts the clock: the greeting happens
+            // first, and the lull is measured from then.
+            "face" if self.last_voice.get().is_none() => self.last_voice.set(Some(o.at)),
+            _ => {}
+        }
+        self.check(o.at, w, out);
+    }
+
+    fn on_tick(&self, now: Instant, w: &World, out: &mut Commands) {
+        self.check(now, w, out);
+    }
+}
+
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
@@ -187,5 +302,6 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
 pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v = default_rules();
     v.push(Box::new(crate::plan::PlannerRule));
+    v.push(Box::new(Lull::new()));
     v
 }

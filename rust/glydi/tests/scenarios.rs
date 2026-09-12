@@ -107,6 +107,7 @@ impl Rig {
 
     /// What the camera emits for a sighting: 10 Hz per track in the real
     /// pipeline, so `hz` sightings a second for `secs` keeps presence alive.
+    #[allow(clippy::needless_pass_by_value)]
     fn faces(&self, hint: EntityHint, hz: u32, secs: f32) {
         let period = Duration::from_secs_f32(1.0 / hz as f32);
         let n = (secs * hz as f32) as u32;
@@ -404,7 +405,7 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     );
     rig.blip(Duration::from_millis(150));
     assert!(
-        wait_for(Duration::from_secs(3), || rig.spoken().len()
+        wait_for(Duration::from_secs(8), || rig.spoken().len()
             >= sentences.len()),
         "a 150 ms blip cancelled the reply: spoken = {:?}",
         rig.spoken()

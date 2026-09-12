@@ -160,3 +160,51 @@ fn log_and_snapshot_follow_observations() {
     assert_eq!(r.log().recent(1)[0].kind.tag(), "LEFT");
     assert!(r.snapshot().people.is_empty());
 }
+
+#[test]
+fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
+    use common::{Command, EntityId};
+    use mind::rules::{Lull, cognitive_rules};
+    fn small_talk(cmds: &[Command]) -> Vec<String> {
+        cmds.iter()
+            .filter(|c| c.target == "deliberate")
+            .filter_map(|c| c.payload.as_text().map(str::to_owned))
+            .filter(|t| t.contains("small_talk"))
+            .collect()
+    }
+    // The camera keeps seeing them (presence expires after 3 s otherwise);
+    // a sighting is not a voice, so the silence clock keeps running.
+    fn step(r: &mut Reflex, clock: &FakeClock, t: f64) -> Vec<String> {
+        let mut cmds = r.on_observation(&face_known(clock.at_secs(t), "john"));
+        cmds.extend(r.tick(clock.at_secs(t)));
+        small_talk(&cmds)
+    }
+    let clock = FakeClock::new();
+    let mut r = Reflex::with_rules("l", clock.now(), cognitive_rules());
+    r.world_mut().set_name(&EntityId::new("john"), "John");
+    // Arrival (greeting is the planner's business, not this rule's).
+    let _ = step(&mut r, &clock, 0.0);
+    for t in [1.0, 2.0, 10.0, 20.0, 30.0] {
+        assert!(step(&mut r, &clock, t).is_empty(), "not settled yet at {t}");
+    }
+    let got = step(&mut r, &clock, Lull::SETTLE.as_secs_f64() + 1.0);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains(r#""name":"John""#), "{}", got[0]);
+    // Not again for a while, even in silence.
+    for t in [60.0, 100.0] {
+        assert!(step(&mut r, &clock, t).is_empty());
+    }
+    // A voice resets the silence; the gap still applies.
+    let _ = r.on_observation(&face_known(clock.at_secs(120.0), "john"));
+    let _ = r.on_observation(&voice(clock.at_secs(120.0), Some("john"), true));
+    let _ = r.on_observation(&voice(clock.at_secs(121.0), Some("john"), false));
+    for t in [122.0, 150.0] {
+        assert!(step(&mut r, &clock, t).is_empty());
+    }
+    // Past the gap and 25 s quiet: once more, and only once.
+    assert_eq!(step(&mut r, &clock, 240.0).len(), 1);
+    assert!(step(&mut r, &clock, 242.0).is_empty());
+    // Never over the bot's own voice.
+    let _ = r.on_observation(&self_speaking(clock.at_secs(500.0), true));
+    assert!(step(&mut r, &clock, 600.0).is_empty());
+}
