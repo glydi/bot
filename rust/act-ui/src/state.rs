@@ -6,6 +6,8 @@
 //! and the real window cannot drift apart.
 
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
 use common::{Command, Observation, Payload};
@@ -17,6 +19,11 @@ use crate::expression::{Expression, FaceState};
 /// turn (a barge-in, a few sentences, the attend that followed) without
 /// growing without bound.
 pub const RECENT_COMMANDS: usize = 50;
+
+/// `Observation.source` of the bot's own speaker (`SpeakerConfig::source`
+/// in act-speaker, whose default this is). Only its `audio_level` moves
+/// the mouth.
+pub const SPEAKER_SOURCE: &str = "speaker";
 
 /// One line in the debug panel's command list.
 #[derive(Clone, Debug)]
@@ -131,7 +138,7 @@ impl UiState {
         self.face.expression(now)
     }
 
-    /// Apply one observation. The UI listens to three modalities and
+    /// Apply one observation. The UI listens to four modalities and
     /// ignores the rest; it is a consumer of the loop's output, not a
     /// second mind.
     pub fn on_observation(&mut self, o: &Observation, now: Instant) {
@@ -142,10 +149,24 @@ impl UiState {
                     self.face.set_speaking(b, now);
                 }
             }
-            // Drives the mouth and the meter.
+            // The speaker's own level drives the mouth; any other source
+            // (the mic, which reports even while muted) is the listening
+            // meter and must never touch the mouth, or the muted mic's
+            // zeros shut it between the speaker's blocks.
             "audio_level" => {
                 if let Payload::Level(l) = o.payload {
-                    self.face.set_level(l, now);
+                    if o.source == SPEAKER_SOURCE {
+                        self.face.set_level(l, now);
+                    } else {
+                        self.face.set_mic_level(l);
+                    }
+                }
+            }
+            // A sentence is about to start playing: it precedes the audio
+            // by the device queue, so the mouth can open just ahead of it.
+            "spoke" => {
+                if o.source == SPEAKER_SOURCE {
+                    self.face.anticipate(now);
                 }
             }
             // Someone else talking.
@@ -260,6 +281,32 @@ mod tests {
         // Unknown modalities change nothing.
         s.on_observation(&obs("face", Payload::None), now);
         assert_eq!(s.expression(now), Expression::Idle);
+    }
+
+    #[test]
+    fn only_the_speakers_level_moves_the_mouth() {
+        let now = Instant::now();
+        let mut s = UiState::new(now);
+        let speaker = |m: &str, p: Payload| Observation::new("speaker", m, now).with_payload(p);
+        let mic = |p: Payload| Observation::new("mic0", "audio_level", now).with_payload(p);
+        s.on_observation(&speaker("self_speaking", Payload::Bool(true)), now);
+        s.on_observation(&speaker("audio_level", Payload::Level(0.2)), now);
+        let open = s.face.mouth_open(now);
+        assert!(open > 0.9, "{open}");
+        // The muted mic's zero, which used to shut the mouth between the
+        // speaker's levels, is the meter's business only.
+        s.on_observation(&mic(Payload::Level(0.0)), now);
+        assert!((s.face.mouth_open(now) - open).abs() < 1e-6);
+        assert!(s.face.mic_level() < 1e-6);
+        s.on_observation(&mic(Payload::Level(0.4)), now);
+        assert!((s.face.mic_level() - 0.4).abs() < 1e-6);
+        assert!((s.face.mouth_open(now) - open).abs() < 1e-6);
+        // `spoke` opens the mouth ahead of the audio.
+        s.on_observation(&speaker("self_speaking", Payload::Bool(false)), now);
+        s.on_observation(&speaker("self_speaking", Payload::Bool(true)), now);
+        assert!(s.face.mouth_open(now) < 1e-6);
+        s.on_observation(&speaker("spoke", Payload::Text("Hi.".into())), now);
+        assert!(s.face.mouth_open(now + Duration::from_millis(80)) > 0.2);
     }
 
     #[test]

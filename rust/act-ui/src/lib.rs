@@ -11,11 +11,13 @@
 //! * `listening` / `thinking` / `speaking` / `idle` -- the loop's own
 //!   transitions.
 //!
-//! It also reads observations when it is given a ring: `self_speaking` and
-//! `audio_level` from the speaker drive the mouth, `voice_activity` the
-//! listening state. The mouth follows the actual audio rather than a
-//! generic talking animation -- lip movement that disagrees with the sound
-//! is worse than no lip movement at all (`go/internal/ui/face.go`).
+//! It also reads observations when it is given a ring: `self_speaking`,
+//! `audio_level` and `spoke` from the speaker (source `"speaker"`) drive
+//! the mouth, `voice_activity` the listening state, and `audio_level`
+//! from any other source (the mic) only the meter. The mouth follows the
+//! actual audio rather than a generic talking animation -- lip movement
+//! that disagrees with the sound is worse than no lip movement at all
+//! (`go/internal/ui/face.go`).
 //!
 //! # The face
 //!
@@ -246,9 +248,15 @@ impl eframe::App for FaceApp {
                 ui.toggle_value(&mut self.debug, "debug");
                 ui.weak(expression.name());
                 // The level shows as the ring around the shell; the bar is
-                // a debugging aid.
+                // a debugging aid: the speaker's envelope while talking,
+                // the mic's level otherwise.
                 if self.debug {
-                    meter(ui, self.state.face.scaled_level());
+                    let level = if expression.is_speaking() {
+                        self.state.face.scaled_level()
+                    } else {
+                        self.state.face.mic_level()
+                    };
+                    meter(ui, level);
                 }
             });
         });
@@ -271,7 +279,7 @@ impl eframe::App for FaceApp {
                     textures,
                     &self.motion,
                     expression,
-                    self.state.face.scaled_level(),
+                    self.state.face.mouth_open(now),
                     now,
                 );
             }

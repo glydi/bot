@@ -22,7 +22,9 @@
 //!   flag and the observation flip on the first chunk written and once
 //!   nothing is queued, in flight or still draining. It also reports
 //!   `spoke` (the first 40 chars of a sentence, as its first chunk goes to
-//!   the device), so a log can show *what* started playing when.
+//!   the device), so a log can show *what* started playing when, and
+//!   `audio_level` (the RMS of each 20 ms block, timed to when that block
+//!   is heard, see [`LevelQueue`]) so the face's mouth follows the voice.
 //!
 //! The first sentence of a reply is cut once more, at its first clause
 //! boundary (`sentence::first_clause`), so the backend starts on 4-8 words
@@ -76,8 +78,61 @@ const PCM_CHUNK_MS: u64 = 20;
 /// drains stale chunks in a tight loop, so depth costs nothing there.
 const PCM_QUEUE_CHUNKS: usize = 2048;
 
-/// How often the play thread reports `audio_level` while speaking.
-const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
+/// `audio_level` observations waiting for their audio to start playing.
+///
+/// The play thread reports one level per [`PCM_CHUNK_MS`] block it
+/// writes: 50 Hz, the rate a mouth needs to show syllables (they come
+/// 4-7 a second, so the old 10 Hz batch was one frame per syllable and a
+/// face could not tell a vowel from a gap). Each level is sent not at
+/// write time but when its block reaches the listener: `write` returns
+/// as soon as the chunk is queued, which for a device is up to
+/// [`crate::output::RING_CHUNKS`] chunks (500 ms) before it is heard, and
+/// lips half a second early read as dubbing. `output.pending()` right
+/// after the write says how far ahead that is, so each level is stamped
+/// with the instant its block starts and sent once that instant arrives.
+/// The null output has no queue, so there it goes out at once.
+struct LevelQueue {
+    due: std::collections::VecDeque<(Instant, f32)>,
+}
+
+impl LevelQueue {
+    fn new() -> Self {
+        Self {
+            due: std::collections::VecDeque::with_capacity(32),
+        }
+    }
+
+    /// RMS of `samples`, 0..1.
+    fn rms(samples: &[i16]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sq: f64 = samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+        ((sq / samples.len() as f64).sqrt() / 32768.0) as f32
+    }
+
+    /// Queue the level of a block just written; `lead` is the audio still
+    /// queued ahead of it.
+    fn push(&mut self, samples: &[i16], lead: Duration, now: Instant) {
+        self.due.push_back((now + lead, Self::rms(samples)));
+    }
+
+    /// Send every level whose block has started playing.
+    fn flush(&mut self, now: Instant, report: &Reporter) {
+        while let Some(&(at, level)) = self.due.front() {
+            if at > now {
+                break;
+            }
+            self.due.pop_front();
+            report.send("audio_level", Payload::Level(level));
+        }
+    }
+
+    /// Drop what was queued: a stop threw its audio away too.
+    fn clear(&mut self) {
+        self.due.clear();
+    }
+}
 
 /// How much of a sentence the `spoke` observation carries. Enough to
 /// recognise the sentence in a log, short enough not to be the log.
@@ -352,26 +407,31 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
     let mut speaking = false;
     let mut last_audio = Instant::now();
     let mut seen_generation = shared.current();
-    let mut level_at = Instant::now();
-    let mut level_acc = (0f64, 0usize);
+    let mut levels = LevelQueue::new();
+    let rate = f64::from(output.sample_rate()).max(1.0);
 
-    let set_speaking = |speaking: &mut bool, on: bool| {
+    // Levels not yet due are dropped on a stop (their audio was), and the
+    // last word is a zero *before* `self_speaking` goes false, so a face
+    // sees the mouth shut and then the state change, and never a level
+    // after the end.
+    let set_speaking = |speaking: &mut bool, levels: &mut LevelQueue, on: bool| {
         if *speaking == on {
             return;
         }
         *speaking = on;
-        shared.self_speaking.store(on, Ordering::Release);
-        report.send("self_speaking", Payload::Bool(on));
         if !on {
+            levels.clear();
             report.send("audio_level", Payload::Level(0.0));
         }
+        shared.self_speaking.store(on, Ordering::Release);
+        report.send("self_speaking", Payload::Bool(on));
         tracing::debug!(on, "self_speaking");
     };
 
     loop {
         if shared.stopping() {
             output.clear();
-            set_speaking(&mut speaking, false);
+            set_speaking(&mut speaking, &mut levels, false);
             return;
         }
         // A stop since we last looked: throw away what the device holds,
@@ -380,14 +440,14 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
         if g != seen_generation {
             seen_generation = g;
             output.clear();
-            set_speaking(&mut speaking, false);
+            set_speaking(&mut speaking, &mut levels, false);
         }
 
         match pcm.recv_timeout(Duration::from_millis(5)) {
             Ok(chunk) => {
                 let stale = chunk.generation != shared.current();
                 if !stale && !chunk.samples.is_empty() {
-                    set_speaking(&mut speaking, true);
+                    set_speaking(&mut speaking, &mut levels, true);
                     if chunk.first {
                         // After `self_speaking`, before the write: a log
                         // reads "speaking, then this sentence".
@@ -395,23 +455,15 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
                     }
                     let cancel = || chunk.generation != shared.current() || shared.stopping();
                     output.write(&chunk.samples, &cancel);
-                    last_audio = Instant::now();
+                    let now = Instant::now();
+                    last_audio = now;
 
-                    // Level, for the face. Batched to LEVEL_INTERVAL so the
-                    // ring is not flooded with 50 observations a second.
-                    let sq: f64 = chunk
-                        .samples
-                        .iter()
-                        .map(|&s| f64::from(s) * f64::from(s))
-                        .sum();
-                    level_acc.0 += sq;
-                    level_acc.1 += chunk.samples.len();
-                    if level_at.elapsed() >= LEVEL_INTERVAL {
-                        let rms = (level_acc.0 / level_acc.1 as f64).sqrt() / 32768.0;
-                        report.send("audio_level", Payload::Level(rms as f32));
-                        level_acc = (0.0, 0);
-                        level_at = Instant::now();
-                    }
+                    // The level of this block, for the face, due when the
+                    // block starts playing: everything queued ahead of it
+                    // plays first.
+                    let ahead = output.pending().saturating_sub(chunk.samples.len());
+                    let lead = Duration::from_secs_f64(ahead as f64 / rate);
+                    levels.push(&chunk.samples, lead, now);
                 }
                 if chunk.last {
                     shared.inflight.fetch_sub(1, Ordering::AcqRel);
@@ -420,10 +472,11 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 output.clear();
-                set_speaking(&mut speaking, false);
+                set_speaking(&mut speaking, &mut levels, false);
                 return;
             }
         }
+        levels.flush(Instant::now(), report);
 
         if speaking && output.pending() == 0 {
             let inflight = shared.inflight.load(Ordering::Acquire);
@@ -434,8 +487,7 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
                 INFLIGHT_HOLD
             };
             if quiet_for >= hold {
-                set_speaking(&mut speaking, false);
-                level_acc = (0.0, 0);
+                set_speaking(&mut speaking, &mut levels, false);
             }
         }
     }

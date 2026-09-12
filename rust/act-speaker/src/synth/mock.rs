@@ -24,7 +24,14 @@ pub const CHUNK_MS: u64 = 20;
 #[derive(Clone, Default)]
 pub struct MockSynth {
     spoken: Arc<Mutex<Vec<Spoken>>>,
+    /// Peak amplitude of a tone instead of silence, see
+    /// [`MockSynth::with_tone`].
+    tone: Option<i16>,
 }
+
+/// The tone [`MockSynth::with_tone`] produces, in Hz. Low enough that its
+/// RMS over a 20 ms block (nine cycles) is steady.
+pub const TONE_HZ: f32 = 440.0;
 
 /// One synthesis the mock ran.
 #[derive(Clone, Debug)]
@@ -41,6 +48,17 @@ impl MockSynth {
     /// A fresh mock with an empty log.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A mock that produces a [`TONE_HZ`] sine at `peak` instead of
+    /// silence, so a test can see the `audio_level` the play thread
+    /// reports from what it writes. Timing is identical to the silent
+    /// mock.
+    pub fn with_tone(peak: i16) -> Self {
+        Self {
+            spoken: Arc::default(),
+            tone: Some(peak),
+        }
     }
 
     /// Everything synthesised so far, oldest first.
@@ -76,13 +94,21 @@ impl Synth for MockSynth {
     ) -> Result<(), SynthError> {
         let started = Instant::now();
         let chunk = (CHUNK_MS * u64::from(SAMPLE_RATE) / 1000) as usize;
-        let zeros = vec![0i16; chunk];
+        let mut block = vec![0i16; chunk];
         let mut left = Self::samples_for(text);
         let mut first_audio = None;
+        let mut phase = 0usize;
         while left > 0 {
             let n = left.min(chunk);
+            if let Some(peak) = self.tone {
+                for (i, s) in block[..n].iter_mut().enumerate() {
+                    let t = (phase + i) as f32 / SAMPLE_RATE as f32;
+                    *s = (f32::from(peak) * (std::f32::consts::TAU * TONE_HZ * t).sin()) as i16;
+                }
+                phase += n;
+            }
             first_audio.get_or_insert_with(Instant::now);
-            if !sink(&zeros[..n]) {
+            if !sink(&block[..n]) {
                 break;
             }
             left -= n;

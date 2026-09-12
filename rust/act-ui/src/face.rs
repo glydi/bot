@@ -56,9 +56,33 @@
 //! * Eyes snap toward a target far faster than they drift. That asymmetry
 //!   is what makes it read as a flick rather than a slide.
 //!
-//! `docs/face-<state>.png` are screenshots of
-//! `cargo run -p act-ui --example face -- --state <state>`, for comparison
-//! when touching the drawing code.
+//! # The talking mouth
+//!
+//! The design's `.openMouth` is a dark ellipse with a cream border that
+//! scales on a fixed keyframe loop (`talkSmall`, `talkBig`). Drawn that
+//! way, driven by a 10 Hz level, it was a small static "O" -- a hole,
+//! not a mouth. What is drawn now, [`Lips`]:
+//!
+//! * a lip shape, not a hole: a cream band (the design's highlight) with
+//!   corners anchored at the mouth line, a dark interior whose height is
+//!   the envelope (the lower lip drops further than the upper rises, as a
+//!   jaw does), a little wider when louder, and at large openings a pale
+//!   row of teeth under the upper lip and a dusky tongue at the bottom;
+//! * the envelope from [`FaceState::mouth_open`](crate::FaceState::mouth_open)
+//!   (10 ms attack, 90 ms release, parted between words, shut in pauses)
+//!   with a 5-7 Hz flap on top whose depth grows with the level, so a held
+//!   loud vowel still flaps like syllables rather than inflating;
+//! * a jaw: the whole shell dips up to 1.6% with the envelope (the
+//!   `talkBig` bounce), and the eyes narrow a little on loud;
+//! * a small head tilt every 1-2 s while talking ([`Motion::head_tilt`]).
+//!
+//! `docs/speaking-{1,2,3,4}.png` are frames of
+//! `cargo run -p act-ui --example face -- --level-demo` from one 1.2 s
+//! capture, 100 ms apart: a loud syllable (teeth and tongue showing, jaw
+//! down, ring bright), a quieter one, the closed mouth in a pause, and
+//! the small opening of an unstressed syllable. `docs/face-<state>.png`
+//! are screenshots of `cargo run -p act-ui --example face -- --state
+//! <state>`, for comparison when touching the drawing code.
 
 use std::cell::Cell;
 use std::f32::consts::{PI, TAU};
@@ -75,6 +99,10 @@ pub const ASPECT: f32 = 1.0529;
 const CREAM: Color32 = Color32::from_rgb(0xff, 0xf2, 0xd9);
 /// Inside an open mouth (`.openMouth` background).
 const MOUTH_DARK: Color32 = Color32::from_rgb(0x12, 0x13, 0x19);
+/// Teeth: the cream, a shade duller so they sit behind the lip.
+const TEETH: Color32 = Color32::from_rgb(0xec, 0xe3, 0xd0);
+/// The tongue: a dusky rose, dark enough to stay inside the mouth.
+const TONGUE: Color32 = Color32::from_rgb(0x8a, 0x3a, 0x48);
 /// The sleeping z's (`.zzz`).
 const MUTED: Color32 = Color32::from_rgb(0xa1, 0xa6, 0xbb);
 /// The vignette's ink: the design's text colour, at a few percent.
@@ -170,6 +198,12 @@ pub struct Motion {
     micro_at: Instant,
     /// Where an `attend` command is pointing, and when it landed.
     glance: Option<(Vec2, Instant)>,
+    /// The talking head tilt, radians, eased toward its target; the
+    /// target flips between a small angle and zero every 1-2 s while
+    /// speaking, see [`Self::head_tilt`].
+    tilt: f32,
+    tilt_target: f32,
+    tilt_at: Instant,
     /// The expression the last `tick` was given.
     shown: Expression,
     /// The pose the face was showing when the expression last changed, and
@@ -199,6 +233,9 @@ impl Motion {
             saccade_at: now,
             micro_at: now,
             glance: None,
+            tilt: 0.0,
+            tilt_target: 0.0,
+            tilt_at: now,
             shown: Expression::Idle,
             from: None,
             last_pose: Cell::new(pose(Expression::Idle, 0.0, 0.0)),
@@ -314,6 +351,32 @@ impl Motion {
 
         // Snap, don't slide: 0.35 of the remaining distance per frame.
         self.gaze += (self.gaze_target - self.gaze) * 0.35;
+
+        // The talking head tilt: every 1-2 s, lean 1-2.5 degrees to one
+        // side or come back to level, eased so it is a lean and not a
+        // twitch. People move their head when they talk and hold it still
+        // when they do not, so anything but the speaking pair straightens.
+        if expression.is_speaking() {
+            if now >= self.tilt_at {
+                self.tilt_target = if self.tilt_target.abs() > 1e-4 {
+                    0.0
+                } else {
+                    let sign = if self.rand() < 0.5 { -1.0 } else { 1.0 };
+                    sign * (self.rand() * 1.5 + 1.0).to_radians()
+                };
+                self.tilt_at = now + secs(self.rand() + 1.0);
+            }
+        } else {
+            self.tilt_target = 0.0;
+            self.tilt_at = now;
+        }
+        self.tilt += (self.tilt_target - self.tilt) * 0.08;
+    }
+
+    /// The talking head tilt this frame, radians: added to the body's
+    /// rotation by [`draw`].
+    pub fn head_tilt(&self) -> f32 {
+        self.tilt
     }
 
     /// Seconds since construction, for the periodic animations.
@@ -579,7 +642,8 @@ fn shell_outline(s: f32) -> impl Iterator<Item = Vec2> {
 
 /// The whole-face movement for one expression at time `t`: the design's
 /// per-state keyframes, plus the Go face's breathing and a slow drift on
-/// top of all of them so nothing ever holds perfectly still.
+/// top of all of them so nothing ever holds perfectly still. `open` is
+/// the talking mouth's opening, 0..1, which only the speaking pair use.
 #[derive(Clone, Copy, Debug)]
 struct Body {
     offset: Vec2,
@@ -587,7 +651,11 @@ struct Body {
     scale: Vec2,
 }
 
-fn body(e: Expression, t: f32) -> Body {
+/// How far the shell dips at a full mouth opening: the jaw. The design's
+/// `talkBig` bounce, tied to the sound instead of a loop.
+const JAW_DIP: f32 = 0.016;
+
+fn body(e: Expression, open: f32, t: f32) -> Body {
     let cyc = |period: f32| (t % period) / period;
     let sin = |period: f32| (cyc(period) * TAU).sin();
     // 0..1..0 over a period: two `ease-in-out` keyframe legs, which is
@@ -602,8 +670,9 @@ fn body(e: Expression, t: f32) -> Body {
     match e {
         // `float`: up 1.2% at the half.
         Expression::Idle => out.offset.y = -0.012 * pulse(4.2),
-        Expression::Quiet => out.offset.y = -0.012 * pulse(3.6),
-        Expression::Loud => out.offset.y = -0.012 * pulse(3.2),
+        // The float, and the jaw: down with the mouth.
+        Expression::Quiet => out.offset.y = -0.012 * pulse(3.6) + JAW_DIP * open,
+        Expression::Loud => out.offset.y = -0.012 * pulse(3.2) + JAW_DIP * open,
         // `listen`: -2deg to 2deg.
         Expression::Listening => out.rot = deg(2.0) * sin(2.2),
         // `thinkTilt`: 0 to -3deg.
@@ -699,7 +768,9 @@ const EYE_ORIGIN: Vec2 = vec2(0.5, 0.55);
 /// shifted by the expression. Each rule is the HTML's `.ew` CSS for that
 /// state: `scale(a,b) translate(x%,y%)` moves the box by its own size then
 /// scales about the origin. `level` only matters to the speaking pair,
-/// whose eyes narrow from `quiet`'s 88% to `loud`'s 95% with the volume.
+/// whose eyes narrow a little as the mouth opens (the CSS has `quiet` at
+/// 88% and `loud` at 95%; here the narrowing rides the sound, since eyes
+/// that widen on every stressed syllable read as alarm).
 fn eye_boxes(e: Expression, level: f32) -> [EyeBox; 2] {
     let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(x, y), vec2(w, h));
     let left = at(0.151, 0.296, 0.2665, 0.3495);
@@ -730,7 +801,7 @@ fn eye_boxes(e: Expression, level: f32) -> [EyeBox; 2] {
             xf(at(0.578, 0.315, 0.2665, 0.22), 1.0, 1.0, 0.06, 0.0, -5.0),
         ],
         Expression::Quiet | Expression::Loud => {
-            let sy = lerp(0.88, 0.95, level);
+            let sy = lerp(0.95, 0.87, level);
             [
                 xf(left, 1.0, sy, 0.0, 0.0, 0.0),
                 xf(right, 1.0, sy, 0.0, 0.0, 0.0),
@@ -810,6 +881,44 @@ struct Flat {
     rot: f32,
 }
 
+/// The talking mouth: a pair of lips, in stage fractions. The corners sit
+/// on the mouth line at `centre` +- `half_w`; the dark interior reaches
+/// `upper` above the line and `lower` below it; the cream band around it
+/// is `band` thick. When `upper + lower` is nearly nothing it is a closed
+/// mouth: a cream band with a seam.
+#[derive(Clone, Copy, Debug)]
+struct Lips {
+    centre: Vec2,
+    half_w: f32,
+    upper: f32,
+    lower: f32,
+    band: f32,
+    /// How visible the teeth and tongue are, 0..1: only at large openings.
+    teeth: f32,
+    tongue: f32,
+}
+
+impl Lips {
+    /// The outline `inset` outside the interior (0 for the interior
+    /// itself, `band` for the outer edge of the lips). The corners stay
+    /// pointed and the profile is fuller than an ellipse
+    /// (`|sin|^0.8`), which is what makes it lips rather than an "O".
+    fn outline(&self, inset: f32) -> impl Iterator<Item = Vec2> + '_ {
+        const N: usize = 40;
+        (0..N).map(move |i| {
+            let (sin, cos) = (TAU * i as f32 / N as f32).sin_cos();
+            let x = self.centre.x + (self.half_w + inset * 0.7) * cos;
+            let rise = sin.abs().powf(0.8);
+            let y = if sin < 0.0 {
+                self.centre.y - (self.upper + inset) * rise
+            } else {
+                self.centre.y + (self.lower + inset) * rise
+            };
+            vec2(x, y)
+        })
+    }
+}
+
 /// Everything the face's geometry is, as numbers, so any two can be
 /// blended. Features an expression does not show keep a sensible resting
 /// geometry at zero opacity, so fading one in never drags it across the
@@ -825,13 +934,12 @@ struct Pose {
     smile: Rect,
     smile_rot: f32,
     smile_alpha: f32,
-    /// The dark open mouth: the talking mouth and the surprised `O` share
-    /// it, since both are an ellipse with a cream rim.
+    /// The surprised `O` (`.oMouth`): an ellipse with a cream rim.
     open: Rect,
     open_alpha: f32,
-    /// The talking mouth's inner lip highlight (`.openMouth`'s inset
-    /// shadow); the `O` has none.
-    lip: f32,
+    /// The talking mouth.
+    lips: Lips,
+    lips_alpha: f32,
     flat: Flat,
     flat_alpha: f32,
     wavy_rot: f32,
@@ -906,6 +1014,7 @@ fn glow(e: Expression, level: f32, t: f32) -> Glow {
 fn pose(e: Expression, level: f32, t: f32) -> Pose {
     let level = level.clamp(0.0, 1.0);
     let deg = |d: f32| d.to_radians();
+    let on = |b: bool| if b { 1.0 } else { 0.0 };
 
     // `.smile`, scaled about its centre per state.
     let (smile_scale, smile_left, smile_top, smile_rot, smile_alpha) = match e {
@@ -920,16 +1029,15 @@ fn pose(e: Expression, level: f32, t: f32) -> Pose {
     let smile = Rect::from_min_size(pos2(smile_left, smile_top), vec2(0.2565, 0.1275));
     let smile = Rect::from_center_size(smile.center(), smile.size() * smile_scale);
 
-    // The open mouth.
-    let (open, open_alpha, lip) = match e {
-        Expression::Quiet | Expression::Loud => (talk_mouth(level, t), 1.0, 1.0),
-        // `.oMouth`: caught off guard.
-        Expression::Surprised => (
-            Rect::from_min_size(pos2(0.5 - 0.032, 0.652), vec2(0.064, 0.086)),
-            1.0,
-            0.0,
-        ),
-        _ => (talk_mouth(0.0, 0.0), 0.0, 1.0),
+    // `.oMouth`: caught off guard.
+    let open = Rect::from_min_size(pos2(0.5 - 0.032, 0.652), vec2(0.064, 0.086));
+    let open_alpha = on(e == Expression::Surprised);
+
+    // The talking mouth. At rest (any other state) it is the closed lips,
+    // so a transition into speech fades in a mouth that then opens.
+    let (lips, lips_alpha) = match e {
+        Expression::Quiet | Expression::Loud => (talk_mouth(level, t), 1.0),
+        _ => (talk_mouth(0.0, t), 0.0),
     };
 
     // `.flatMouth`: a small bar pushed off centre, the way a person's goes
@@ -965,10 +1073,9 @@ fn pose(e: Expression, level: f32, t: f32) -> Pose {
         e,
         Expression::Greeting | Expression::Delighted | Expression::Asleep
     );
-    let on = |b: bool| if b { 1.0 } else { 0.0 };
 
     Pose {
-        body: body(e, t),
+        body: body(e, level, t),
         eyes: eye_boxes(e, level),
         eyes_alpha: on(!lidded && e != Expression::Broken),
         lids: lids(e),
@@ -979,7 +1086,8 @@ fn pose(e: Expression, level: f32, t: f32) -> Pose {
         smile_alpha,
         open,
         open_alpha,
-        lip,
+        lips,
+        lips_alpha,
         flat,
         flat_alpha,
         // `.wavyMouth`: a shallow tilted arch; it did not follow that.
@@ -991,21 +1099,36 @@ fn pose(e: Expression, level: f32, t: f32) -> Pose {
     }
 }
 
-/// `.openMouth` while talking: the design's `quiet` (8% x 6.5%, `talkSmall`
-/// scaling .82x.55 to 1x1 every .58 s) and `loud` (14% x 14%, `talkBig`
-/// scaling .88x.7 to 1.05x1.25 every .46 s) geometry, blended by the level
-/// so the mouth is the audio meter, with the keyframe pulse riding on top
-/// so it keeps working through a held vowel. The pulse runs at one rate
-/// rather than the two periods, so a rising level does not jump its phase.
-fn talk_mouth(level: f32, t: f32) -> Rect {
-    let c = (1.0 - (TAU * t / 0.52).cos()) / 2.0;
-    let w = lerp(0.08, 0.14, level);
-    let h = lerp(0.065, 0.14, level);
-    // `top` plus half the height: quiet sits at 66.7%, loud at 63.3%.
-    let cy = lerp(0.667 + 0.0325, 0.633 + 0.07, level);
-    let sx = lerp(lerp(0.82, 1.0, c), lerp(0.88, 1.05, c), level);
-    let sy = lerp(lerp(0.55, 1.0, c), lerp(0.70, 1.25, c), level);
-    Rect::from_center_size(pos2(0.5, cy), vec2(w * sx, h * sy))
+/// The syllable flap's rate, Hz, and how far it wanders (so it is not a
+/// metronome): 5.2-6.8 Hz, the rate syllables come at.
+const FLAP_HZ: f32 = 6.0;
+const FLAP_WANDER: f32 = 0.8;
+
+/// The talking mouth for opening `open` (0..1) at `t` seconds: the
+/// design's `.openMouth` extents (`loud` at 14% wide, `talkBig` peaking
+/// 25% taller than that) as a pair of lips on the mouth line at 68.8%.
+///
+/// The flap: a 5-7 Hz oscillation multiplied into the opening, whose
+/// depth grows with the opening. A loud held vowel (a flat envelope at
+/// full) still flaps between 0.55 and 1 like a run of syllables, while a
+/// quiet passage barely flutters -- a mouth that inflates smoothly with
+/// the volume reads as a balloon, one that flaps at syllable rate reads
+/// as talking. The corners stay put: only the interior and the width
+/// change, and the width less than the height.
+fn talk_mouth(open: f32, t: f32) -> Lips {
+    let open = open.clamp(0.0, 1.0);
+    let phase = TAU * (FLAP_HZ * t + FLAP_WANDER * (TAU * 0.23 * t).sin() / TAU);
+    let flap = 0.5 + 0.5 * phase.sin();
+    let h = open * (1.0 - 0.45 * open * (1.0 - flap));
+    Lips {
+        centre: vec2(0.5, 0.688),
+        half_w: 0.054 + 0.024 * h,
+        upper: 0.0025 + 0.042 * h,
+        lower: 0.0025 + 0.082 * h,
+        band: 0.013,
+        teeth: ((h - 0.45) / 0.35).clamp(0.0, 1.0),
+        tongue: ((h - 0.40) / 0.45).clamp(0.0, 1.0),
+    }
 }
 
 impl Pose {
@@ -1042,7 +1165,16 @@ impl Pose {
             smile_alpha: f(self.smile_alpha, to.smile_alpha),
             open: r(self.open, to.open),
             open_alpha: f(self.open_alpha, to.open_alpha),
-            lip: f(self.lip, to.lip),
+            lips: Lips {
+                centre: v(self.lips.centre, to.lips.centre),
+                half_w: f(self.lips.half_w, to.lips.half_w),
+                upper: f(self.lips.upper, to.lips.upper),
+                lower: f(self.lips.lower, to.lips.lower),
+                band: f(self.lips.band, to.lips.band),
+                teeth: f(self.lips.teeth, to.lips.teeth),
+                tongue: f(self.lips.tongue, to.lips.tongue),
+            },
+            lips_alpha: f(self.lips_alpha, to.lips_alpha),
             flat: Flat {
                 centre: v(self.flat.centre, to.flat.centre),
                 len: f(self.flat.len, to.flat.len),
@@ -1071,9 +1203,9 @@ impl Pose {
 /// vignette covers the painter's whole clip rect, so the letterboxing
 /// around the face is part of the picture rather than a flat margin.
 ///
-/// `level` is the scaled speech level 0..1; it only moves the mouth while
-/// the expression is one of the speaking pair, so lip movement can never
-/// disagree with the audio.
+/// `level` is the mouth opening 0..1 (`FaceState::mouth_open`); it only
+/// moves the mouth, the jaw and the eyes while the expression is one of
+/// the speaking pair, so lip movement can never disagree with the audio.
 pub fn draw(
     painter: &egui::Painter,
     rect: Rect,
@@ -1103,7 +1235,7 @@ pub fn draw(
         rect,
         pivot: vec2(0.5, 0.6),
         offset: p.body.offset,
-        rot: p.body.rot,
+        rot: p.body.rot + motion.head_tilt(),
         scale: p.body.scale,
     };
     let stage = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1275,9 +1407,7 @@ fn draw_mouths(cv: &Canvas, tex: &FaceTextures, p: &Pose) {
         p.smile_alpha,
     );
 
-    // The open mouth: dark inside, cream rim, and while talking the
-    // design's inset lip highlight (`inset 0 -9px 0 rgba(cream,.18)`) as a
-    // paler band low in the mouth, and its faint outer halo.
+    // The surprised `O`: dark inside, cream rim, a faint halo.
     if p.open_alpha > 0.002 {
         let a = p.open_alpha;
         cv.ellipse(
@@ -1292,16 +1422,11 @@ fn draw_mouths(cv: &Canvas, tex: &FaceTextures, p: &Pose) {
             MOUTH_DARK.gamma_multiply(a),
             Stroke::new(stroke_w, CREAM.gamma_multiply(a)),
         );
-        let lip = Rect::from_center_size(
-            p.open.center() + vec2(0.0, p.open.height() * 0.24),
-            vec2(p.open.width() * 0.62, p.open.height() * 0.36),
-        );
-        cv.ellipse(
-            lip,
-            0.0,
-            CREAM.gamma_multiply(0.18 * a * p.lip),
-            Stroke::NONE,
-        );
+    }
+
+    // The talking mouth, see `Lips`.
+    if p.lips_alpha > 0.002 {
+        draw_lips(cv, &p.lips, p.lips_alpha);
     }
 
     // The flat bar.
@@ -1320,6 +1445,48 @@ fn draw_mouths(cv: &Canvas, tex: &FaceTextures, p: &Pose) {
             Canvas::arc_points(bx, PI, PI, p.wavy_rot),
             w * 0.0096,
             CREAM.gamma_multiply(p.wavy_alpha),
+        );
+    }
+}
+
+/// The lips, outside in: a faint halo (the design's `0 0 7px` glow), the
+/// cream band, the dark interior, then the teeth under the upper lip and
+/// the tongue at the bottom, both sized to stay inside the interior at
+/// any opening.
+fn draw_lips(cv: &Canvas, l: &Lips, alpha: f32) {
+    let poly = |pts: Vec<Vec2>, fill: Color32| {
+        let pts: Vec<Pos2> = pts.into_iter().map(|p| cv.at(p)).collect();
+        cv.painter
+            .add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+    };
+    poly(
+        l.outline(l.band * 1.9).collect(),
+        CREAM.gamma_multiply(0.07 * alpha),
+    );
+    poly(l.outline(l.band).collect(), CREAM.gamma_multiply(alpha));
+    poly(l.outline(0.0).collect(), MOUTH_DARK.gamma_multiply(alpha));
+    if l.teeth > 0.002 {
+        let teeth = Rect::from_center_size(
+            (l.centre - vec2(0.0, l.upper * 0.60)).to_pos2(),
+            vec2(l.half_w * 1.15, l.upper * 0.62),
+        );
+        cv.ellipse(
+            teeth,
+            0.0,
+            TEETH.gamma_multiply(0.55 * l.teeth * alpha),
+            Stroke::NONE,
+        );
+    }
+    if l.tongue > 0.002 {
+        let tongue = Rect::from_center_size(
+            (l.centre + vec2(0.0, l.lower * 0.64)).to_pos2(),
+            vec2(l.half_w * 1.05, l.lower * 0.58),
+        );
+        cv.ellipse(
+            tongue,
+            0.0,
+            TONGUE.gamma_multiply(0.85 * l.tongue * alpha),
+            Stroke::NONE,
         );
     }
 }
@@ -1442,7 +1609,7 @@ mod tests {
     fn body_motion_is_bounded() {
         for e in ALL {
             for i in 0..300 {
-                let motion = body(e, i as f32 * 0.037);
+                let motion = body(e, (i % 3) as f32 / 2.0, i as f32 * 0.037);
                 assert!(
                     motion.offset.length() < 0.05,
                     "{} offset {:?}",
@@ -1489,7 +1656,8 @@ mod tests {
                 let p = pose(e, level, t);
                 let eyes = p.eyes_alpha + p.lids_alpha + p.x_alpha;
                 assert!((eyes - 1.0).abs() < 1e-6, "{} shows {eyes} eyes", e.name());
-                let mouths = p.smile_alpha + p.open_alpha + p.flat_alpha + p.wavy_alpha;
+                let mouths =
+                    p.smile_alpha + p.open_alpha + p.lips_alpha + p.flat_alpha + p.wavy_alpha;
                 assert!(
                     (mouths - 1.0).abs() < 1e-6,
                     "{} shows {mouths} mouths",
@@ -1509,14 +1677,73 @@ mod tests {
 
     #[test]
     fn the_mouth_follows_the_level() {
-        // Louder is a bigger mouth, at every point of the talk pulse.
-        for t in [0.0, 0.13, 0.26] {
-            let quiet = talk_mouth(0.0, t);
+        let height = |l: &Lips| l.upper + l.lower;
+        // More open is a taller and a little wider mouth, at every point
+        // of the flap; the corners never move.
+        for t in [0.0, 0.05, 0.11, 0.3] {
+            let quiet = talk_mouth(0.15, t);
             let loud = talk_mouth(1.0, t);
-            assert!(loud.width() > quiet.width() && loud.height() > quiet.height());
+            assert!(
+                height(&loud) > 2.0 * height(&quiet),
+                "{loud:?} vs {quiet:?}"
+            );
+            assert!(loud.half_w > quiet.half_w);
+            assert!(loud.half_w - quiet.half_w < height(&loud) - height(&quiet));
+            assert!((loud.centre - quiet.centre).length() < 1e-6);
+            // The jaw drops more than the upper lip rises.
+            assert!(loud.lower > loud.upper);
         }
-        // And it never shuts: the floor keeps a held vowel from stuttering.
-        assert!(talk_mouth(0.0, 0.0).height() > 0.03);
+        // Shut is a seam between the lips, not a hole.
+        let shut = talk_mouth(0.0, 0.0);
+        assert!(height(&shut) < 0.01 && shut.band > 0.01);
+        assert!(shut.teeth < 1e-6);
+        // Teeth and tongue only at a wide opening.
+        assert!(talk_mouth(0.25, 0.0).teeth < 1e-6);
+        assert!(talk_mouth(1.0, 0.04).teeth > 0.5);
+        assert!(talk_mouth(1.0, 0.04).tongue > 0.5);
+        // The flap: over one syllable a loud mouth swings by half, a
+        // quiet one hardly at all, so a held note flaps and a murmur
+        // does not shimmer.
+        let swing = |open: f32| {
+            let hs: Vec<f32> = (0..40)
+                .map(|i| height(&talk_mouth(open, i as f32 / 40.0 / FLAP_HZ)))
+                .collect();
+            let max = hs.iter().copied().fold(0.0, f32::max);
+            let min = hs.iter().copied().fold(1.0, f32::min);
+            (max - min) / max
+        };
+        assert!(swing(1.0) > 0.35, "{}", swing(1.0));
+        assert!(swing(0.15) < 0.08, "{}", swing(0.15));
+        // The outline stays on the shell and inside the design's mouth
+        // box at any opening.
+        for open in [0.0, 0.5, 1.0] {
+            for p in talk_mouth(open, 0.04).outline(0.013) {
+                assert!(
+                    p.x > 0.38 && p.x < 0.62 && p.y > 0.60 && p.y < 0.80,
+                    "{p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_head_tilts_while_talking_and_straightens_after() {
+        let now = Instant::now();
+        let mut m = Motion::new(now);
+        let mut max = 0.0f32;
+        for i in 0..400 {
+            let t = now + Duration::from_millis(16 * i);
+            m.tick(t, Expression::Loud);
+            max = max.max(m.head_tilt().abs());
+        }
+        // Over six seconds of talking it leaned at least once, and never
+        // far: a lean, not a wobble.
+        assert!(max > 0.5f32.to_radians(), "{max}");
+        assert!(max < 3.0f32.to_radians(), "{max}");
+        for i in 400..600 {
+            m.tick(now + Duration::from_millis(16 * i), Expression::Idle);
+        }
+        assert!(m.head_tilt().abs() < 0.05f32.to_radians());
     }
 
     #[test]

@@ -118,11 +118,42 @@ const PEAK_FLOOR: f32 = 0.04;
 /// span a sentence, short enough to re-scale between a shout and a murmur.
 const PEAK_HALF_LIFE: Duration = Duration::from_millis(1500);
 
-/// How fast the mouth's envelope falls once a syllable ends. Attack is
-/// instant (a consonant is a step); the release is what keeps the mouth
-/// from fluttering on every 20 ms RMS frame, and 110 ms to fall by half
-/// is about the length of a syllable's tail.
-const RELEASE_HALF_LIFE: Duration = Duration::from_millis(110);
+/// How fast the mouth's envelope rises on a louder block: a time constant
+/// of 10 ms, so a plosive lands within the 20 ms block that carries it and
+/// two blocks in a row do not read as one ramp.
+const ATTACK_TAU: Duration = Duration::from_millis(10);
+
+/// How fast the mouth's envelope falls once a syllable ends. 90 ms to fall
+/// by half: long enough not to flutter between 20 ms RMS blocks, short
+/// enough that the dip between two syllables (they come 4-7 a second)
+/// still shows as a dip, which is what makes it read as speech rather
+/// than a balloon inflating.
+const RELEASE_HALF_LIFE: Duration = Duration::from_millis(90);
+
+/// Below this scaled level a block counts as a gap. Speech between words
+/// is not silent (breath, room, the voice's tail), so it is a threshold
+/// rather than zero.
+const GAP_LEVEL: f32 = 0.12;
+
+/// A gap shorter than this is between words: the lips stay parted at
+/// [`GAP_FLOOR`]. Longer is a pause, and the mouth closes.
+pub const SILENCE_CLOSE: Duration = Duration::from_millis(150);
+
+/// How open the mouth stays between words, 0..1 of a full opening.
+const GAP_FLOOR: f32 = 0.16;
+
+/// Once a pause is called, the mouth shuts on this half-life rather than
+/// snapping.
+const CLOSE_HALF_LIFE: Duration = Duration::from_millis(40);
+
+/// A `spoke` observation precedes its audio by the device's queue (the
+/// speaker sends it before the write). The mouth opens a little over this
+/// long from it, so the first syllable is not the first movement -- people
+/// open their mouth before the sound starts.
+pub const ANTICIPATE: Duration = Duration::from_millis(160);
+
+/// How far the anticipatory open goes, 0..1.
+const ANTICIPATE_OPEN: f32 = 0.30;
 
 /// After this long with nothing at all, the face sleeps. Matches the Go
 /// face's "nobody around for a while".
@@ -148,9 +179,19 @@ pub struct FaceState {
     /// Speech level, 0..1 raw RMS, and the running peak it is scaled by.
     level: f32,
     peak: f32,
-    /// The scaled level with a release tail: what the mouth draws.
+    /// The scaled level through attack and release, as of `level_at`:
+    /// [`Self::mouth_open`] carries the release on to the frame's time.
     envelope: f32,
     level_at: Instant,
+    /// When the level last dropped below [`GAP_LEVEL`] and stayed there.
+    gap_since: Option<Instant>,
+    /// A block above [`GAP_LEVEL`] has arrived since speech started: the
+    /// between-words floor only makes sense once there have been words.
+    voiced: bool,
+    /// The last `spoke`: a sentence is about to start.
+    anticipate_at: Option<Instant>,
+    /// The microphone's level, 0..1: the listening meter, never the mouth.
+    mic_level: f32,
     /// An explicit `expression` command and when it landed.
     override_to: Option<(Expression, Instant)>,
     /// Last time anything happened, for [`SLEEP_AFTER`].
@@ -169,6 +210,10 @@ impl FaceState {
             peak: PEAK_FLOOR,
             envelope: 0.0,
             level_at: now,
+            gap_since: Some(now),
+            voiced: false,
+            anticipate_at: None,
+            mic_level: 0.0,
             override_to: None,
             activity_at: now,
         }
@@ -181,9 +226,14 @@ impl FaceState {
             self.broken = false;
         }
         self.speaking = on;
+        // Either way the mouth starts shut: a new utterance opens on its
+        // first block (or its `spoke`), and the old one's tail is gone.
+        self.level = 0.0;
+        self.envelope = 0.0;
+        self.gap_since = Some(now);
+        self.voiced = false;
         if !on {
-            self.level = 0.0;
-            self.envelope = 0.0;
+            self.anticipate_at = None;
         }
         self.activity_at = now;
     }
@@ -229,7 +279,11 @@ impl FaceState {
         }
     }
 
-    /// A speech level from the speaker (`audio_level`).
+    /// A speech level from the speaker's own output (`audio_level` with
+    /// the speaker's source). The microphone's level goes to
+    /// [`Self::set_mic_level`]: while the bot talks the mic is muted, and
+    /// a muted mic's zeros fed to the mouth would shut it between every
+    /// two of the speaker's blocks.
     pub fn set_level(&mut self, level: f32, now: Instant) {
         let level = level.clamp(0.0, 1.0);
         // Decay the peak toward the current level, then raise it if this is
@@ -239,14 +293,45 @@ impl FaceState {
         let decay = 0.5f32.powf(dt / half);
         self.peak = (self.peak * decay).max(PEAK_FLOOR).max(level);
         self.level = level;
-        // The envelope: up instantly, down on its own half-life.
-        let release = 0.5f32.powf(dt / RELEASE_HALF_LIFE.as_secs_f32());
+        // The envelope: released to now, then pulled up toward a louder
+        // block on the attack time constant.
+        let released = self.envelope * 0.5f32.powf(dt / RELEASE_HALF_LIFE.as_secs_f32());
         let scaled = (level / self.peak.max(PEAK_FLOOR)).clamp(0.0, 1.0);
-        self.envelope = (self.envelope * release).max(scaled);
+        self.envelope = if scaled > released {
+            // A block with no time since the last (the first one, or two
+            // stamped alike) is a step: there is nothing to ramp over.
+            let attack = if dt <= 0.0 {
+                1.0
+            } else {
+                1.0 - (-dt / ATTACK_TAU.as_secs_f32()).exp()
+            };
+            released + (scaled - released) * attack
+        } else {
+            released
+        };
+        if scaled < GAP_LEVEL {
+            self.gap_since.get_or_insert(now);
+        } else {
+            self.gap_since = None;
+            self.voiced = true;
+        }
         self.level_at = now;
         if level > 0.0 {
             self.activity_at = now;
         }
+    }
+
+    /// The microphone's level (`audio_level` from any source but the
+    /// speaker): shown on the listening meter, never on the mouth.
+    pub fn set_mic_level(&mut self, level: f32) {
+        self.mic_level = level.clamp(0.0, 1.0);
+    }
+
+    /// A sentence is about to start (`spoke`): the mouth opens a touch
+    /// ahead of the audio, see [`ANTICIPATE`].
+    pub fn anticipate(&mut self, now: Instant) {
+        self.anticipate_at = Some(now);
+        self.activity_at = now;
     }
 
     /// The raw level, 0..1.
@@ -254,12 +339,52 @@ impl FaceState {
         self.level
     }
 
-    /// The level scaled against recent speech, 0..1, with a short release
-    /// tail: what the mouth and the ring use. Instantaneous on the way up
-    /// so a plosive lands on the frame it is heard; the tail only stops
-    /// the mouth flickering between RMS frames.
+    /// The microphone's level, 0..1.
+    pub fn mic_level(&self) -> f32 {
+        self.mic_level
+    }
+
+    /// The speaker's level scaled against recent speech, 0..1, through
+    /// the attack and release, as of the last block: the meter's number.
+    /// The mouth uses [`Self::mouth_open`], which carries this on to the
+    /// frame being drawn.
     pub fn scaled_level(&self) -> f32 {
         self.envelope
+    }
+
+    /// How open the talking mouth is at `now`, 0..1. Zero unless the bot
+    /// is speaking. The envelope's release continues past the last block
+    /// so a 60 Hz frame between two 50 Hz levels is not a hold; between
+    /// words the lips stay parted at the floor; after [`SILENCE_CLOSE`] of
+    /// gap (or of no levels at all) they close; and a `spoke` opens them
+    /// a little ahead of the audio.
+    pub fn mouth_open(&self, now: Instant) -> f32 {
+        if !self.speaking {
+            return 0.0;
+        }
+        let since = now.saturating_duration_since(self.level_at);
+        let env =
+            self.envelope * 0.5f32.powf(since.as_secs_f32() / RELEASE_HALF_LIFE.as_secs_f32());
+        // A gap is measured from the first quiet block; a stream that has
+        // stopped arriving is a gap from its last block.
+        let gap = self
+            .gap_since
+            .map_or(since, |g| now.saturating_duration_since(g).max(since));
+        let shut = if gap > SILENCE_CLOSE {
+            let over = gap.saturating_sub(SILENCE_CLOSE).as_secs_f32();
+            0.5f32.powf(over / CLOSE_HALF_LIFE.as_secs_f32())
+        } else {
+            1.0
+        };
+        let floor = if self.voiced { GAP_FLOOR } else { 0.0 };
+        let mut open = env.max(floor) * shut;
+        if let Some(at) = self.anticipate_at {
+            let u = now.saturating_duration_since(at).as_secs_f32() / ANTICIPATE.as_secs_f32();
+            if u < 1.0 {
+                open = open.max(ANTICIPATE_OPEN * (u * std::f32::consts::PI).sin());
+            }
+        }
+        open.clamp(0.0, 1.0)
     }
 
     /// The level scaled against recent speech with no smoothing: what
@@ -419,6 +544,46 @@ mod tests {
         f.set_level(0.2, now + Duration::from_millis(700));
         f.set_speaking(false, now + Duration::from_millis(700));
         assert!(f.scaled_level().abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_mouth_parts_between_words_and_shuts_in_a_pause() {
+        let now = t0();
+        let ms = |n: u64| now + Duration::from_millis(n);
+        let mut f = FaceState::new(now);
+        f.set_speaking(true, now);
+        // Shut until the first block.
+        assert!(f.mouth_open(now) < 1e-6);
+        // A syllable, then quiet blocks every 20 ms.
+        f.set_level(0.2, ms(20));
+        // One 20 ms block into a 10 ms attack: 86% of the way.
+        assert!(f.mouth_open(ms(20)) > 0.8, "{}", f.mouth_open(ms(20)));
+        for i in 2..=6 {
+            f.set_level(0.0, ms(20 * i));
+        }
+        // 100 ms into the gap: released but parted, not shut.
+        let between = f.mouth_open(ms(120));
+        assert!(between > GAP_FLOOR * 0.9 && between < 0.6, "{between}");
+        // Between two consecutive 50 Hz blocks the frame keeps releasing:
+        // no hold, no step.
+        assert!(f.mouth_open(ms(125)) < f.mouth_open(ms(121)));
+        for i in 7..=20 {
+            f.set_level(0.0, ms(20 * i));
+        }
+        // 300 ms of gap is a pause: shut.
+        assert!(f.mouth_open(ms(400)) < 0.02, "{}", f.mouth_open(ms(400)));
+        // The stream stopping counts as a pause too.
+        f.set_level(0.2, ms(500));
+        assert!(f.mouth_open(ms(900)) < 0.02);
+        // The next word opens it again, at once.
+        f.set_level(0.2, ms(1000));
+        assert!(f.mouth_open(ms(1000)) > 0.8);
+        // And a `spoke` opens it a little ahead of its audio.
+        f.set_speaking(true, ms(2000));
+        f.anticipate(ms(2000));
+        let ahead = f.mouth_open(ms(2000) + ANTICIPATE / 2);
+        assert!(ahead > 0.25 && ahead < 0.35, "{ahead}");
+        assert!(f.mouth_open(ms(2000) + ANTICIPATE + Duration::from_millis(200)) < 1e-6);
     }
 
     #[test]

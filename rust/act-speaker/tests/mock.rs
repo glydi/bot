@@ -409,3 +409,84 @@ fn stop_during_a_split_reply_discards_the_rest() {
     assert!(!r.flag.load(Ordering::Acquire), "the rest must not play");
     r.handle.stop();
 }
+
+/// The mouth is driven by `audio_level`, so the play thread must report it
+/// at syllable rate, from the audio it is actually writing, and stop the
+/// moment speech does. The silent mock would report zeros, so this one
+/// speaks a tone.
+#[test]
+fn audio_level_follows_the_audio_at_syllable_rate_and_stops_with_it() {
+    let config = SpeakerConfig {
+        backend: Backend::Mock,
+        silent: true,
+        source: "speaker".into(),
+    };
+    let synth = MockSynth::with_tone(16_000);
+    let (cmd, rx) = crossbeam_channel::unbounded();
+    let (obs_tx, obs) = ObservationRing::bounded(1024);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut handle = Speaker::spawn_with(
+        &config,
+        Box::new(synth),
+        Box::new(NullOutput::new(SAMPLE_RATE)),
+        rx,
+        obs_tx,
+        Arc::clone(&flag),
+        Arc::new(RealClock),
+    )
+    .unwrap_or_else(|e| panic!("spawn: {e}"));
+
+    // 50 chars = 1.5 s of tone.
+    let text = "y".repeat(50);
+    let audio = Duration::from_millis(50 * MS_PER_CHAR);
+    cmd.send(say(&text)).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        flag.load(Ordering::Acquire)
+    });
+    wait_until("down", Duration::from_secs(5), || {
+        !flag.load(Ordering::Acquire)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Everything on the ring, in order.
+    let all: Vec<(String, Payload)> = std::iter::from_fn(|| obs.try_recv())
+        .map(|o| (o.modality.to_string(), o.payload))
+        .collect();
+    let up = all
+        .iter()
+        .position(|(m, p)| m == "self_speaking" && p.as_bool() == Some(true))
+        .unwrap_or_else(|| panic!("no self_speaking true in {all:?}"));
+    let down = all
+        .iter()
+        .position(|(m, p)| m == "self_speaking" && p.as_bool() == Some(false))
+        .unwrap_or_else(|| panic!("no self_speaking false in {all:?}"));
+    let levels: Vec<f32> = all[up..down]
+        .iter()
+        .filter(|(m, _)| m == "audio_level")
+        .filter_map(|(_, p)| match p {
+            Payload::Level(l) => Some(*l),
+            _ => None,
+        })
+        .collect();
+    // At least 25 a second while speaking (one per 20 ms block is 50).
+    let per_second = levels.len() as f32 / audio.as_secs_f32();
+    assert!(
+        per_second >= 25.0,
+        "{} levels over {audio:?} = {per_second:.0}/s",
+        levels.len()
+    );
+    // Every level is the tone's RMS (peak / sqrt 2 = 0.345), not silence,
+    // except the final zero that shuts the mouth.
+    let (tail, body) = levels.split_last().unwrap_or_else(|| panic!("no levels"));
+    assert!(tail.abs() < 1e-6, "the last level closes the mouth: {tail}");
+    for l in body {
+        assert!((0.30..0.40).contains(l), "level {l} is not the tone");
+    }
+    // Every level is from the speaker, and none arrives once speech ended.
+    assert!(
+        all[down..].iter().all(|(m, _)| m != "audio_level"),
+        "levels after self_speaking false: {:?}",
+        &all[down..]
+    );
+    handle.stop();
+}

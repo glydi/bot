@@ -18,7 +18,9 @@
 //!
 //! Reports back through observations from source `"speaker"`:
 //! `self_speaking` (`Payload::Bool`) on the start and end of playback,
-//! `audio_level` (`Payload::Level`, RMS 0..1, ~10 Hz) while speaking,
+//! `audio_level` (`Payload::Level`, RMS 0..1, one per 20 ms block, i.e.
+//! 50 Hz, each sent as its block starts playing, and a final `0.0` just
+//! before `self_speaking` goes false) while speaking,
 //! `spoke` (`Payload::Text`, the first 40 chars) as each chunk (a sentence,
 //! or the opening clause of the first one) starts playing, and
 //! `speaker_latency` (`Payload::Level`, milliseconds) once per reply: the
