@@ -37,11 +37,11 @@ pub const STALE: Duration = Duration::from_secs(30);
 /// The stages, in order, for the panel's "slowest" highlight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// speech_end -> utterance.
+    /// `speech_end` -> `utterance`.
     Stt,
-    /// utterance -> first_say.
+    /// `utterance` -> `first_say`.
     Think,
-    /// first_say -> first_audio.
+    /// `first_say` -> `first_audio`.
     Tts,
 }
 
@@ -62,13 +62,13 @@ impl Stage {
 pub struct TurnSummary {
     /// Sequence number since start, 1-based; the number in the log line.
     pub id: u64,
-    /// speech_end -> utterance: VAD silence to transcript.
+    /// `speech_end` -> `utterance`: VAD silence to transcript.
     pub stt_ms: Option<u64>,
     /// utterance -> first `say`: the LLM's time to first sentence.
     pub think_ms: Option<u64>,
     /// first `say` -> first audio: synthesis plus device start.
     pub tts_ms: Option<u64>,
-    /// speech_end -> first audio: what the user actually waited.
+    /// `speech_end` -> first audio: what the user actually waited.
     pub total_ms: Option<u64>,
     /// first audio -> last audio: how long the reply played, when known.
     pub speak_ms: Option<u64>,
@@ -114,6 +114,7 @@ pub fn summary_line(t: &TurnSummary) -> String {
 
 /// The raw timestamps of one turn.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_field_names)]
 struct Turn {
     id: u64,
     speech_end: Instant,
@@ -188,10 +189,11 @@ impl TurnTimeline {
     /// one string match, no lock.
     pub fn observe(&self, o: &Observation) {
         match o.modality.as_str() {
-            "voice_activity" => match o.payload.as_bool() {
-                Some(false) => self.speech_end(o.at),
-                _ => {}
-            },
+            "voice_activity" => {
+                if o.payload.as_bool() == Some(false) {
+                    self.speech_end(o.at);
+                }
+            }
             "turn_ended" => {
                 let mut g = self.inner.lock();
                 if let Some(t) = g.open() {
@@ -213,8 +215,17 @@ impl TurnTimeline {
         }
     }
 
-    /// Fold one command in. Only `speaker/say` and `speaker/stop` matter.
+    /// Fold one command in, stamped now. Commands carry no timestamp, and
+    /// the router hands them over the moment they are issued, so "now" is
+    /// within a thread hop of when the mind decided.
     pub fn command(&self, c: &Command) {
+        self.command_at(c, Instant::now());
+    }
+
+    /// Fold one command in with an explicit instant (tests and replays
+    /// drive this from a fake clock). Only `speaker/say` and
+    /// `speaker/stop` matter.
+    pub fn command_at(&self, c: &Command, at: Instant) {
         if c.target != "speaker" {
             return;
         }
@@ -222,10 +233,7 @@ impl TurnTimeline {
             "say" => {
                 let mut g = self.inner.lock();
                 if let Some(t) = g.open() {
-                    // No clock here: the command carries no timestamp, and
-                    // it is folded the moment the router hands it over, so
-                    // "now" is within a thread hop of when it was issued.
-                    t.first_say.get_or_insert(Instant::now());
+                    t.first_say.get_or_insert(at);
                 }
             }
             "stop" => {
@@ -324,12 +332,22 @@ mod tests {
         Observation::new("mic0", modality, clock.at_secs(secs)).with_payload(payload)
     }
 
-    fn say() -> Command {
-        Command::new("speaker", "say", Priority::Deliberate).with_payload(Payload::Text("Hi.".into()))
+    fn speaking(clock: &FakeClock, secs: f64, on: bool) -> Observation {
+        Observation::new("speaker", "self_speaking", clock.at_secs(secs))
+            .with_payload(Payload::Bool(on))
     }
 
-    /// One scripted turn: silence at 0, turn end at 0.1, transcript at
-    /// 0.31, say "now", audio 0.18 s after the say.
+    fn say() -> Command {
+        Command::new("speaker", "say", Priority::Deliberate)
+            .with_payload(Payload::Text("Hi.".into()))
+    }
+
+    fn stop() -> Command {
+        Command::new("speaker", "stop", Priority::Reflex)
+    }
+
+    /// One scripted turn, all on the fake clock: silence at `base`, turn
+    /// end +0.1, transcript +0.31, say +1.73, audio +1.91, audio end +2.91.
     fn scripted(tl: &TurnTimeline, clock: &FakeClock, base: f64) -> TurnSummary {
         tl.observe(&obs(clock, base, "voice_activity", Payload::Bool(false)));
         tl.observe(&obs(clock, base + 0.1, "turn_ended", Payload::None));
@@ -339,62 +357,48 @@ mod tests {
             "utterance",
             Payload::Text("hello".into()),
         ));
-        // `first_say` is stamped with the real clock, so the tts leg is
-        // measured against a real instant taken right after the command.
-        tl.command(&say());
-        let said = Instant::now();
-        tl.observe(
-            &Observation::new(
-                "speaker",
-                "self_speaking",
-                said + Duration::from_millis(180),
-            )
-            .with_payload(Payload::Bool(true)),
-        );
-        tl.observe(
-            &Observation::new(
-                "speaker",
-                "self_speaking",
-                said + Duration::from_millis(1180),
-            )
-            .with_payload(Payload::Bool(false)),
-        );
-        tl.recent().last().cloned().unwrap_or_else(|| panic!("no turn"))
+        tl.command_at(&say(), clock.at_secs(base + 1.73));
+        tl.observe(&speaking(clock, base + 1.91, true));
+        tl.observe(&speaking(clock, base + 2.91, false));
+        tl.recent()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("no turn"))
     }
 
     #[test]
-    fn stt_and_tts_legs_are_measured() {
+    fn legs_are_measured_from_a_scripted_sequence() {
         let clock = FakeClock::new();
         let tl = TurnTimeline::new();
         let t = scripted(&tl, &clock, 0.0);
         assert_eq!(t.id, 1);
         assert_eq!(t.stt_ms, Some(310));
-        // think spans a fake instant to a real one; only its presence is
-        // deterministic.
-        assert!(t.think_ms.is_some());
+        assert_eq!(t.think_ms, Some(1420));
         assert_eq!(t.tts_ms, Some(180));
+        assert_eq!(t.total_ms, Some(1910));
         assert_eq!(t.speak_ms, Some(1000));
         assert!(t.complete && !t.cancelled);
-        assert_eq!(t.total_ms, Some(t.stt_ms.unwrap_or(0) + t.think_ms.unwrap_or(0) + 180));
+        assert_eq!(t.slowest(), Some(Stage::Think));
+        assert_eq!(
+            summary_line(&t),
+            "turn 1: stt 310ms, think 1420ms, tts 180ms, total 1910ms"
+        );
     }
 
     #[test]
-    fn think_leg_is_measured_when_all_instants_are_close() {
-        // Drive everything off `Instant::now()` so the three legs line up.
+    fn command_without_an_instant_uses_now() {
         let tl = TurnTimeline::new();
         let t0 = Instant::now();
-        let o = |ms: u64, m: &str, p: Payload| {
-            Observation::new("mic0", m, t0 + Duration::from_millis(ms)).with_payload(p)
-        };
-        tl.observe(&o(0, "voice_activity", Payload::Bool(false)));
-        tl.observe(&o(300, "utterance", Payload::Text("x".into())));
-        // Sleep so the say lands measurably after the utterance instant
-        // (which is 300 ms in the future of t0).
-        std::thread::sleep(Duration::from_millis(320));
+        tl.observe(
+            &Observation::new("mic0", "voice_activity", t0).with_payload(Payload::Bool(false)),
+        );
+        tl.observe(
+            &Observation::new("mic0", "utterance", t0).with_payload(Payload::Text("x".into())),
+        );
         tl.command(&say());
         let t = tl.recent().pop().unwrap_or_else(|| panic!("no turn"));
         let think = t.think_ms.unwrap_or_else(|| panic!("no think"));
-        assert!((10..500).contains(&think), "think {think}");
+        assert!(think < 1000, "think {think}");
         assert!(!t.complete);
     }
 
@@ -404,28 +408,32 @@ mod tests {
         let tl = TurnTimeline::new();
         tl.observe(&obs(&clock, 0.0, "voice_activity", Payload::Bool(false)));
         tl.observe(&obs(&clock, 0.25, "utterance", Payload::Text("hi".into())));
-        tl.command(&say());
-        tl.command(&Command::new("speaker", "stop", Priority::Reflex));
+        tl.command_at(&say(), clock.at_secs(0.5));
+        tl.command_at(&stop(), clock.at_secs(0.6));
         let t = tl.recent().pop().unwrap_or_else(|| panic!("no turn"));
         assert!(t.cancelled && t.complete);
         assert_eq!(t.stt_ms, Some(250));
+        assert_eq!(t.think_ms, Some(250));
         assert_eq!(t.tts_ms, None);
         assert_eq!(t.total_ms, None);
+        assert_eq!(
+            summary_line(&t),
+            "turn 1: stt 250ms, think 250ms, tts -, total - (cancelled)"
+        );
         // The next speech_end opens a fresh turn rather than reusing it.
         tl.observe(&obs(&clock, 1.0, "voice_activity", Payload::Bool(false)));
         let all = tl.recent();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].id, 2);
         assert!(!all[1].complete);
-        // A stop with no open turn is noise, not a cancellation.
+        // A stop once audio has started is a barge-in on a complete turn,
+        // not a cancellation.
         tl.observe(&obs(&clock, 1.2, "utterance", Payload::Text("x".into())));
-        tl.command(&say());
-        tl.observe(
-            &Observation::new("speaker", "self_speaking", Instant::now())
-                .with_payload(Payload::Bool(true)),
-        );
-        tl.command(&Command::new("speaker", "stop", Priority::Reflex));
+        tl.command_at(&say(), clock.at_secs(1.5));
+        tl.observe(&speaking(&clock, 1.6, true));
+        tl.command_at(&stop(), clock.at_secs(1.7));
         assert!(!tl.recent()[1].cancelled);
+        assert!(tl.recent()[1].complete);
     }
 
     #[test]
@@ -456,6 +464,16 @@ mod tests {
         );
         assert_eq!(t.slowest(), Some(Stage::Think));
         assert_eq!(c.slowest(), Some(Stage::Think));
+        let empty = TurnSummary {
+            stt_ms: None,
+            think_ms: None,
+            ..c
+        };
+        assert_eq!(empty.slowest(), None);
+        assert_eq!(
+            summary_line(&empty),
+            "turn 12: stt -, think -, tts -, total - (cancelled)"
+        );
     }
 
     #[test]
@@ -484,11 +502,9 @@ mod tests {
         let clock = FakeClock::new();
         let tl = TurnTimeline::new();
         tl.observe(&obs(&clock, 0.0, "voice_activity", Payload::Bool(false)));
-        tl.observe(
-            &Observation::new("speaker", "self_speaking", clock.at_secs(0.1))
-                .with_payload(Payload::Bool(true)),
-        );
+        tl.observe(&speaking(&clock, 0.1, true));
         assert!(!tl.recent()[0].complete);
+        assert_eq!(tl.recent()[0].tts_ms, None);
     }
 
     #[test]
@@ -502,5 +518,6 @@ mod tests {
         assert_eq!(all.len(), KEEP);
         assert_eq!(all[0].id, 6);
         assert_eq!(all[KEEP - 1].id, (KEEP + 5) as u64);
+        assert!(all.iter().all(|t| t.total_ms == Some(1910)));
     }
 }

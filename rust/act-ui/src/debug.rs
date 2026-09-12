@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::{Stage, TurnSummary};
 use mind::{Event, EventKind, WorldView};
 
 use crate::state::UiState;
@@ -23,6 +24,9 @@ pub type Getter<T> = Box<dyn Fn() -> T + Send>;
 /// How many events the panel shows.
 pub const EVENT_LINES: usize = 50;
 
+/// How many turns the latency table shows, newest first.
+pub const LATENCY_ROWS: usize = 10;
+
 /// Where the panel reads from. All three are called on the render thread,
 /// once per frame, and must not block.
 pub struct Sources {
@@ -30,9 +34,10 @@ pub struct Sources {
     pub view: Getter<Arc<WorldView>>,
     /// The most recent `n` events, oldest first (`EventLog::recent`).
     pub events: Box<dyn Fn(usize) -> Vec<Event> + Send>,
-    /// Optional per-stage latency, as (stage, milliseconds) pairs, for
-    /// whoever is measuring: reflex, STT, LLM first token, synthesis.
-    pub latency: Option<Getter<Vec<(String, f32)>>>,
+    /// Optional per-turn latency (`TurnTimeline::recent`), oldest first.
+    /// `None` hides the section: a bench or a speaker-only run has no
+    /// timeline to read.
+    pub latency: Option<Box<dyn Fn() -> Vec<TurnSummary> + Send>>,
 }
 
 impl Sources {
@@ -61,14 +66,81 @@ pub fn show(ui: &mut egui::Ui, state: &UiState, src: &Sources, now: Instant) {
         .show(ui, |ui| commands(ui, state, now));
     if let Some(latency) = &src.latency {
         egui::CollapsingHeader::new("latency")
-            .default_open(false)
-            .show(ui, |ui| {
-                for (stage, ms) in latency() {
-                    ui.label(format!("{stage:>18}  {ms:>7.1} ms"));
-                }
-            });
+            .default_open(true)
+            .show(ui, |ui| latency_table(ui, &latency_rows(&latency())));
     }
 }
+
+/// One row of the latency table, ready to draw: the cells as text and
+/// which stage column to highlight. Computed apart from egui so the
+/// selection of the slowest stage is testable without a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatencyRow {
+    /// `turn N`.
+    pub turn: String,
+    /// stt / think / tts / total, `-` when the stage has not happened.
+    pub cells: [String; 4],
+    /// The stage that took longest, if any leg is measured.
+    pub slowest: Option<Stage>,
+    /// A `stop` arrived before the reply started playing.
+    pub cancelled: bool,
+}
+
+/// The last [`LATENCY_ROWS`] turns, newest first, as rows.
+pub fn latency_rows(turns: &[TurnSummary]) -> Vec<LatencyRow> {
+    let ms = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |ms| format!("{ms}"));
+    turns
+        .iter()
+        .rev()
+        .take(LATENCY_ROWS)
+        .map(|t| LatencyRow {
+            turn: format!("turn {}", t.id),
+            cells: [ms(t.stt_ms), ms(t.think_ms), ms(t.tts_ms), ms(t.total_ms)],
+            slowest: t.slowest(),
+            cancelled: t.cancelled,
+        })
+        .collect()
+}
+
+/// The stage each of the first three columns shows.
+const STAGE_COLUMNS: [Stage; 3] = [Stage::Stt, Stage::Think, Stage::Tts];
+
+fn latency_table(ui: &mut egui::Ui, rows: &[LatencyRow]) {
+    if rows.is_empty() {
+        ui.weak("no turns yet");
+        return;
+    }
+    egui::Grid::new("latency_table")
+        .num_columns(6)
+        .striped(true)
+        .show(ui, |ui| {
+            ui.weak("");
+            for s in STAGE_COLUMNS {
+                ui.weak(s.name());
+            }
+            ui.weak("total");
+            ui.weak("");
+            ui.end_row();
+            for r in rows {
+                ui.label(&r.turn);
+                for (i, s) in STAGE_COLUMNS.iter().enumerate() {
+                    let cell = format!("{:>6}", r.cells[i]);
+                    if r.slowest == Some(*s) {
+                        ui.colored_label(SLOW, egui::RichText::new(cell).strong());
+                    } else {
+                        ui.monospace(cell);
+                    }
+                }
+                ui.monospace(format!("{:>6}", r.cells[3]));
+                ui.weak(if r.cancelled { "cancelled" } else { "" });
+                ui.end_row();
+            }
+        });
+}
+
+/// The highlight for the slowest stage: the same red the face uses for
+/// nothing else, so it reads as "look here".
+const SLOW: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x39, 0x2b);
 
 fn room(ui: &mut egui::Ui, view: &WorldView, now: Instant) {
     if view.people.is_empty() {
@@ -152,6 +224,60 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn turn(id: u64, stt: Option<u64>, think: Option<u64>, tts: Option<u64>) -> TurnSummary {
+        let total = match (stt, think, tts) {
+            (Some(a), Some(b), Some(c)) => Some(a + b + c),
+            _ => None,
+        };
+        TurnSummary {
+            id,
+            stt_ms: stt,
+            think_ms: think,
+            tts_ms: tts,
+            total_ms: total,
+            speak_ms: None,
+            cancelled: tts.is_none(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn empty_sources_have_no_latency_and_full_sources_read_through() {
+        let now = Instant::now();
+        let empty = Sources::empty(now);
+        assert!(empty.latency.is_none());
+        assert!((empty.events)(EVENT_LINES).is_empty());
+        assert!((empty.view)().people.is_empty());
+
+        let full = Sources {
+            view: Box::new(move || WorldView::empty(now)),
+            events: Box::new(|_| Vec::new()),
+            latency: Some(Box::new(|| vec![turn(1, Some(310), Some(1420), Some(180))])),
+        };
+        let got = full.latency.as_ref().map(|f| f());
+        assert_eq!(got.as_ref().map(Vec::len), Some(1));
+        assert_eq!(latency_rows(&[]), Vec::new());
+    }
+
+    #[test]
+    fn latency_rows_are_newest_first_and_flag_the_slowest_stage() {
+        let turns: Vec<TurnSummary> = (1..=15)
+            .map(|i| turn(i, Some(300), Some(1000 + i), Some(150)))
+            .collect();
+        let rows = latency_rows(&turns);
+        assert_eq!(rows.len(), LATENCY_ROWS);
+        assert_eq!(rows[0].turn, "turn 15");
+        assert_eq!(rows[9].turn, "turn 6");
+        assert_eq!(rows[0].cells, ["300", "1015", "150", "1465"]);
+        assert_eq!(rows[0].slowest, Some(Stage::Think));
+        assert!(!rows[0].cancelled);
+
+        let rows = latency_rows(&[turn(2, Some(900), Some(200), None)]);
+        assert_eq!(rows[0].cells, ["900", "200", "-", "-"]);
+        assert_eq!(rows[0].slowest, Some(Stage::Stt));
+        assert!(rows[0].cancelled);
+    }
 
     #[test]
     fn ago_is_short() {

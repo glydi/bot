@@ -16,7 +16,15 @@
 //!   the "synthesise N+1 while N plays" overlap from `kokoro_tts.py`.
 //! * **play** owns the output device and the `self_speaking` state: the
 //!   flag and the observation flip on the first chunk written and once
-//!   nothing is queued, in flight or still draining.
+//!   nothing is queued, in flight or still draining. It also reports
+//!   `spoke` (the first 40 chars of a sentence, as its first chunk goes to
+//!   the device), so a log can show *what* started playing when.
+//!
+//! The synth thread reports `speaker_latency` (`Payload::Level`, in
+//! milliseconds) for the first sentence of each reply: how long the
+//! backend took to produce its first audio. Together with `self_speaking`
+//! that is the `tts` leg of `common::TurnTimeline` split into "synth" and
+//! "device start".
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -57,18 +65,34 @@ const PCM_QUEUE_CHUNKS: usize = 2048;
 /// How often the play thread reports `audio_level` while speaking.
 const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How much of a sentence the `spoke` observation carries. Enough to
+/// recognise the sentence in a log, short enough not to be the log.
+pub const SPOKE_CHARS: usize = 40;
+
 /// A sentence to synthesise.
 pub(crate) struct Job {
     generation: u64,
-    text: String,
+    /// Shared with every `Pcm` chunk cut from it, so the play thread can
+    /// name the sentence without a copy per chunk.
+    text: Arc<str>,
+    /// The first sentence of a reply (the speaker was idle when it was
+    /// queued): the one whose synth time is the user-visible latency.
+    first: bool,
 }
 
-/// PCM for part of a sentence. `last` marks the end of a job (and may be
-/// empty).
+/// PCM for part of a sentence. `first` marks the first chunk of a job,
+/// `last` the end of it (and may be empty).
 pub(crate) struct Pcm {
     generation: u64,
     samples: Vec<i16>,
+    text: Arc<str>,
+    first: bool,
     last: bool,
+}
+
+/// The first [`SPOKE_CHARS`] of `text`, for the `spoke` observation.
+pub fn spoke_text(text: &str) -> String {
+    text.chars().take(SPOKE_CHARS).collect()
 }
 
 /// State shared by all three threads.
@@ -107,6 +131,7 @@ impl Shared {
 }
 
 /// Where the engine reports to.
+#[derive(Clone)]
 pub(crate) struct Reporter {
     pub source: SmolStr,
     pub obs_tx: RingSender,
@@ -125,10 +150,15 @@ impl Reporter {
 /// disconnects or shutdown is set.
 fn control_loop(commands: &Receiver<Command>, jobs: &Sender<Job>, shared: &Shared) {
     let enqueue = |text: String| -> bool {
+        // Idle means nothing queued, in flight or playing: this sentence
+        // is the start of a reply, and its synth time is the latency the
+        // listener feels. Checked before `inflight` goes up.
+        let first = shared.is_idle();
         shared.inflight.fetch_add(1, Ordering::AcqRel);
         jobs.send(Job {
             generation: shared.current(),
-            text,
+            text: Arc::from(text),
+            first,
         })
         .is_ok()
     };
@@ -183,8 +213,15 @@ fn control_loop(commands: &Receiver<Command>, jobs: &Sender<Job>, shared: &Share
     }
 }
 
-/// The synth loop: jobs in, pcm out.
-fn synth_loop(synth: &mut dyn Synth, jobs: &Receiver<Job>, pcm: &Sender<Pcm>, shared: &Shared) {
+/// The synth loop: jobs in, pcm out. Reports `speaker_latency` for the
+/// first sentence of a reply.
+fn synth_loop(
+    synth: &mut dyn Synth,
+    jobs: &Receiver<Job>,
+    pcm: &Sender<Pcm>,
+    shared: &Shared,
+    report: &Reporter,
+) {
     let chunk = (PCM_CHUNK_MS * u64::from(synth.sample_rate()) / 1000) as usize;
     loop {
         if shared.stopping() {
@@ -202,12 +239,21 @@ fn synth_loop(synth: &mut dyn Synth, jobs: &Receiver<Job>, pcm: &Sender<Pcm>, sh
         }
         let started = Instant::now();
         let generation = job.generation;
+        let text = Arc::clone(&job.text);
         let mut carry: Vec<i16> = Vec::with_capacity(chunk);
         let mut cancelled = false;
+        // Time to the first audio the backend produced. For a streaming
+        // backend (ttsd) this is what the listener waits; for a one-shot
+        // one (Kokoro) it equals the whole synthesis.
+        let mut first_audio: Option<Duration> = None;
+        let mut sent = 0usize;
         let result = synth.synthesize(&job.text, &mut |samples: &[i16]| {
             if generation != shared.current() || shared.stopping() {
                 cancelled = true;
                 return false;
+            }
+            if first_audio.is_none() && !samples.is_empty() {
+                first_audio = Some(started.elapsed());
             }
             carry.extend_from_slice(samples);
             while carry.len() >= chunk {
@@ -217,6 +263,8 @@ fn synth_loop(synth: &mut dyn Synth, jobs: &Receiver<Job>, pcm: &Sender<Pcm>, sh
                     .send(Pcm {
                         generation,
                         samples: out,
+                        text: Arc::clone(&text),
+                        first: sent == 0,
                         last: false,
                     })
                     .is_err()
@@ -224,24 +272,32 @@ fn synth_loop(synth: &mut dyn Synth, jobs: &Receiver<Job>, pcm: &Sender<Pcm>, sh
                     cancelled = true;
                     return false;
                 }
+                sent += 1;
             }
             true
         });
         if let Err(e) = result {
             tracing::error!(error = %e, text = %job.text, "synthesis failed");
         }
+        let synth_ms = first_audio.unwrap_or_else(|| started.elapsed()).as_millis();
         tracing::debug!(
             ms = started.elapsed().as_millis(),
+            first_audio_ms = synth_ms,
             chars = job.text.len(),
             cancelled,
             "synth"
         );
+        if job.first && !cancelled {
+            report.send("speaker_latency", Payload::Level(synth_ms as f32));
+        }
         // The tail, marked last, so the play thread retires the job. On a
         // cancel it is stale and retired the same way.
         if pcm
             .send(Pcm {
                 generation,
                 samples: std::mem::take(&mut carry),
+                text,
+                first: sent == 0,
                 last: true,
             })
             .is_err()
@@ -292,6 +348,11 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
                 let stale = chunk.generation != shared.current();
                 if !stale && !chunk.samples.is_empty() {
                     set_speaking(&mut speaking, true);
+                    if chunk.first {
+                        // After `self_speaking`, before the write: a log
+                        // reads "speaking, then this sentence".
+                        report.send("spoke", Payload::Text(spoke_text(&chunk.text)));
+                    }
                     let cancel = || chunk.generation != shared.current() || shared.stopping();
                     output.write(&chunk.samples, &cancel);
                     last_audio = Instant::now();
@@ -358,9 +419,10 @@ pub(crate) fn spawn_threads(
         .spawn(move || control_loop(&commands, &jobs_tx, &s1))?;
 
     let s2 = Arc::clone(shared);
+    let r2 = report.clone();
     let synth_thread = std::thread::Builder::new()
         .name("glydi-speaker-synth".into())
-        .spawn(move || synth_loop(synth.as_mut(), &jobs_rx, &pcm_tx, &s2))?;
+        .spawn(move || synth_loop(synth.as_mut(), &jobs_rx, &pcm_tx, &s2, &r2))?;
 
     let s3 = Arc::clone(shared);
     let play = std::thread::Builder::new()

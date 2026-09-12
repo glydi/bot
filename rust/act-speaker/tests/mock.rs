@@ -72,6 +72,20 @@ fn speaking_obs(obs: &RingReceiver) -> Vec<bool> {
         .collect()
 }
 
+/// Drain the ring into "modality:detail" lines, skipping `audio_level`
+/// (rate-driven, so its count is not deterministic).
+fn trace(obs: &RingReceiver) -> Vec<String> {
+    std::iter::from_fn(|| obs.try_recv())
+        .filter(|o| o.modality != "audio_level")
+        .map(|o| match &o.payload {
+            Payload::Bool(b) => format!("{}:{b}", o.modality),
+            Payload::Text(t) => format!("{}:{t}", o.modality),
+            Payload::Level(_) => o.modality.to_string(),
+            other => format!("{}:{other:?}", o.modality),
+        })
+        .collect()
+}
+
 #[test]
 fn say_say_keeps_order_and_splits_sentences() {
     let mut r = rig();
@@ -205,5 +219,74 @@ fn commands_for_other_targets_are_ignored() {
         .ok();
     std::thread::sleep(Duration::from_millis(50));
     assert!(r.synth.spoken().is_empty());
+    r.handle.stop();
+}
+
+#[test]
+fn spoke_follows_self_speaking_and_names_each_sentence_in_order() {
+    let mut r = rig();
+    let long = "x".repeat(60);
+    r.cmd.send(say(&format!("One. Two. {long}."))).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        r.flag.load(Ordering::Acquire)
+    });
+    wait_until("down", Duration::from_secs(5), || {
+        !r.flag.load(Ordering::Acquire)
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let got = trace(&r.obs);
+    // The latency for the first sentence is reported by the synth thread
+    // before its audio reaches the device, so it precedes speaking.
+    let first_spoke = got
+        .iter()
+        .position(|l| l.starts_with("spoke:"))
+        .unwrap_or_else(|| panic!("no spoke in {got:?}"));
+    let latency = got
+        .iter()
+        .position(|l| l == "speaker_latency")
+        .unwrap_or_else(|| panic!("no speaker_latency in {got:?}"));
+    assert!(latency < first_spoke, "{got:?}");
+    assert_eq!(got.iter().filter(|l| *l == "speaker_latency").count(), 1);
+    let rest: Vec<&str> = got
+        .iter()
+        .filter(|l| *l != "speaker_latency")
+        .map(String::as_str)
+        .collect();
+    let truncated: String = format!("{long}.")
+        .chars()
+        .take(act_speaker::SPOKE_CHARS)
+        .collect();
+    assert_eq!(
+        rest,
+        [
+            "self_speaking:true".to_owned(),
+            "spoke:One.".to_owned(),
+            "spoke:Two.".to_owned(),
+            format!("spoke:{truncated}"),
+            "self_speaking:false".to_owned(),
+        ]
+    );
+    r.handle.stop();
+}
+
+#[test]
+fn stop_emits_self_speaking_false_promptly() {
+    let mut r = rig();
+    r.cmd.send(say(&"z".repeat(100))).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        r.flag.load(Ordering::Acquire)
+    });
+    // Drain what has arrived so far, then time the stop by the ring: the
+    // observation is what the timeline and the face see, not the flag.
+    let _ = speaking_obs(&r.obs);
+    r.cmd
+        .send(Command::new("speaker", "stop", Priority::Reflex))
+        .ok();
+    let took = wait_until(
+        "self_speaking false on the ring",
+        Duration::from_secs(1),
+        || speaking_obs(&r.obs).contains(&false),
+    );
+    assert!(took < Duration::from_millis(100), "stop took {took:?}");
     r.handle.stop();
 }

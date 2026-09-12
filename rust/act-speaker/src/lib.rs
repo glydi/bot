@@ -12,8 +12,11 @@
 //!   immediately. Anything queued is discarded.
 //!
 //! Reports back through observations from source `"speaker"`:
-//! `self_speaking` (`Payload::Bool`) on the start and end of playback, and
-//! `audio_level` (`Payload::Level`, RMS 0..1, ~10 Hz) while speaking. The
+//! `self_speaking` (`Payload::Bool`) on the start and end of playback,
+//! `audio_level` (`Payload::Level`, RMS 0..1, ~10 Hz) while speaking,
+//! `spoke` (`Payload::Text`, the first 40 chars) as each sentence starts
+//! playing, and `speaker_latency` (`Payload::Level`, milliseconds) once
+//! per reply: the synth time of its first sentence. The
 //! same start/stop is mirrored in a shared `AtomicBool` the audio sense
 //! reads on its callback to mute the mic, since an observation round trip
 //! is too slow for that.
@@ -53,7 +56,7 @@ use common::{Clock, Command, CommandQueue, RingSender};
 use crossbeam_channel::Receiver;
 use smol_str::SmolStr;
 
-pub use engine::{INFLIGHT_HOLD, SPEAKING_HOLD};
+pub use engine::{INFLIGHT_HOLD, SPEAKING_HOLD, SPOKE_CHARS, spoke_text};
 pub use output::{CpalOutput, NullOutput, Output, OutputError};
 pub use sentence::{ends_sentence, phrases, sentences};
 #[cfg(feature = "kokoro")]

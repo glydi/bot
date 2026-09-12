@@ -18,7 +18,6 @@ fn router_feeds_both_actuators_from_one_queue() {
     let mut router = CommandRouter::new(queue.clone());
     let speaker = router.route("speaker");
     let ui_rx = router.route("ui");
-    let mut handle = router.spawn().unwrap_or_else(|e| panic!("spawn: {e}"));
 
     queue.push(
         Command::new("speaker", "say", Priority::Deliberate)
@@ -26,6 +25,10 @@ fn router_feeds_both_actuators_from_one_queue() {
     );
     queue.push(ui("thinking", Priority::Deliberate));
     queue.push(Command::new("speaker", "stop", Priority::Reflex));
+    // Spawned after the pushes: a router already running could pop the
+    // `say` before the `stop` is queued, and then the order below is a
+    // race rather than a property of the queue.
+    let mut handle = router.spawn().unwrap_or_else(|e| panic!("spawn: {e}"));
 
     // The speaker's stop overtakes its queued sentence (the queue's own
     // ordering, preserved through the router).
