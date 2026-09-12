@@ -193,13 +193,13 @@ impl EnergyVad {
         Self {
             threshold: 0.015,
             start_frames: 3,
-            // 12 x 32 ms = 384 ms. The Go build waited 640 ms so a pause
+            // 15 x 32 ms = 480 ms. The Go build waited 640 ms so a pause
             // inside a sentence did not end the turn; the semantic turn
             // judge now makes that call (it defers an unfinished
             // sentence), so the hangover only has to outlast a breath.
             // Measured: with whisper speculating under it, this is ~94% of
             // the wait from speech end to the transcript.
-            hangover_frames: 12,
+            hangover_frames: 15,
             min_speech_frames: 8,
             floor_ratio: 3.0,
             floor_secs: 2.0,
@@ -586,6 +586,6 @@ mod tests {
         assert!((rms(&[0.5, -0.5]) - 0.5).abs() < 1e-6);
         assert_eq!(rms(&[2.0]), 1.0);
         let v = EnergyVad::new();
-        assert_eq!(v.hangover_duration(16_000), Duration::from_millis(384));
+        assert_eq!(v.hangover_duration(16_000), Duration::from_millis(480));
     }
 }

@@ -650,6 +650,14 @@ fn speaker_bridge(
 ) {
     for c in from {
         timeline.command(&c);
+        // The transcript's other half: what was heard is logged by the
+        // sense, what was said is logged here, so a session can be read
+        // back as a conversation.
+        if let Some(text) = c.payload.as_text()
+            && matches!(c.kind.as_str(), "say" | "backchannel")
+        {
+            tracing::info!(kind = %c.kind, "said: {text}");
+        }
         if c.kind == "say"
             && let Some(text) = c.payload.as_text()
         {

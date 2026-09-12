@@ -101,7 +101,7 @@ fn speech_end_to_utterance() {
     };
     let full = clip("complete.wav");
     let one_second = full[..16_000].to_vec();
-    let hangover_ms = 384.0;
+    let hangover_ms = 480.0;
 
     // Components first, so a regression in the total can be placed.
     let (Some(wm), Some(em), Some(tm)) = (&cfg.whisper_model, &cfg.voiceid_model, &cfg.turn_model)
