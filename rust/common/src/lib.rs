@@ -14,8 +14,12 @@
 
 pub mod channel;
 pub mod clock;
+pub mod recorded;
+pub mod router;
 pub mod types;
 
 pub use channel::{CommandQueue, ObservationRing, RingReceiver, RingSender};
 pub use clock::{Clock, FakeClock, RealClock};
+pub use recorded::{Recorded, RecordedHint, RecordedPayload};
+pub use router::{CommandRouter, RouterHandle};
 pub use types::{Command, EntityHint, EntityId, Observation, Payload, Priority};

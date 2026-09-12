@@ -202,7 +202,8 @@ impl World {
     /// Any observation with an entity hint counts as evidence of presence
     /// (a voice is as good as a face), so `last_seen` is refreshed and
     /// ENTERED/RETURNED can come from any modality. Modality-specific
-    /// handling follows for `voice_activity`, `utterance`, `self_speaking`.
+    /// handling follows for `voice_activity`, `utterance`, `self_speaking`
+    /// and `name_binding`.
     /// Unknown modalities with no entity are ignored: that is how a new
     /// sense can be added with zero edits here.
     pub fn fold(&mut self, o: &Observation) -> Events {
@@ -245,6 +246,18 @@ impl World {
             "self_speaking" => {
                 if let Some(b) = o.payload.as_bool() {
                     self.bot_speaking = b;
+                }
+            }
+            // Someone (memory, after `remember_name`) telling us what to call
+            // an entity. The hint has already been sighted above, so a
+            // `KnownOnTrack` binding merged the stranger track into the
+            // named id; all that is left is the name.
+            "name_binding" => {
+                if let (Some(id), Some(name)) = (id, o.payload.as_text()) {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        self.set_name(&id, name);
+                    }
                 }
             }
             _ => {}

@@ -5,10 +5,52 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "glydi"
+path = "src/main.rs"
+
+[features]
+default = []
+# Scripted senses, a silent speaker and a scripted model: the whole loop
+# without hardware, models or a server (tests/headless.rs).
+mock = [
+    "sense-audio/mock",
+    "act-speaker/mock",
+    "act-ui/mock",
+    "deliberate/mock",
+]
+# The camera sense. Off by default while sense-vision settles; the binary
+# compiles and runs voice-only without it.
+vision = ["dep:sense-vision"]
+# Kokoro TTS in-process (see act-speaker).
+kokoro = ["act-speaker/kokoro"]
+
 [dependencies]
 common = { workspace = true }
 mind = { workspace = true }
+deliberate = { path = "../deliberate" }
+memory = { path = "../memory" }
+sense-audio = { path = "../sense-audio" }
+sense-vision = { path = "../sense-vision", optional = true }
+act-speaker = { path = "../act-speaker" }
+act-ui = { path = "../act-ui" }
+bench = { path = "../bench" }
 anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+smol_str = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+cpal = { workspace = true }
+ctrlc = "3"
 
 [lints]
 workspace = true

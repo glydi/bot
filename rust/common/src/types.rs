@@ -142,6 +142,14 @@ impl Payload {
             _ => None,
         }
     }
+
+    /// The scalar, if this is a `Level` payload.
+    pub fn as_level(&self) -> Option<f32> {
+        match self {
+            Self::Level(l) => Some(*l),
+            _ => None,
+        }
+    }
 }
 
 /// One thing a sense noticed.

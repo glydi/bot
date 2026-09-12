@@ -15,7 +15,9 @@
 //! * pushes commands into the priority queue.
 //!
 //! The only allocations per observation are the snapshot `Arc` and the
-//! `Vec` inside it, both sized by the number of people in the room.
+//! `Vec` inside it, both sized by the number of people in the room, plus
+//! -- only when the fold produced events -- a fresh copy of the bounded
+//! recent-events ring published the same way.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -29,6 +31,7 @@ use smallvec::SmallVec;
 use crate::event::{Event, EventLog};
 use crate::goal::GoalStack;
 use crate::rules::default_rules;
+use crate::stats::{Histogram, ReflexStats, StatsCells};
 use crate::view::WorldView;
 use crate::working::WorkingMemory;
 use crate::world::World;
@@ -79,6 +82,9 @@ pub trait Rule: Send {
 /// the "~300 ms stale is invisible" budget of the Python mirror.
 pub const TICK: Duration = Duration::from_millis(100);
 
+/// How many events [`ReflexHandle::recent_events`] can hand back.
+pub const RECENT_EVENTS: usize = 64;
+
 /// World + rules + log. Drive it directly with [`Reflex::on_observation`]
 /// in tests and the bench, or let [`Reflex::spawn`] run it on a thread.
 pub struct Reflex {
@@ -89,6 +95,13 @@ pub struct Reflex {
     last_tick: Instant,
     working: WorkingMemory,
     goals: GoalStack,
+    /// Every event, as it is logged, via `try_send`: a full or closed
+    /// channel drops it. The memory worker and the UI hang off this.
+    event_tap: Option<Sender<Event>>,
+    /// The last [`RECENT_EVENTS`] events, oldest first, for readers that
+    /// only want "what just happened" without a lock.
+    recent: Arc<ArcSwap<Vec<Event>>>,
+    latency: Histogram,
 }
 
 impl Reflex {
@@ -111,7 +124,41 @@ impl Reflex {
             last_tick: now,
             working: WorkingMemory::new(),
             goals: GoalStack::new(),
+            event_tap: None,
+            recent: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
+            latency: Histogram::new(),
         }
+    }
+
+    /// Send every event to `tx` as it is logged. `try_send` only: a slow
+    /// consumer loses events, the reflex never waits.
+    #[must_use]
+    pub fn with_event_tap(mut self, tx: Option<Sender<Event>>) -> Self {
+        self.event_tap = tx;
+        self
+    }
+
+    /// The last `n` events (at most [`RECENT_EVENTS`]), oldest first.
+    pub fn recent_events(&self, n: usize) -> Vec<Event> {
+        recent_from(&self.recent, n)
+    }
+
+    /// The counters and the latency percentiles.
+    pub fn stats(&self) -> ReflexStats {
+        self.latency.stats()
+    }
+
+    /// Fold as [`Reflex::on_observation`] and record how long it took in
+    /// the latency histogram. The thread loop and the replay bench both
+    /// use this; direct tests do not need the numbers.
+    pub fn on_observation_timed(&mut self, o: &Observation) -> Commands {
+        let started = Instant::now();
+        let out = self.on_observation(o);
+        self.latency.observation();
+        self.latency.commands(out.len() as u64);
+        self.latency
+            .record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        out
     }
 
     /// Working memory: topic, open questions, attention.
@@ -205,10 +252,30 @@ impl Reflex {
     }
 
     fn record(&mut self, events: SmallVec<[Event; 4]>, now: Instant) {
-        for e in &events {
-            tracing::debug!(entity = %e.entity, kind = e.kind.tag(), "event");
+        if !events.is_empty() {
+            for e in &events {
+                tracing::debug!(entity = %e.entity, kind = e.kind.tag(), "event");
+                if let Some(tx) = &self.event_tap
+                    && let Err(TrySendError::Full(_)) = tx.try_send(e.clone())
+                {
+                    tracing::trace!(kind = e.kind.tag(), "event tap full; event dropped");
+                }
+            }
+            // Copy-on-write ring: readers hold the old Arc, we publish a
+            // new one. Bounded, so the copy is at most RECENT_EVENTS long.
+            let old = self.recent.load();
+            let keep = old
+                .len()
+                .saturating_sub(RECENT_EVENTS.saturating_sub(events.len()));
+            let mut ring: Vec<Event> = Vec::with_capacity(RECENT_EVENTS);
+            ring.extend_from_slice(&old[keep.min(old.len())..]);
+            ring.extend(events.iter().cloned());
+            if ring.len() > RECENT_EVENTS {
+                ring.drain(..ring.len() - RECENT_EVENTS);
+            }
+            self.recent.store(Arc::new(ring));
+            self.log.extend(events);
         }
-        self.log.extend(events);
         self.view
             .store(WorldView::snapshot_with(&self.world, &self.working, now));
     }
@@ -227,6 +294,8 @@ impl Reflex {
         deliberate_tx: Option<Sender<Observation>>,
     ) -> Result<ReflexHandle, std::io::Error> {
         let view = self.view();
+        let recent = Arc::clone(&self.recent);
+        let stats = self.latency.cells();
         let thread = std::thread::Builder::new()
             .name("glydi-reflex".into())
             .spawn(move || {
@@ -243,15 +312,9 @@ impl Reflex {
                                     );
                                 }
                             }
-                            let started = Instant::now();
-                            for c in self.on_observation(&o) {
+                            for c in self.on_observation_timed(&o) {
                                 commands.push(c);
                             }
-                            tracing::trace!(
-                                modality = %o.modality,
-                                us = started.elapsed().as_micros(),
-                                "reflex"
-                            );
                             // Observations can arrive faster than TICK; keep
                             // expiry on schedule regardless.
                             let now = clock.now();
@@ -262,7 +325,9 @@ impl Reflex {
                             }
                         }
                         Ok(None) => {
-                            for c in self.tick(clock.now()) {
+                            let cmds = self.tick(clock.now());
+                            self.latency.commands(cmds.len() as u64);
+                            for c in cmds {
                                 commands.push(c);
                             }
                         }
@@ -272,13 +337,27 @@ impl Reflex {
                 tracing::info!(dropped, events = self.log.len(), "reflex thread exiting");
                 self
             })?;
-        Ok(ReflexHandle { view, thread })
+        Ok(ReflexHandle {
+            view,
+            recent,
+            stats,
+            thread,
+        })
     }
+}
+
+/// The last `n` of a published ring, oldest first.
+fn recent_from(recent: &ArcSwap<Vec<Event>>, n: usize) -> Vec<Event> {
+    let ring = recent.load();
+    let start = ring.len().saturating_sub(n);
+    ring[start..].to_vec()
 }
 
 /// A running reflex thread.
 pub struct ReflexHandle {
     view: Arc<ArcSwap<WorldView>>,
+    recent: Arc<ArcSwap<Vec<Event>>>,
+    stats: Arc<StatsCells>,
     thread: JoinHandle<Reflex>,
 }
 
@@ -286,6 +365,22 @@ impl ReflexHandle {
     /// Lock-free read of the latest snapshot.
     pub fn snapshot(&self) -> Arc<WorldView> {
         self.view.load_full()
+    }
+
+    /// Lock-free read of the last `n` events (at most [`RECENT_EVENTS`]),
+    /// oldest first.
+    pub fn recent_events(&self, n: usize) -> Vec<Event> {
+        recent_from(&self.recent, n)
+    }
+
+    /// Counters and latency percentiles, from atomics.
+    pub fn stats(&self) -> ReflexStats {
+        self.stats.load()
+    }
+
+    /// Whether the thread has exited.
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
     }
 
     /// The `ArcSwap` itself, for readers that want to hold it.
