@@ -118,6 +118,12 @@ const PEAK_FLOOR: f32 = 0.04;
 /// span a sentence, short enough to re-scale between a shout and a murmur.
 const PEAK_HALF_LIFE: Duration = Duration::from_millis(1500);
 
+/// How fast the mouth's envelope falls once a syllable ends. Attack is
+/// instant (a consonant is a step); the release is what keeps the mouth
+/// from fluttering on every 20 ms RMS frame, and 110 ms to fall by half
+/// is about the length of a syllable's tail.
+const RELEASE_HALF_LIFE: Duration = Duration::from_millis(110);
+
 /// After this long with nothing at all, the face sleeps. Matches the Go
 /// face's "nobody around for a while".
 pub const SLEEP_AFTER: Duration = Duration::from_secs(180);
@@ -142,6 +148,8 @@ pub struct FaceState {
     /// Speech level, 0..1 raw RMS, and the running peak it is scaled by.
     level: f32,
     peak: f32,
+    /// The scaled level with a release tail: what the mouth draws.
+    envelope: f32,
     level_at: Instant,
     /// An explicit `expression` command and when it landed.
     override_to: Option<(Expression, Instant)>,
@@ -159,6 +167,7 @@ impl FaceState {
             broken: false,
             level: 0.0,
             peak: PEAK_FLOOR,
+            envelope: 0.0,
             level_at: now,
             override_to: None,
             activity_at: now,
@@ -174,6 +183,7 @@ impl FaceState {
         self.speaking = on;
         if !on {
             self.level = 0.0;
+            self.envelope = 0.0;
         }
         self.activity_at = now;
     }
@@ -229,6 +239,10 @@ impl FaceState {
         let decay = 0.5f32.powf(dt / half);
         self.peak = (self.peak * decay).max(PEAK_FLOOR).max(level);
         self.level = level;
+        // The envelope: up instantly, down on its own half-life.
+        let release = 0.5f32.powf(dt / RELEASE_HALF_LIFE.as_secs_f32());
+        let scaled = (level / self.peak.max(PEAK_FLOOR)).clamp(0.0, 1.0);
+        self.envelope = (self.envelope * release).max(scaled);
         self.level_at = now;
         if level > 0.0 {
             self.activity_at = now;
@@ -240,9 +254,17 @@ impl FaceState {
         self.level
     }
 
-    /// The level scaled against recent speech, 0..1: what the mouth and the
-    /// meter use.
+    /// The level scaled against recent speech, 0..1, with a short release
+    /// tail: what the mouth and the ring use. Instantaneous on the way up
+    /// so a plosive lands on the frame it is heard; the tail only stops
+    /// the mouth flickering between RMS frames.
     pub fn scaled_level(&self) -> f32 {
+        self.envelope
+    }
+
+    /// The level scaled against recent speech with no smoothing: what
+    /// decides `quiet` vs `loud`.
+    fn scaled_now(&self) -> f32 {
         (self.level / self.peak.max(PEAK_FLOOR)).clamp(0.0, 1.0)
     }
 
@@ -256,7 +278,7 @@ impl FaceState {
             return Expression::Broken;
         }
         if self.speaking {
-            return if self.scaled_level() >= LOUD_THRESHOLD {
+            return if self.scaled_now() >= LOUD_THRESHOLD {
                 Expression::Loud
             } else {
                 Expression::Quiet
@@ -378,6 +400,25 @@ mod tests {
         assert_eq!(f.expression(now), Expression::Loud);
         f.set_level(0.01, now);
         assert_eq!(f.expression(now), Expression::Quiet);
+    }
+
+    #[test]
+    fn the_envelope_rises_at_once_and_falls_on_a_tail() {
+        let now = t0();
+        let mut f = FaceState::new(now);
+        f.set_speaking(true, now);
+        f.set_level(0.2, now);
+        assert!((f.scaled_level() - 1.0).abs() < 1e-6);
+        // 20 ms of silence: still mostly open.
+        f.set_level(0.0, now + Duration::from_millis(20));
+        assert!(f.scaled_level() > 0.85, "{}", f.scaled_level());
+        // A syllable later it has all but closed.
+        f.set_level(0.0, now + Duration::from_millis(600));
+        assert!(f.scaled_level() < 0.05, "{}", f.scaled_level());
+        // Stopping speaking shuts it outright.
+        f.set_level(0.2, now + Duration::from_millis(700));
+        f.set_speaking(false, now + Duration::from_millis(700));
+        assert!(f.scaled_level().abs() < 1e-6);
     }
 
     #[test]

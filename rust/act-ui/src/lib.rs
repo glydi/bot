@@ -245,7 +245,11 @@ impl eframe::App for FaceApp {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.debug, "debug");
                 ui.weak(expression.name());
-                meter(ui, self.state.face.scaled_level());
+                // The level shows as the ring around the shell; the bar is
+                // a debugging aid.
+                if self.debug {
+                    meter(ui, self.state.face.scaled_level());
+                }
             });
         });
         if self.debug {
@@ -273,9 +277,11 @@ impl eframe::App for FaceApp {
             }
         });
 
-        // The face is never perfectly still, so there is always a next
-        // frame due. 60 fps, like the Go face's SetTPS(60).
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+        // 60 fps while anything moves (a blink, a transition, speech), 30
+        // when the face is only breathing: the idle window should not cost
+        // a core.
+        ui.ctx()
+            .request_repaint_after(self.motion.repaint_after(now, expression));
     }
 }
 
