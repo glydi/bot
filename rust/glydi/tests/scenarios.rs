@@ -181,6 +181,17 @@ fn face_embedding(i: usize) -> Payload {
 
 /// Someone the gallery knows walks in: the mind greets them by name from
 /// what it already knows, without a model round trip.
+/// The reply proper: a greeting for whoever is in the room, or the
+/// reflex's "Mm-hm." at the end of their turn, is spoken too and is not
+/// part of it.
+fn replies_in(spoken: Vec<String>) -> Vec<String> {
+    spoken
+        .into_iter()
+        .filter(|s| !s.starts_with("Hi") && !s.starts_with("Welcome"))
+        .filter(|s| !mind::rules::Acknowledge::PHRASES.contains(&s.as_str()))
+        .collect()
+}
+
 #[test]
 fn known_person_is_greeted_by_name() {
     let started = Instant::now();
@@ -405,17 +416,12 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     );
     rig.blip(Duration::from_millis(150));
     assert!(
-        wait_for(Duration::from_secs(8), || rig.spoken().len()
+        wait_for(Duration::from_secs(8), || replies_in(rig.spoken()).len()
             >= sentences.len()),
         "a 150 ms blip cancelled the reply: spoken = {:?}",
         rig.spoken()
     );
-    // A greeting for whoever is in the room is not part of the reply.
-    let replies: Vec<String> = rig
-        .spoken()
-        .into_iter()
-        .filter(|s| !s.starts_with("Hi") && !s.starts_with("Welcome"))
-        .collect();
+    let replies = replies_in(rig.spoken());
     assert_eq!(replies, sentences, "spoken out of order or repeated");
     // Let the speaker drain and the speaking TTL clear before the next turn.
     assert!(wait_for(Duration::from_secs(2), || !rig.app.is_speaking()));
