@@ -14,6 +14,9 @@
 //!   summarised to a sentence or two through the same model, so the next
 //!   room line can say "last visit 2 days ago: talked about X".
 //! * RETURNED -> nothing beyond the log; the deliberate path reads.
+//! * LEFT while another known person is still here -> a co-presence row
+//!   for the overlap (`Store::note_co_presence`), which becomes the
+//!   `often_with` relation after two long enough visits together.
 //! * Every event -> the `events` table, with the session id.
 
 use std::collections::HashMap;
@@ -74,6 +77,8 @@ pub struct Stats {
     /// Episode summaries the model could not produce; the plain list of
     /// what was said is stored in their place.
     pub failed_summaries: u64,
+    /// Co-presence overlaps recorded (two known people, three minutes).
+    pub co_presence: u64,
 }
 
 /// The consumer. Drive it directly with [`MemoryWorker::handle`] in tests,
@@ -181,6 +186,7 @@ impl MemoryWorker {
             }
             EventKind::Left => {
                 if let Some(name) = &name {
+                    self.co_presence(&e.entity, at);
                     self.episode(&e.entity, name, at);
                 } else {
                     // A stranger, or someone forgotten mid-visit: nothing
@@ -255,6 +261,39 @@ impl MemoryWorker {
                 }
                 Ok(false) => {}
                 Err(err) => tracing::debug!(error = %err, "remember failed"),
+            }
+        }
+    }
+
+    /// `entity` just left: everyone known who is still here shared the
+    /// room with them since the later of the two arrivals. Recorded per
+    /// pair; the store decides when that adds up to `often_with`.
+    fn co_presence(&mut self, entity: &common::EntityId, ended_at: f64) {
+        let Some(&(mine, _)) = self.visits.get(entity) else {
+            return;
+        };
+        let others: Vec<(common::EntityId, f64)> = self
+            .visits
+            .iter()
+            .filter(|(other, _)| *other != entity && !other.is_track())
+            .map(|(other, (since, _))| (other.clone(), *since))
+            .collect();
+        for (other, since) in others {
+            let started = mine.max(since);
+            if ended_at - started < crate::social::OFTEN_WITH_MIN_OVERLAP {
+                continue;
+            }
+            match self
+                .store
+                .note_co_presence(entity, &other, started, ended_at)
+            {
+                Ok(new_relation) => {
+                    self.stats.co_presence += 1;
+                    if new_relation {
+                        tracing::info!(%entity, %other, "often here together");
+                    }
+                }
+                Err(err) => tracing::debug!(error = %err, "co-presence not recorded"),
             }
         }
     }
@@ -431,6 +470,7 @@ mod tests {
                 episodes: 1,
                 failed_extractions: 1,
                 failed_summaries: 0,
+                co_presence: 0,
             }
         );
         // The extractor saw the reference prompt shape.
@@ -486,6 +526,55 @@ mod tests {
         let (_, _, away) = store.events_of("s1", &ada).unwrap().pop().unwrap();
         assert_eq!(away.as_deref(), Some("90.0"));
         assert!(store.episodes(&stranger).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaving_records_co_presence_with_whoever_is_still_here() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let ada = store.enrol_name_only("Ada").unwrap();
+        let bob = store.enrol_name_only("Bob").unwrap();
+        // No model calls: nobody says anything.
+        let llm = MockLlm::new(vec![]);
+        let mut w = MemoryWorker::new(Arc::clone(&store), llm, "s3").unwrap();
+        let base = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        let t = |secs: f64| base + Duration::from_secs_f64(secs);
+        // Ada 0..400 s, Bob 100..400 s: 300 s together, one visit.
+        w.handle(&Event::new(t(0.0), ada.clone(), EventKind::Entered));
+        w.handle(&Event::new(t(100.0), bob.clone(), EventKind::Entered));
+        w.handle(&Event::new(t(400.0), ada.clone(), EventKind::Left));
+        assert_eq!(w.stats().co_presence, 1);
+        assert_eq!(store.co_presence_visits(&ada, &bob).unwrap(), 1);
+        assert!(store.relations(&ada).unwrap().is_empty());
+        // Bob leaves alone: nothing. A stranger with Bob: nothing.
+        w.handle(&Event::new(
+            t(401.0),
+            EntityId::for_track(9),
+            EventKind::Entered,
+        ));
+        w.handle(&Event::new(t(450.0), bob.clone(), EventKind::Left));
+        assert_eq!(w.stats().co_presence, 1);
+        // Ada back for a second long overlap: the relation is written.
+        w.handle(&Event::new(
+            t(460.0),
+            ada.clone(),
+            EventKind::Returned {
+                away_for: Duration::from_secs(60),
+            },
+        ));
+        w.handle(&Event::new(
+            t(461.0),
+            bob.clone(),
+            EventKind::Returned {
+                away_for: Duration::from_secs(11),
+            },
+        ));
+        w.handle(&Event::new(t(599.0), bob.clone(), EventKind::Left));
+        // 138 s: too short. Not a visit.
+        assert_eq!(w.stats().co_presence, 1);
+        assert_eq!(store.co_presence_visits(&ada, &bob).unwrap(), 1);
+        assert_eq!(w.stats().episodes, 3);
     }
 
     #[test]

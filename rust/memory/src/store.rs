@@ -285,7 +285,7 @@ struct Stash {
 /// an `RwLock`, so a sense thread can `best_match` while the worker writes.
 /// Matching takes only the read lock and never touches the database.
 pub struct Store {
-    db: Mutex<Connection>,
+    pub(crate) db: Mutex<Connection>,
     face: RwLock<Index>,
     voice: RwLock<Index>,
     names: RwLock<HashMap<EntityId, String>>,
@@ -300,6 +300,8 @@ pub struct Store {
     /// id, and the one kind of id that can recur (the deliberate tools'
     /// lower-cased name) may then legitimately be someone new.
     forgotten: Mutex<HashSet<EntityId>>,
+    /// Seconds east of UTC for "today" (see [`Store::with_utc_offset`]).
+    pub(crate) utc_offset_secs: i64,
 }
 
 /// The Python `SCHEMA`, verbatim in effect (whitespace aside), plus the
@@ -369,6 +371,32 @@ CREATE TABLE IF NOT EXISTS episodes (
     turns       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_person ON episodes(person_id, ended_at);
+-- Commitments (see `social.rs`): what to bring up with someone, and when.
+CREATE TABLE IF NOT EXISTS reminders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id   TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+    text        TEXT NOT NULL,
+    due_at      REAL NOT NULL,
+    created_at  REAL NOT NULL,
+    done        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(done, due_at);
+-- Which visit a person was last asked about (how did the interview go?).
+CREATE TABLE IF NOT EXISTS check_ins (
+    person_id   TEXT PRIMARY KEY REFERENCES persons(person_id) ON DELETE CASCADE,
+    episode_id  INTEGER NOT NULL,
+    done_at     REAL NOT NULL
+);
+-- Two known people in the room at once, one row per overlap; feeds the
+-- `often_with` relation.
+CREATE TABLE IF NOT EXISTS co_presence (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    a           TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+    b           TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+    started_at  REAL NOT NULL,
+    ended_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_co_presence_pair ON co_presence(a, b);
 ";
 
 /// Columns added since the reference schema, as `(table, column, ddl)`.
@@ -421,6 +449,7 @@ impl Store {
             voice_gates: Gates::VOICE,
             stash: Mutex::new(HashMap::new()),
             forgotten: Mutex::new(HashSet::new()),
+            utc_offset_secs: 0,
         };
         store.reload()?;
         Ok(store)
@@ -431,6 +460,15 @@ impl Store {
     pub fn with_gates(mut self, face: Gates, voice: Gates) -> Self {
         self.face_gates = face;
         self.voice_gates = voice;
+        self
+    }
+
+    /// Set the local time zone's offset from UTC, in seconds, so that
+    /// "first sighting of the day" ([`Store::pending_check_in`]) turns
+    /// over at local midnight rather than UTC's. Default 0.
+    #[must_use]
+    pub fn with_utc_offset(mut self, secs: i64) -> Self {
+        self.utc_offset_secs = secs;
         self
     }
 
@@ -630,6 +668,19 @@ impl Store {
         }
     }
 
+    /// `(relation, other name)` for `id`, oldest first: "friend" / "Sony",
+    /// `often_with` / "Ada". The same list [`Person::relations`] carries.
+    pub fn relations(&self, id: &EntityId) -> Result<Vec<(String, String)>, Error> {
+        Ok(self
+            .db
+            .lock()
+            .prepare(
+                "SELECT relation, other_name FROM relations WHERE person_id = ? ORDER BY created_at, id",
+            )?
+            .query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// The person, with facts in recall order, or `None`.
     pub fn get(&self, id: &EntityId) -> Result<Option<Person>, Error> {
         let conn = self.db.lock();
@@ -651,7 +702,9 @@ impl Store {
         };
         let facts = Self::facts_of(&conn, id)?;
         let relations = conn
-            .prepare("SELECT relation, other_name FROM relations WHERE person_id = ? ORDER BY created_at")?
+            .prepare(
+                "SELECT relation, other_name FROM relations WHERE person_id = ? ORDER BY created_at, id",
+            )?
             .query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         Ok(Some(Person {
@@ -785,7 +838,7 @@ impl Store {
     /// the id) when it is not. The deliberate tools key facts by the
     /// lower-cased name when the gallery does not know a name, and a fact
     /// about someone must have a row to hang off.
-    fn ensure_person(conn: &Connection, id: &EntityId) -> Result<(), Error> {
+    pub(crate) fn ensure_person(conn: &Connection, id: &EntityId) -> Result<(), Error> {
         conn.execute(
             "INSERT OR IGNORE INTO persons (person_id, name, created_at, last_seen_at, meta)
              VALUES (?1, ?1, ?2, ?2, '{}')",
@@ -872,7 +925,7 @@ impl Store {
         Ok(merged.is_none())
     }
 
-    fn reload_names_if_new(&self, id: &EntityId) {
+    pub(crate) fn reload_names_if_new(&self, id: &EntityId) {
         if !self.names.read().contains_key(id) {
             self.names
                 .write()
@@ -1500,6 +1553,9 @@ mod tests {
             "sessions",
             "events",
             "episodes",
+            "reminders",
+            "check_ins",
+            "co_presence",
         ] {
             let n: i64 = conn
                 .query_row(

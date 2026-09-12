@@ -5,7 +5,8 @@
 //! senses --embedding--> Store (face/voice gallery, SQLite + in-memory index)
 //! mind   --Event------> MemoryWorker --SAID--> fact extraction (LLM, background)
 //!                                    --LEFT--> episode summary
-//! deliberate --tool---> Store as FactSource (recall / remember / name / forget)
+//! deliberate --tool---> Store as FactSource (recall / remember / name / forget / remind)
+//! glydi (30 s poll) --> Store::due_reminders / pending_check_in --> observations
 //! ```
 //!
 //! Port of `../src/glydi_bot/identity/store.py` (schema, matching, forget)
@@ -25,13 +26,19 @@
 
 pub mod extract;
 pub mod gallery;
+pub mod social;
 pub mod store;
 pub mod worker;
 
 use common::EntityId;
 
+pub use deliberate::tools::Reminder;
 pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, is_small_talk, parse};
 pub use gallery::FaceGallery;
+pub use social::{
+    CHECK_IN_WORDS, OFTEN_WITH, OFTEN_WITH_MIN_OVERLAP, OFTEN_WITH_MIN_VISITS, event_in,
+    relation_sentence,
+};
 pub use store::{
     CONTEXT_MAX_CHARS, Episode, FACE_DIM, FACE_MARGIN, FACE_THRESHOLD, Fact, Gates, Modality,
     Person, PersonSummary, RECALL_LIMIT, Store, VOICE_DIM, VOICE_MARGIN, VOICE_THRESHOLD,

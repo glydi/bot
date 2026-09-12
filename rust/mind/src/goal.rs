@@ -9,14 +9,14 @@
 //! The stack is small and inline: it lives on the reflex thread and is
 //! updated in `Reflex::on_observation` right after the fold.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::EntityId;
 use smallvec::SmallVec;
 
 use crate::event::{Event, EventKind};
 use crate::working::WorkingMemory;
-use crate::world::World;
+use crate::world::{Status, World};
 
 /// Goals kept at once. The bottom is dropped when a ninth arrives: a goal
 /// that old has been superseded by everything above it.
@@ -32,11 +32,20 @@ pub const GREET_WINDOW: Duration = Duration::from_secs(600);
 /// gets no "welcome back" (same figure as `view::RETURN_NOTE_MIN_AWAY`).
 pub const RETURN_GREET_MIN_AWAY: Duration = Duration::from_secs(60);
 
+/// Two known people arriving within this of each other, neither greeted
+/// yet, are greeted as a pair ("Hi Ada, hi Bob"). Five seconds covers
+/// one holding the door for the other.
+pub const PAIR_WINDOW: Duration = Duration::from_secs(5);
+
 /// Something the mind wants to achieve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Goal {
     /// Say hello to someone who just arrived.
     Greet(EntityId),
+    /// Say hello to two people who arrived together. Replaces the
+    /// [`Goal::Greet`] of the first when the second walks in within
+    /// [`PAIR_WINDOW`]; the planner greets both in one intent.
+    GreetPair(EntityId, EntityId),
     /// Find out who a stranger is, by asking. The entity is a track id.
     AskName(EntityId),
     /// Follow along with something they said they were doing.
@@ -62,6 +71,7 @@ impl Goal {
     pub fn entity(&self) -> Option<&EntityId> {
         match self {
             Self::Greet(e)
+            | Self::GreetPair(e, _)
             | Self::AskName(e)
             | Self::HelpWith { entity: e, .. }
             | Self::ResolveUnknown { entity: e, .. } => Some(e),
@@ -69,10 +79,19 @@ impl Goal {
         }
     }
 
+    /// Whether this goal is about `id` (either half of a pair counts).
+    pub fn is_about(&self, id: &EntityId) -> bool {
+        match self {
+            Self::GreetPair(a, b) => a == id || b == id,
+            g => g.entity() == Some(id),
+        }
+    }
+
     /// Snake-case tag for logs and the intent JSON.
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Greet(_) => "greet",
+            Self::GreetPair(..) => "greet_pair",
             Self::AskName(_) => "ask_name",
             Self::HelpWith { .. } => "help_with",
             Self::ResolveUnknown { .. } => "resolve_unknown",
@@ -139,9 +158,48 @@ impl GoalStack {
         self.stack.is_empty()
     }
 
-    /// Drop every goal about `entity` (they left).
+    /// Drop every goal about `entity` (they left). A pair greeting loses
+    /// the one who left and becomes a plain greeting of the other.
     pub fn retire(&mut self, entity: &EntityId) {
-        self.stack.retain(|g| g.entity() != Some(entity));
+        for g in &mut self.stack {
+            if let Goal::GreetPair(a, b) = g
+                && (a == entity || b == entity)
+            {
+                let stay = if a == entity { b.clone() } else { a.clone() };
+                *g = Goal::Greet(stay);
+            }
+        }
+        self.stack.retain(|g| !g.is_about(entity));
+    }
+
+    /// Raise a greeting for `entity`, or fold it into a pair when someone
+    /// else known arrived within [`PAIR_WINDOW`] and is still waiting for
+    /// their hello (their `Greet` is on the stack: the planner has not
+    /// acted on it, because it acts at once when it can). Two arrivals
+    /// in one fold, or the second while the first was blocked by speech,
+    /// are the cases this catches; a greeting already said is not
+    /// repeated for the pair.
+    fn greet_or_pair(&mut self, entity: &EntityId, at: Instant, world: &World) {
+        let pending = self.stack.iter().position(|g| {
+            let Goal::Greet(other) = g else {
+                return false;
+            };
+            other != entity
+                && world.get(other).is_some_and(|e| {
+                    e.status == Status::Present
+                        && at.saturating_duration_since(e.returned.map_or(e.first_seen, |(w, _)| w))
+                            < PAIR_WINDOW
+                })
+        });
+        match pending {
+            Some(i) => {
+                let Goal::Greet(other) = self.stack.remove(i) else {
+                    return;
+                };
+                self.push(Goal::GreetPair(other, entity.clone()));
+            }
+            None => self.push(Goal::Greet(entity.clone())),
+        }
     }
 
     /// Raise and retire goals from one fold's events. `working` is read
@@ -161,12 +219,13 @@ impl GoalStack {
     ///   → [`Goal::Greet`], which the planner phrases as a return.
     /// * SAID answers any open [`Goal::ResolveUnknown`] for that person;
     ///   a SAID mentioning what they are working on → [`Goal::HelpWith`].
+    /// * Two known ENTERED within [`PAIR_WINDOW`], the first not yet
+    ///   greeted → one [`Goal::GreetPair`] in place of the two greetings.
     /// * LEFT retires their goals. The thread stays in working memory,
     ///   which is what makes the RETURNED rule fire later.
     /// * MERGED re-keys goals from the stranger id to the known one, and
     ///   drops the stranger's [`Goal::AskName`]: recognition answered it.
     pub fn from_events(&mut self, events: &[Event], world: &World, working: &WorkingMemory) {
-        let _ = world;
         for e in events {
             match &e.kind {
                 EventKind::Entered => {
@@ -175,7 +234,7 @@ impl GoalStack {
                             self.push(Goal::AskName(e.entity.clone()));
                         }
                     } else if !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
-                        self.push(Goal::Greet(e.entity.clone()));
+                        self.greet_or_pair(&e.entity, e.at, world);
                     }
                 }
                 EventKind::Returned { away_for } => {
@@ -212,7 +271,7 @@ impl GoalStack {
                     // we know, and they have not been greeted -- the ENTERED
                     // was theirs as a track, so no Greet was raised then.
                     if !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
-                        self.push(Goal::Greet(e.entity.clone()));
+                        self.greet_or_pair(&e.entity, e.at, world);
                     }
                 }
                 EventKind::SpeakingStarted | EventKind::SpeakingStopped => {}
@@ -223,6 +282,13 @@ impl GoalStack {
 
 fn rekey(g: &mut Goal, from: &EntityId, to: &EntityId) {
     match g {
+        Goal::GreetPair(a, b) => {
+            for e in [a, b] {
+                if e == from {
+                    *e = to.clone();
+                }
+            }
+        }
         Goal::Greet(e)
         | Goal::AskName(e)
         | Goal::HelpWith { entity: e, .. }
@@ -294,6 +360,45 @@ mod tests {
         );
         assert_eq!(task_in("nice weather"), None);
         assert_eq!(task_in("working on "), None);
+    }
+
+    #[test]
+    fn two_arrivals_together_become_one_pair_greeting() {
+        use common::{EntityHint, FakeClock, Observation};
+
+        let clock = FakeClock::new();
+        let face = |t: f64, id: &str| {
+            Observation::new("cam0", "face", clock.at_secs(t))
+                .with_entity(EntityHint::Known(EntityId::new(id)))
+        };
+        let mut world = World::new();
+        let working = WorkingMemory::new();
+        let mut goals = GoalStack::new();
+        let ev = world.fold(&face(0.0, "ada"));
+        goals.from_events(&ev, &world, &working);
+        assert_eq!(*goals.current(), Goal::Greet(EntityId::new("ada")));
+        // Bob two seconds later, Ada still waiting: one pair goal.
+        let ev = world.fold(&face(2.0, "bob"));
+        goals.from_events(&ev, &world, &working);
+        assert_eq!(
+            *goals.current(),
+            Goal::GreetPair(EntityId::new("ada"), EntityId::new("bob"))
+        );
+        assert_eq!(goals.len(), 1);
+        assert!(goals.current().is_about(&EntityId::new("bob")));
+        assert_eq!(goals.current().tag(), "greet_pair");
+        // Ada leaves: Bob keeps a plain greeting.
+        goals.retire(&EntityId::new("ada"));
+        assert_eq!(*goals.current(), Goal::Greet(EntityId::new("bob")));
+        goals.retire(&EntityId::new("bob"));
+        assert!(goals.is_empty());
+        // Outside the window it is two separate greetings: Ada's hello
+        // is still pending but her arrival at 0.0 is too old to pair with.
+        goals.push(Goal::Greet(EntityId::new("ada")));
+        let ev = world.fold(&face(10.0, "cy"));
+        goals.from_events(&ev, &world, &working);
+        assert_eq!(*goals.current(), Goal::Greet(EntityId::new("cy")));
+        assert_eq!(goals.len(), 2);
     }
 
     #[test]

@@ -7,9 +7,11 @@
 
 use common::EntityId;
 use deliberate::FactSource;
+use deliberate::tools::Reminder;
 use sense_audio::voiceid::VoiceGallery;
 
 use crate::Error;
+use crate::social::relation_sentence;
 use crate::store::{Modality, Store};
 
 /// Who a face belongs to. Same shape as [`VoiceGallery`] so the vision
@@ -76,14 +78,55 @@ impl VoiceGallery for Store {
 /// call happens mid-turn, and the model can talk around an empty answer
 /// but not around a panic.
 impl FactSource for Store {
+    /// Relations first, as sentences ("Ada is often here with Bob."),
+    /// then the facts oldest-first: the deliberate path takes the *last*
+    /// entry as the thing to pick back up on, and that should be what
+    /// they said, not who they came with.
     fn recall(&self, entity: &EntityId) -> Vec<String> {
+        let name = self
+            .name_of(entity)
+            .unwrap_or_else(|| entity.as_str().to_owned());
+        let mut out: Vec<String> = FactSource::relations(self, entity)
+            .iter()
+            .map(|(rel, other)| relation_sentence(&name, rel, other))
+            .collect();
         match Store::recall(self, entity) {
-            Ok(facts) => facts.into_iter().map(|f| f.text).collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, %entity, "recall failed");
-                Vec::new()
-            }
+            Ok(facts) => out.extend(facts.into_iter().map(|f| f.text)),
+            Err(e) => tracing::warn!(error = %e, %entity, "recall failed"),
         }
+        out
+    }
+
+    fn relations(&self, entity: &EntityId) -> Vec<(String, String)> {
+        Store::relations(self, entity).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, %entity, "relations failed");
+            Vec::new()
+        })
+    }
+
+    fn remind(&self, entity: &EntityId, text: &str, due_at: f64) -> Result<i64, String> {
+        Store::remind(self, entity, text, due_at).map_err(|e| e.to_string())
+    }
+
+    fn due_reminders(&self, now: f64) -> Vec<Reminder> {
+        Store::due_reminders(self, now).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "due_reminders failed");
+            Vec::new()
+        })
+    }
+
+    fn reminders(&self, entity: &EntityId) -> Vec<Reminder> {
+        self.reminders_of(entity).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, %entity, "reminders failed");
+            Vec::new()
+        })
+    }
+
+    fn reminder_done(&self, id: i64) -> bool {
+        Store::reminder_done(self, id).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, id, "reminder_done failed");
+            false
+        })
     }
 
     fn remember(&self, entity: &EntityId, fact: &str) {
