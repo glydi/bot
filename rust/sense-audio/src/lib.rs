@@ -286,6 +286,15 @@ impl Drop for AudioSenseHandle {
 /// The audio sense. Build with [`AudioSense::spawn`].
 pub struct AudioSense;
 
+/// Everything [`AudioSense::prepare`] loads before a source is opened.
+struct Prepared {
+    judge: Option<Box<dyn TurnJudge>>,
+    stt: Option<Box<dyn Transcriber>>,
+    encoder: Option<Encoder>,
+    gallery: Arc<dyn VoiceGallery>,
+    vad: EnergyVad,
+}
+
 impl AudioSense {
     /// Open the microphone, load the models, and start listening.
     ///
@@ -297,8 +306,14 @@ impl AudioSense {
         tx: RingSender,
         self_speaking: Arc<AtomicBool>,
     ) -> Result<AudioSenseHandle, Error> {
+        // Models first, microphone second. The mic callback starts filling
+        // its queue the moment the stream opens, and whisper + smart-turn
+        // warm-up is ~8 s on this machine: opened the other way round, the
+        // pipeline began ~500 frames behind and logged "mic queue full"
+        // for the first seconds of every run.
+        let prepared = Self::prepare(&config)?;
         let mic = MicInput::open(config.device.as_deref())?;
-        Self::spawn_with_source(config, Box::new(mic), clock, tx, self_speaking)
+        Self::start(config, prepared, Box::new(mic), clock, tx, self_speaking)
     }
 
     /// Like [`spawn`](Self::spawn) but with any [`FrameSource`]: the mock
@@ -310,6 +325,15 @@ impl AudioSense {
         tx: RingSender,
         self_speaking: Arc<AtomicBool>,
     ) -> Result<AudioSenseHandle, Error> {
+        let prepared = Self::prepare(&config)?;
+        Self::start(config, prepared, source, clock, tx, self_speaking)
+    }
+
+    /// Load the models and configure the VAD, on the caller's thread so a
+    /// missing model is a `Result`, not a log line from a thread that then
+    /// dies. Kept apart from [`start`](Self::start) so the microphone can
+    /// be opened between the two.
+    fn prepare(config: &AudioConfig) -> Result<Prepared, Error> {
         if config.sample_rate != input::TARGET_RATE {
             return Err(Error::Model(format!(
                 "sample_rate must be {} (models are trained at it), got {}",
@@ -318,8 +342,6 @@ impl AudioSense {
             )));
         }
 
-        // Load everything on the caller's thread so a missing model is a
-        // `Result`, not a log line from a thread that then dies.
         let judge: Option<Box<dyn TurnJudge>> = match &config.turn_model {
             Some(p) => {
                 let mut a = SmartTurn::open(p, &config.ort_lib)?;
@@ -360,7 +382,31 @@ impl AudioSense {
             turn_model = judge.is_some(),
             "vad configured"
         );
+        Ok(Prepared {
+            judge,
+            stt,
+            encoder,
+            gallery,
+            vad,
+        })
+    }
 
+    /// Start the pipeline and worker threads over an open source.
+    fn start(
+        config: AudioConfig,
+        prepared: Prepared,
+        source: Box<dyn FrameSource>,
+        clock: Arc<dyn Clock>,
+        tx: RingSender,
+        self_speaking: Arc<AtomicBool>,
+    ) -> Result<AudioSenseHandle, Error> {
+        let Prepared {
+            judge,
+            stt,
+            encoder,
+            gallery,
+            vad,
+        } = prepared;
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
         // One in flight plus one queued. A third means whisper is more than

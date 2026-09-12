@@ -92,14 +92,19 @@ history (MAX_HISTORY 16, TRIM_SLACK 8, trim in batches — measured in
 user turn. Tools `recall_person`, `remember`. Streams sentences as
 `Command{speaker, say, Deliberate}`; a reflex `stop` cancels the stream.
 
-## Ports from the reference builds (../src, ../go)
+## Ports from the reference builds
 
-- Turn detection: ../go/internal/turn/ (features.go, fft.go, smartturn.go, wav.go)
-- Prompt + tool wording: ../src/glydi_bot/llm/prompt.py, tools.py
-- Fact extraction + condense: ../src/glydi_bot/memory.py
-- Face pipeline thresholds: ../src/glydi_bot/identity/vision.py, ../go/internal/vision/
-- Voice id: ../src/glydi_bot/identity/voice.py, ../go/internal/voiceid/
-- Models: same ONNX files as today, path from config `models_dir` (default ../models).
+The Python (Pipecat) and Go builds were removed once this workspace reached
+parity; they are preserved at git commit `8e603bc`. Comments that cite a
+`.py` or `.go` file refer to that tree. What was ported, and from where:
+
+- Turn detection: go/internal/turn/ (features.go, fft.go, smartturn.go, wav.go)
+- Prompt + tool wording: src/glydi_bot/llm/prompt.py, tools.py, room_injector.py
+- Fact extraction + condense: src/glydi_bot/memory.py
+- Face pipeline thresholds: src/glydi_bot/identity/vision.py, go/internal/vision/
+- Voice id: src/glydi_bot/identity/voice.py, go/internal/voiceid/
+- The macOS voice helper: go/cmd/ttsd/ttsd.swift, now rust/ttsd/
+- Models: the same ONNX files, path from config `models_dir` (default ../models).
 
 ## Conventions
 

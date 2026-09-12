@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ::common::{EntityHint, ObservationRing, RealClock};
-use common::{config_with_models, drain, events, repo_root, run_to_end};
+use common::{config_with_models, drain, events, run_to_end};
 use sense_audio::mock::MockInput;
 use sense_audio::turn::{SmartTurn, TurnJudge};
 use sense_audio::voiceid::{InMemoryGallery, VoiceGallery};
 use sense_audio::wav::load_wav;
 use sense_audio::{AudioConfig, AudioSense};
+use std::path::Path;
 
 #[test]
 fn vad_starts_and_stops_on_a_tone() {
@@ -95,7 +96,9 @@ fn stop_returns_promptly() {
 }
 
 fn clip(name: &str) -> Vec<f32> {
-    let p = repo_root().join("go/internal/turn/testdata").join(name);
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name);
     let (s, rate) = load_wav(&p).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(rate, 16_000);
     s
@@ -167,9 +170,10 @@ fn wav_to_utterance_end_to_end() {
     }
     cfg.gallery = Some(gallery);
 
-    let src = MockInput::from_wav(repo_root().join("go/internal/turn/testdata/complete.wav"))
-        .unwrap_or_else(|e| panic!("{e}"))
-        .with_trailing_silence(1.0);
+    let src =
+        MockInput::from_wav(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/complete.wav"))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .with_trailing_silence(1.0);
     let obs = run_to_end(cfg, Box::new(src));
     let ev = events(&obs);
     eprintln!("{ev:?}");
