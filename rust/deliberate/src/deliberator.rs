@@ -44,6 +44,11 @@ pub const BARGE_IN_SUSTAIN: Duration = Duration::from_millis(400);
 /// and one slot lost it (see `glydi::app::DELIBERATE_BACKLOG`).
 pub const OBSERVATION_BACKLOG: usize = 16;
 
+/// An utterance older than this when the loop gets to it is not answered.
+/// Long enough for a turn's own queue drain; shorter than a person's
+/// patience for a reply to something they said before the last exchange.
+pub const STALE_UTTERANCE: Duration = Duration::from_secs(4);
+
 /// Bounds the tool-call loop. Without it a model that keeps calling tools
 /// can spin forever while the person waits in silence.
 pub const MAX_TOOL_ROUNDS: usize = 3;
@@ -665,6 +670,14 @@ impl Session {
                 if !said.is_empty() {
                     self.conversation.push(Message::assistant(said));
                 }
+                // Our own stop, behind our last sentence: the reflex's stop
+                // went out the instant the voice was heard, but sentences
+                // we emitted between then and here are queued behind it and
+                // would be spoken after the next reply -- the user heard
+                // the answer to their previous question, late. Same
+                // priority as the sentences, so it follows them.
+                self.commands
+                    .push(Command::new("speaker", "stop", Priority::Deliberate));
                 return Ok(TurnEnd::Cancelled);
             }
             if let Some(s) = splitter.finish() {
@@ -777,24 +790,40 @@ impl Session {
         shutdown: CancellationToken,
         current: Arc<Mutex<Option<CancellationToken>>>,
     ) {
+        // An utterance that arrived while a turn was running, kept for
+        // after it (only the newest, and only while fresh).
+        let mut pending: Option<Observation> = None;
         loop {
-            let o = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                Some(o) = self.condense_rx.recv() => {
-                    self.apply_one(o);
-                    continue;
+            let o = if let Some(p) = pending.take() {
+                p
+            } else {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    Some(o) = self.condense_rx.recv() => {
+                        self.apply_one(o);
+                        continue;
+                    }
+                    Some(cmd) = intents.recv() => {
+                        self.on_intent(cmd, &mut obs, &shutdown, &current).await;
+                        continue;
+                    }
+                    o = obs.recv() => match o {
+                        Some(o) => o,
+                        None => break,
+                    },
                 }
-                Some(cmd) = intents.recv() => {
-                    self.on_intent(cmd, &mut obs, &shutdown, &current).await;
-                    continue;
-                }
-                o = obs.recv() => match o {
-                    Some(o) => o,
-                    None => break,
-                },
             };
             if o.modality != UTTERANCE {
+                continue;
+            }
+            // Answer what was just said, never what was said a while ago:
+            // with the channel a few slots deep, an utterance that queued
+            // behind a turn used to be answered after it -- the user heard
+            // the reply to their previous question.
+            let age = self.clock.now().saturating_duration_since(o.at);
+            if age > STALE_UTTERANCE {
+                tracing::info!(age_ms = age.as_millis(), "stale utterance skipped");
                 continue;
             }
             let Some(text) = o.payload.as_text().map(str::trim).filter(|t| !t.is_empty()) else {
@@ -854,6 +883,15 @@ impl Session {
                 Err(e) => tracing::warn!(error = %e, "turn failed"),
             }
             *current.lock() = None;
+            // Whatever queued during the turn: keep the newest utterance
+            // only. Two questions asked while the bot was busy get one
+            // answer, to the last one; the staleness check above decides
+            // whether even that is still worth answering.
+            while let Ok(queued) = obs.try_recv() {
+                if queued.modality == UTTERANCE {
+                    pending = Some(queued);
+                }
+            }
         }
         tracing::info!("deliberate loop exiting");
     }
@@ -2111,5 +2149,52 @@ mod tests {
                 .contains("ugh, the traffic"),
             "first turn was the first utterance"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_utterance_is_never_answered() {
+        use tokio::sync::mpsc;
+        let llm = MockLlm::new(vec![Script::text(&["One."]), Script::text(&["Two."])]);
+        let commands = Arc::new(CommandQueue::new());
+        let facts = Arc::new(InMemoryFacts::new());
+        let clock: Arc<dyn Clock> = Arc::new(common::RealClock);
+        let session = Session::new(
+            llm.clone(),
+            Config::default(),
+            room_with(vec![person("john", true)]),
+            facts,
+            commands.clone(),
+            clock,
+        );
+        let (tx, rx) = mpsc::channel::<Observation>(OBSERVATION_BACKLOG);
+        let (_itx, irx) = mpsc::unbounded_channel::<Command>();
+        let shutdown = CancellationToken::new();
+        let current = Arc::new(Mutex::new(None));
+        let run = tokio::spawn(session.run(rx, irx, shutdown.clone(), current));
+        let utt = |t: &str, at: Instant| {
+            Observation::new("mic0", UTTERANCE, at)
+                .with_entity(common::EntityHint::Known(EntityId::new("john")))
+                .with_payload(Payload::Text(t.to_owned()))
+        };
+        let old = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        tx.send(utt("old question", old)).await.unwrap();
+        tx.send(utt("first", Instant::now())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown.cancel();
+        let _ = run.await;
+        let asked: Vec<String> = llm
+            .requests()
+            .iter()
+            .map(|r| {
+                r.messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::User)
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].ends_with("first"), "{}", asked[0]);
     }
 }
