@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common::EntityId;
 use smallvec::SmallVec;
@@ -30,6 +30,14 @@ pub const MAX_OPEN_QUESTIONS: usize = 8;
 
 /// Threads ("what X said they were working on") kept, one per person.
 pub const MAX_THREADS: usize = 8;
+
+/// Greeting timestamps kept, one per person. Sixteen is more people than
+/// pass through a room in the ten minutes a greeting is remembered for.
+pub const MAX_GREETED: usize = 16;
+
+/// Stranger tracks we have asked for a name. Bounded the same way; a
+/// track number that old has been recycled by the tracker anyway.
+pub const MAX_NAME_ASKED: usize = 16;
 
 /// Something we asked and are waiting to hear back on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +68,20 @@ pub struct WorkingMemory {
     /// What each person said they were working on. Survives LEFT: it is
     /// what a RETURNED can pick back up on.
     threads: Vec<(EntityId, String)>,
+    /// When we last greeted each person. Survives LEFT, which is the
+    /// point: someone who steps out for a minute and comes back is not
+    /// greeted like a new arrival. The planner's half of the "once per ten
+    /// minutes" rule; the deliberate path keeps its own copy because it
+    /// also greets on its own initiative.
+    greeted: Vec<(EntityId, Instant)>,
+    /// Stranger tracks we have asked for a name. A track is asked once:
+    /// asking twice reads as not listening, and the answer (or the lack
+    /// of one) is the deliberate path's to handle.
+    name_asked: Vec<EntityId>,
+    /// When we last asked anyone for a name. One question per minute
+    /// across the room: two strangers walking in together get one
+    /// "what's your name?", not a volley.
+    pub last_name_ask: Option<Instant>,
 }
 
 impl WorkingMemory {
@@ -91,6 +113,50 @@ impl WorkingMemory {
             self.threads.remove(0);
         }
         self.threads.push((entity, task));
+    }
+
+    /// Record that we greeted `entity` at `at` (replacing any earlier
+    /// greeting).
+    pub fn greeted(&mut self, entity: EntityId, at: Instant) {
+        if let Some(slot) = self.greeted.iter_mut().find(|(e, _)| *e == entity) {
+            slot.1 = at;
+            return;
+        }
+        if self.greeted.len() >= MAX_GREETED {
+            self.greeted.remove(0);
+        }
+        self.greeted.push((entity, at));
+    }
+
+    /// When we last greeted `entity`, if ever.
+    pub fn greeted_at(&self, entity: &EntityId) -> Option<Instant> {
+        self.greeted
+            .iter()
+            .find(|(e, _)| e == entity)
+            .map(|(_, at)| *at)
+    }
+
+    /// Whether `entity` was greeted less than `window` before `now`.
+    pub fn greeted_within(&self, entity: &EntityId, now: Instant, window: Duration) -> bool {
+        self.greeted_at(entity)
+            .is_some_and(|at| now.saturating_duration_since(at) < window)
+    }
+
+    /// Record that we asked stranger `entity` for their name at `at`.
+    pub fn asked_name(&mut self, entity: EntityId, at: Instant) {
+        self.last_name_ask = Some(at);
+        if self.name_asked.contains(&entity) {
+            return;
+        }
+        if self.name_asked.len() >= MAX_NAME_ASKED {
+            self.name_asked.remove(0);
+        }
+        self.name_asked.push(entity);
+    }
+
+    /// Whether stranger `entity` has already been asked for a name.
+    pub fn has_asked_name(&self, entity: &EntityId) -> bool {
+        self.name_asked.contains(entity)
     }
 
     /// Record that we asked `entity` something.
@@ -170,6 +236,16 @@ impl WorkingMemory {
                             t.0 = to.clone();
                         }
                     }
+                    // A greeting given to the stranger was given to this
+                    // person: recognising them is not a reason to say hi
+                    // again. The name question, though, belongs to the
+                    // track: it was answered by the recognition itself.
+                    for g in &mut self.greeted {
+                        if g.0 == *from {
+                            g.0 = to.clone();
+                        }
+                    }
+                    self.name_asked.retain(|e| e != from);
                     if self.attention.as_ref() == Some(from) {
                         self.attention = Some(to.clone());
                     }

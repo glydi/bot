@@ -9,6 +9,8 @@
 //! The stack is small and inline: it lives on the reflex thread and is
 //! updated in `Reflex::on_observation` right after the fold.
 
+use std::time::Duration;
+
 use common::EntityId;
 use smallvec::SmallVec;
 
@@ -20,11 +22,23 @@ use crate::world::World;
 /// that old has been superseded by everything above it.
 pub const MAX_GOALS: usize = 8;
 
+/// How long a greeting lasts: someone greeted less than this ago is not
+/// greeted again, whether they re-entered, returned, or were merely
+/// re-recognised. Ten minutes is long enough that a hello on the way back
+/// from the kitchen never happens.
+pub const GREET_WINDOW: Duration = Duration::from_secs(600);
+
+/// A RETURNED shorter than this is a tracking gap, not a departure, and
+/// gets no "welcome back" (same figure as `view::RETURN_NOTE_MIN_AWAY`).
+pub const RETURN_GREET_MIN_AWAY: Duration = Duration::from_secs(60);
+
 /// Something the mind wants to achieve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Goal {
     /// Say hello to someone who just arrived.
     Greet(EntityId),
+    /// Find out who a stranger is, by asking. The entity is a track id.
+    AskName(EntityId),
     /// Follow along with something they said they were doing.
     HelpWith {
         /// Who.
@@ -48,6 +62,7 @@ impl Goal {
     pub fn entity(&self) -> Option<&EntityId> {
         match self {
             Self::Greet(e)
+            | Self::AskName(e)
             | Self::HelpWith { entity: e, .. }
             | Self::ResolveUnknown { entity: e, .. } => Some(e),
             Self::Idle => None,
@@ -58,6 +73,7 @@ impl Goal {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Greet(_) => "greet",
+            Self::AskName(_) => "ask_name",
             Self::HelpWith { .. } => "help_with",
             Self::ResolveUnknown { .. } => "resolve_unknown",
             Self::Idle => "idle",
@@ -133,29 +149,46 @@ impl GoalStack {
     /// updated before this is called.
     ///
     /// Heuristics, in the order events arrive:
-    /// * ENTERED, known person → [`Goal::Greet`].
+    /// * ENTERED, known person, not greeted within [`GREET_WINDOW`] →
+    ///   [`Goal::Greet`]. ENTERED, stranger track, not yet asked →
+    ///   [`Goal::AskName`] (the planner waits for them to stay a while).
     /// * RETURNED with a thread stored for them ("working on X") →
-    ///   [`Goal::ResolveUnknown`] "Did you finish X?".
+    ///   [`Goal::ResolveUnknown`] "Did you finish X?". The question *is*
+    ///   the welcome: "Did you finish the Rust project?" shows we
+    ///   remember them better than "welcome back" does, so no Greet is
+    ///   stacked under it. RETURNED with no thread, away for at least
+    ///   [`RETURN_GREET_MIN_AWAY`] and not greeted within [`GREET_WINDOW`]
+    ///   → [`Goal::Greet`], which the planner phrases as a return.
     /// * SAID answers any open [`Goal::ResolveUnknown`] for that person;
     ///   a SAID mentioning what they are working on → [`Goal::HelpWith`].
     /// * LEFT retires their goals. The thread stays in working memory,
     ///   which is what makes the RETURNED rule fire later.
-    /// * MERGED re-keys goals from the stranger id to the known one.
+    /// * MERGED re-keys goals from the stranger id to the known one, and
+    ///   drops the stranger's [`Goal::AskName`]: recognition answered it.
     pub fn from_events(&mut self, events: &[Event], world: &World, working: &WorkingMemory) {
         let _ = world;
         for e in events {
             match &e.kind {
                 EventKind::Entered => {
-                    if !e.entity.is_track() {
+                    if e.entity.is_track() {
+                        if !working.has_asked_name(&e.entity) {
+                            self.push(Goal::AskName(e.entity.clone()));
+                        }
+                    } else if !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
                         self.push(Goal::Greet(e.entity.clone()));
                     }
                 }
-                EventKind::Returned { .. } => {
+                EventKind::Returned { away_for } => {
                     if let Some(task) = working.thread_for(&e.entity) {
                         self.push(Goal::ResolveUnknown {
                             entity: e.entity.clone(),
                             question: format!("Did you finish {task}?"),
                         });
+                    } else if !e.entity.is_track()
+                        && *away_for >= RETURN_GREET_MIN_AWAY
+                        && !working.greeted_within(&e.entity, e.at, GREET_WINDOW)
+                    {
+                        self.push(Goal::Greet(e.entity.clone()));
                     }
                 }
                 EventKind::Said(text) => {
@@ -169,8 +202,17 @@ impl GoalStack {
                 }
                 EventKind::Left => self.retire(&e.entity),
                 EventKind::Merged { from } => {
+                    self.stack
+                        .retain(|g| !matches!(g, Goal::AskName(t) if t == from));
                     for g in &mut self.stack {
                         rekey(g, from, &e.entity);
+                    }
+                    // Recognition arriving a beat after the face did: the
+                    // stranger we were about to ask turns out to be someone
+                    // we know, and they have not been greeted -- the ENTERED
+                    // was theirs as a track, so no Greet was raised then.
+                    if !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
+                        self.push(Goal::Greet(e.entity.clone()));
                     }
                 }
                 EventKind::SpeakingStarted | EventKind::SpeakingStopped => {}
@@ -182,6 +224,7 @@ impl GoalStack {
 fn rekey(g: &mut Goal, from: &EntityId, to: &EntityId) {
     match g {
         Goal::Greet(e)
+        | Goal::AskName(e)
         | Goal::HelpWith { entity: e, .. }
         | Goal::ResolveUnknown { entity: e, .. } => {
             if e == from {

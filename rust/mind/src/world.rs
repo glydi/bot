@@ -133,6 +133,8 @@ pub struct World {
     /// resolved). Enough for barge-in; not enough to attend to anyone.
     unattributed_speaking: bool,
     unattributed_spoke_at: Option<Instant>,
+    /// Names given by `set_name` for entities that do not exist yet.
+    pending_names: HashMap<EntityId, SmolStr>,
 }
 
 impl World {
@@ -182,8 +184,15 @@ impl World {
     /// Give an entity a display name. Names come from outside the mind (the
     /// gallery, memory); observations only carry ids.
     pub fn set_name(&mut self, id: &EntityId, name: impl Into<SmolStr>) {
+        let name = name.into();
         if let Some(e) = self.entities.get_mut(id) {
-            e.name = Some(name.into());
+            e.name = Some(name);
+        } else {
+            // Not seen yet: the gallery supplies names for everyone it
+            // knows at start-up, before any of them walk in. Held until
+            // the entity is created, so the first ENTERED already carries
+            // the name and the greeting can say it.
+            self.pending_names.insert(id.clone(), name);
         }
     }
 
@@ -349,10 +358,12 @@ impl World {
         let Some(stranger) = self.entities.remove(&prev) else {
             return;
         };
-        let known = self
-            .entities
-            .entry(into.clone())
-            .or_insert_with(|| Entity::new(into.clone(), stranger.first_seen, stranger.confidence));
+        let mut pending = self.pending_names.remove(into);
+        let known = self.entities.entry(into.clone()).or_insert_with(|| {
+            let mut e = Entity::new(into.clone(), stranger.first_seen, stranger.confidence);
+            e.name = pending.take();
+            e
+        });
         // Keep the earliest first_seen; carry over speech state, which the
         // voice path may have attached to the track before the face was
         // recognised.
@@ -379,10 +390,9 @@ impl World {
     fn touch(&mut self, id: &EntityId, now: Instant, confidence: Option<f32>, out: &mut Events) {
         match self.entities.get_mut(id) {
             None => {
-                self.entities.insert(
-                    id.clone(),
-                    Entity::new(id.clone(), now, confidence.unwrap_or(1.0)),
-                );
+                let mut e = Entity::new(id.clone(), now, confidence.unwrap_or(1.0));
+                e.name = self.pending_names.remove(id);
+                self.entities.insert(id.clone(), e);
                 out.push(Event::new(now, id.clone(), EventKind::Entered));
             }
             Some(e) => {
