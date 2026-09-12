@@ -7,6 +7,21 @@ rust-version.workspace = true
 
 [dependencies]
 common = { workspace = true }
+mind = { workspace = true }
+deliberate = { path = "../deliberate" }
+sense-audio = { path = "../sense-audio" }
+rusqlite = { workspace = true }
+smol_str = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+deliberate = { path = "../deliberate", features = ["mock"] }
 
 [lints]
 workspace = true

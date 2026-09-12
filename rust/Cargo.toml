@@ -35,6 +35,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arc-swap = "1"
+# memory: SQLite with the library compiled in, so the person gallery opens
+# the same people.db the Python and Go builds wrote without a system sqlite.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # deliberate: LLM client (HTTP + SSE streaming), cancellation, stream combinators.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -54,6 +57,16 @@ libloading = "0.8"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.36"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# sense-vision: AVFoundation camera capture through the objc2 bindings; the
+# FFI is isolated in sense-vision/src/camera.rs.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-av-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
 
 [workspace.lints.rust]
 # Sense/actuator crates that need FFI override this per crate, isolating the
