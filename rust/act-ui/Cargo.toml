@@ -5,8 +5,27 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Everything except the window: the expression state machine, the router and
+# the headless consumer, so CI runs with no display and no GPU.
+mock = []
+
 [dependencies]
 common = { workspace = true }
+mind = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+arc-swap = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+image = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
