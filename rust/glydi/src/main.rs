@@ -117,10 +117,15 @@ fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
     let mut app = App::build(config, parts)?;
 
     let (ctrlc_tx, ctrlc_rx) = crossbeam_channel::bounded::<()>(1);
-    ctrlc::set_handler(move || {
-        let _ = ctrlc_tx.try_send(());
-        // The window's event loop has no channel to poke; a second Ctrl-C
-        // while it is open ends the process outright rather than hanging.
+    let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    ctrlc::set_handler({
+        let quit = quit.clone();
+        move || {
+            let _ = ctrlc_tx.try_send(());
+            // The window polls this each frame and closes itself; the
+            // handler cannot reach the event loop any other way.
+            quit.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     })?;
 
     if headless {
@@ -132,9 +137,12 @@ fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
             }
         }
     } else if let Some(ui) = app.take_ui() {
-        let ui_config = act_ui::UiConfig::default();
+        let ui_config = act_ui::UiConfig {
+            quit: Some(quit),
+            ..act_ui::UiConfig::default()
+        };
         // eframe owns the main thread until the window closes; Ctrl-C
-        // during that time is delivered as a normal SIGINT exit.
+        // sets `quit`, which the window polls and closes on.
         if let Err(e) = act_ui::run_ui(&ui_config, ui.commands, ui.observations, ui.sources) {
             tracing::warn!(error = %e, "window failed; run with --headless on this machine");
         }

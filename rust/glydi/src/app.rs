@@ -648,7 +648,33 @@ fn spawn_speaker(
             self_speaking,
             clock,
         ),
-        None => Speaker::spawn(&cfg, commands.clone(), obs_tx, self_speaking, clock),
+        None => {
+            // A voice that cannot start (Kokoro not compiled in, its model
+            // files missing) falls back to the system voice rather than
+            // leaving the bot mute: a plainer voice beats a silent one, and
+            // the config choice is reported so it can be fixed.
+            match Speaker::spawn(
+                &cfg,
+                commands.clone(),
+                obs_tx.clone(),
+                self_speaking.clone(),
+                clock.clone(),
+            ) {
+                Err(e) if tts != Tts::Mac => {
+                    tracing::warn!(error = %e, ?tts, "configured voice unavailable; using the macOS voice");
+                    let mac = SpeakerConfig {
+                        backend: Backend::Mac(MacConfig {
+                            voice: config.mac_voice.clone(),
+                            ..MacConfig::default()
+                        }),
+                        silent: parts.silent,
+                        source: SmolStr::new_static("speaker"),
+                    };
+                    Speaker::spawn(&mac, commands.clone(), obs_tx, self_speaking, clock)
+                }
+                other => other,
+            }
+        }
     };
     match result {
         Ok(h) => Some(h),

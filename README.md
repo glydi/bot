@@ -63,7 +63,8 @@ make -C rust/ttsd
 # models (whisper, smart-turn, ecapa, insightface buffalo_s)
 # -> models/ and ~/.insightface/models/buffalo_s ; see STACK.txt
 
-cd rust && cargo build --release --features vision
+cd rust && cargo build --release -p glydi --features vision,kokoro
+rust/make_app.sh            # GLYDI.app on the Desktop
 ./target/release/glydi check
 ./target/release/glydi run
 ```

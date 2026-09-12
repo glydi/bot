@@ -68,6 +68,10 @@ pub struct UiConfig {
     /// being pushy after 600 ms; a window that stays always-on-top is
     /// obnoxious.
     pub front_on_launch: bool,
+    /// Set from outside (a Ctrl-C handler) to close the window. eframe
+    /// owns the main thread and has no channel to poke, so the frame loop
+    /// polls this; Cmd-Q and the close button work without it.
+    pub quit: Option<Arc<AtomicBool>>,
 }
 
 impl Default for UiConfig {
@@ -77,6 +81,7 @@ impl Default for UiConfig {
             size: (420.0, 520.0),
             debug: false,
             front_on_launch: true,
+            quit: None,
         }
     }
 }
@@ -146,6 +151,7 @@ struct FaceApp {
     debug: bool,
     /// How many `attend`s have already been turned into a glance.
     attends_seen: u64,
+    quit: Option<Arc<AtomicBool>>,
 }
 
 impl FaceApp {
@@ -165,6 +171,7 @@ impl FaceApp {
             sources,
             debug: config.debug,
             attends_seen: 0,
+            quit: config.quit.clone(),
         }
     }
 
@@ -192,6 +199,21 @@ impl eframe::App for FaceApp {
     // egui 0.36 hands the app a `Ui` for the whole viewport rather than a
     // `Context`, so panels are nested inside it.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Cmd-Q is taken here rather than left to AppKit: its `terminate:`
+        // calls `exit()` straight from the menu, skipping every shutdown
+        // step (the session row is never closed, and whisper.cpp's Metal
+        // backend aborts in a static destructor, so the OS reports "quit
+        // unexpectedly"). Closing the window instead returns from
+        // `run_native` and the binary stops everything in order.
+        let cmd_q = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Q));
+        if cmd_q
+            || self
+                .quit
+                .as_ref()
+                .is_some_and(|q| q.load(Ordering::Relaxed))
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         let now = Instant::now();
         self.drain(now);
         let expression = self.state.expression(now);

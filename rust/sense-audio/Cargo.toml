@@ -24,7 +24,11 @@ ort = { workspace = true }
 whisper-rs = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-whisper-rs = { workspace = true, features = ["metal"] }
+# No Metal backend: ggml's Metal device aborts in a static destructor when
+# the process exits with a whisper context still alive (an AppKit Cmd-Q
+# does exactly that), and tiny.en on the CPU transcribes an utterance in
+# well under a second, which is what the Python build shipped with.
+whisper-rs = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
