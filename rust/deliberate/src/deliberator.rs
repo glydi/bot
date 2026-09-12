@@ -130,6 +130,67 @@ remember_name tool call only; you greet them after it returns.";
 /// and "skip the hello" would be pinned to every turn of the conversation.
 pub const GREETED_RECENTLY: Duration = Duration::from_secs(120);
 
+/// Modality of the sense's verdict on a pause. `Bool(true)` is the end of
+/// the turn (the transcript follows as an `utterance`); `Bool(false)` is a
+/// deferral: the judge heard a pause mid-thought and is waiting for more
+/// (`sense_audio::pipeline::on_turn_end`).
+pub const TURN_ENDED: &str = "turn_ended";
+
+/// Modality of the transcript so far, while a turn is still open: same
+/// `Text` payload and entity hint as an `utterance`, emitted by a sense
+/// that transcribes speculatively at each pause. Nothing else is done with
+/// it than the early start below; a sense that never emits it just never
+/// starts early.
+pub const PARTIAL_UTTERANCE: &str = "partial_utterance";
+
+/// "Wait", "hold on": how long the hold lasts. Long enough to find a
+/// phone or finish a thought; after it the lull rule may talk again.
+pub const HOLD_WINDOW: Duration = Duration::from_secs(20);
+
+/// The one word allowed in answer to a hold request. Sent as a
+/// `backchannel`, which the speaker plays only when idle and otherwise
+/// drops, so it can never talk over what they were waiting to say.
+pub const HOLD_ACK: &str = "Sure.";
+
+/// An utterance this soon after a reply was cut off by barge-in is the
+/// rest of the same thought: "what's the capital" -- bot starts -- "of
+/// France?" Beyond it the person has heard the half answer and is
+/// reacting to it, which is a new turn. 1.2 s is the STT's own pause
+/// threshold plus the transcription latency, so a mere breath cannot
+/// split a sentence into two turns.
+pub const CONTINUATION_WINDOW: Duration = Duration::from_millis(1200);
+
+/// Silence after a deferred verdict before a finished-looking question is
+/// answered anyway. The judge's deferral budget (`sense_audio::MAX_DEFERRALS`
+/// pauses of the VAD hangover each) can hold a plain question for
+/// seconds; a person who has asked one and stopped expects an answer
+/// inside about a second, and 600 ms leaves room for the "um" that would
+/// make them keep going.
+pub const EARLY_START_SILENCE: Duration = Duration::from_millis(600);
+
+/// A partial transcript must have at least this many words, and end in a
+/// question mark, to be worth an early start: "you?" and "and then?" are
+/// halves of something, "what time is it?" is not.
+pub const EARLY_MIN_WORDS: usize = 4;
+
+/// After an early answer, the sense's own transcript of the same speech
+/// still arrives when the judge finally lets the turn end. Within this
+/// window a transcript that says what we already answered is that
+/// transcript, not a repeat question. Wider than the judge's whole
+/// deferral budget.
+pub const EARLY_MATCH_WINDOW: Duration = Duration::from_secs(8);
+
+/// How long the model may take over its first token before we say we are
+/// thinking. Measured from the request going out: a local 3B model with a
+/// warm prefix answers in 300-800 ms, a cold prefix or a tool round in
+/// 2-4 s; 1.5 s is where a person starts wondering whether they were
+/// heard.
+pub const FIRST_TOKEN_GRACE: Duration = Duration::from_millis(1500);
+
+/// Said once per turn when the first token is late. A `backchannel`, so
+/// the speaker drops it rather than queue it behind the answer.
+pub const THINKING_LINE: &str = "Let me think.";
+
 /// Settings for the deliberate path.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -224,6 +285,13 @@ pub struct Session {
     /// first" then reads as "say sorry instead of calling `forget_person`":
     /// 15/20 calls with the line on such turns, 20/20 without.
     memory_request: bool,
+    /// The person asked us to wait; until this instant no small talk and
+    /// no greeting, and the next utterance is answered as usual.
+    holding_until: Option<Instant>,
+    /// The turn in flight started early, on a partial transcript (see
+    /// [`Session::run`]): any voice cancels it at once, and a cancelled
+    /// early turn leaves no trace in the history.
+    early: bool,
 }
 
 impl Session {
@@ -257,7 +325,29 @@ impl Session {
             absent_hint: false,
             lull: false,
             memory_request: false,
+            holding_until: None,
+            early: false,
         }
+    }
+
+    /// Whether the person asked us to wait less than [`HOLD_WINDOW`] ago.
+    pub fn holding(&self) -> bool {
+        self.holding_until
+            .is_some_and(|until| self.clock.now() < until)
+    }
+
+    /// "Wait", "hold on": no turn, at most a quiet [`HOLD_ACK`], and a
+    /// hold of [`HOLD_WINDOW`]. The words are not kept in the history:
+    /// a small model shown "john says: hold on" answers "Sure, take your
+    /// time" on the *next* turn instead of the question.
+    fn hold(&mut self) {
+        let now = self.clock.now();
+        self.holding_until = Some(now + HOLD_WINDOW);
+        tracing::info!(secs = HOLD_WINDOW.as_secs(), "hold requested");
+        self.backchannel(HOLD_ACK);
+        // The reflex showed "thinking" when their turn ended; declining
+        // to answer is the end of that turn.
+        self.ui("idle");
     }
 
     /// The conversation so far.
@@ -323,9 +413,15 @@ impl Session {
                 // A recall raised for a greeting is a greeting: the person
                 // walked in and the world has no name for them yet. Say
                 // hello now rather than after they speak first.
-                if intent.goal.as_deref() == Some("greet") {
+                if intent.goal.as_deref() == Some("greet") && !self.holding() {
                     self.proactive(Some(id), "greet", "Hi there.".to_owned());
                 }
+            }
+            "greet" if self.holding() => {
+                // They asked us to wait; a hello now is exactly the
+                // interruption they asked not to have. The planner raises
+                // it again once the world changes.
+                tracing::info!("greet intent suppressed: holding");
             }
             "greet" => {
                 let line = match (&intent.name, intent.returned_after_secs) {
@@ -444,6 +540,16 @@ impl Session {
         );
     }
 
+    /// A short sound the speaker plays only if it is idle. Never queued
+    /// behind a reply, so it cannot delay one.
+    fn backchannel(&self, line: &str) {
+        tracing::debug!(line, "backchannel");
+        self.commands.push(
+            Command::new("speaker", "backchannel", Priority::Deliberate)
+                .with_payload(Payload::Text(line.to_owned())),
+        );
+    }
+
     /// The `[room]` note and the speaker's display name for this turn.
     fn room(&self, speaker: Option<&EntityId>) -> (Arc<WorldView>, String, Option<String>) {
         let view = (self.snapshot)();
@@ -540,6 +646,13 @@ impl Session {
         let result = self.respond(speaker, obs, &cancel).await;
         self.absent_hint = false;
         self.memory_request = false;
+        // An early start that the person talked over answered a question
+        // they had not finished asking: nothing of it belongs in the
+        // transcript, the finished question is coming.
+        if self.early && matches!(result, Ok(TurnEnd::Cancelled)) {
+            let n = self.conversation.retract_last_turn();
+            tracing::info!(messages = n, "early start abandoned: retracted");
+        }
         // Prefetched facts were for this prompt; the next turn reads the
         // store, which may have gained a `remember` since.
         self.prefetched.clear();
@@ -583,6 +696,10 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: &CancellationToken,
     ) -> Result<TurnEnd, LlmError> {
+        // "Let me think." goes out once per turn, if the first token of
+        // the first request is later than FIRST_TOKEN_GRACE. A tool round
+        // that follows is not the person's wait starting over.
+        let mut thought_aloud = false;
         for round in 0..=self.max_tool_rounds {
             let (view, note, name) = self.room(speaker);
             let messages = self.conversation.prepare(&note, name.as_deref());
@@ -607,11 +724,20 @@ impl Session {
             // A bell or a cough raises voice_activity too; only speech
             // that keeps going cancels the turn (see mind's BargeInStop).
             let mut voice_since: Option<tokio::time::Instant> = None;
+            // When to say we are thinking, if no token has come by then.
+            let mut thinking_due =
+                (!thought_aloud).then(|| tokio::time::Instant::now() + FIRST_TOKEN_GRACE);
 
             loop {
                 let sustain = async {
                     match voice_since {
                         Some(t) => tokio::time::sleep_until(t + BARGE_IN_SUSTAIN).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let thinking = async {
+                    match thinking_due {
+                        Some(t) => tokio::time::sleep_until(t).await,
                         None => std::future::pending::<()>().await,
                     }
                 };
@@ -630,6 +756,16 @@ impl Session {
                         if let Some(o) = o {
                             if o.modality == VOICE_ACTIVITY {
                                 if barge_in(&o) {
+                                    // An early start answers a question
+                                    // still being asked: the first voiced
+                                    // frame means they went on, and there
+                                    // is no sustain to wait for -- the
+                                    // real transcript replaces ours.
+                                    if self.early {
+                                        tracing::info!("voice resumed: abandoning early start");
+                                        cancelled = true;
+                                        break;
+                                    }
                                     voice_since.get_or_insert_with(tokio::time::Instant::now);
                                 } else {
                                     voice_since = None;
@@ -639,7 +775,16 @@ impl Session {
                         }
                         // Channel closed: keep streaming, shutdown comes via `cancel`.
                     }
+                    () = thinking => {
+                        thinking_due = None;
+                        thought_aloud = true;
+                        tracing::info!(ms = FIRST_TOKEN_GRACE.as_millis(), "first token late");
+                        self.backchannel(THINKING_LINE);
+                    }
                     ev = stream.next() => {
+                        // The first event of any kind means the model is
+                        // going; no need to say so.
+                        thinking_due = None;
                         match ev {
                             None => break,
                             Some(Err(e)) => return Err(e),
@@ -783,6 +928,12 @@ impl Session {
     /// ourselves. The ones that arrive mid-turn queue up (unbounded, they
     /// are tiny) and are handled when the turn ends; the rate limit then
     /// collapses the repeats.
+    ///
+    /// Turn-taking state lives here rather than on the session because it
+    /// is only meaningful between turns: the cut-off utterance a
+    /// continuation joins to, the partial transcript an early start
+    /// answers, and the timer that starts it.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(
         mut self,
         mut obs: mpsc::Receiver<Observation>,
@@ -793,10 +944,28 @@ impl Session {
         // An utterance that arrived while a turn was running, kept for
         // after it (only the newest, and only while fresh).
         let mut pending: Option<Observation> = None;
+        // The utterance whose reply barge-in cut off, and when: the next
+        // one inside CONTINUATION_WINDOW is the rest of the same thought.
+        let mut last_cancelled: Option<(String, Instant)> = None;
+        // The transcript so far of a turn the sense has not closed, with
+        // its speaker, from the latest `partial_utterance`.
+        let mut partial: Option<(String, Option<EntityId>)> = None;
+        // Armed by a deferred verdict on a finished-looking question;
+        // fires an early turn unless voice resumes first.
+        let mut early_due: Option<tokio::time::Instant> = None;
+        // What an early turn answered, and when it finished. The sense's
+        // own transcript of that speech is still to come.
+        let mut early_answered: Option<(String, Instant)> = None;
         loop {
             let o = if let Some(p) = pending.take() {
                 p
             } else {
+                let early = async {
+                    match early_due {
+                        Some(t) => tokio::time::sleep_until(t).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => break,
@@ -808,20 +977,87 @@ impl Session {
                         self.on_intent(cmd, &mut obs, &shutdown, &current).await;
                         continue;
                     }
+                    () = early => {
+                        early_due = None;
+                        let Some((text, speaker)) = partial.take() else {
+                            continue;
+                        };
+                        tracing::info!(text, "early start: silence after a deferred question");
+                        let token = shutdown.child_token();
+                        *current.lock() = Some(token.clone());
+                        self.early = true;
+                        let end = self
+                            .handle_utterance(&text, speaker.as_ref(), &mut obs, token)
+                            .await;
+                        self.early = false;
+                        *current.lock() = None;
+                        match end {
+                            Ok(TurnEnd::Done) => {
+                                early_answered = Some((text, self.clock.now()));
+                            }
+                            // Abandoned: the history was retracted, and the
+                            // finished question arrives as an utterance.
+                            Ok(TurnEnd::Cancelled) => {}
+                            Err(e) => tracing::warn!(error = %e, "early turn failed"),
+                        }
+                        pending = newest_utterance(&mut obs);
+                        continue;
+                    }
                     o = obs.recv() => match o {
                         Some(o) => o,
                         None => break,
                     },
                 }
             };
-            if o.modality != UTTERANCE {
-                continue;
+            let now = self.clock.now();
+            match o.modality.as_str() {
+                UTTERANCE => {
+                    // The sense closed the turn; whatever it transcribed
+                    // in passing is superseded by this.
+                    partial = None;
+                    early_due = None;
+                }
+                PARTIAL_UTTERANCE => {
+                    if let Some(t) = o.payload.as_text().map(str::trim).filter(|t| !t.is_empty()) {
+                        partial = Some((
+                            t.to_owned(),
+                            o.entity
+                                .as_ref()
+                                .and_then(common::EntityHint::known)
+                                .cloned(),
+                        ));
+                    }
+                    continue;
+                }
+                TURN_ENDED => {
+                    // A deferral on a finished-looking question: answer it
+                    // after EARLY_START_SILENCE of quiet rather than after
+                    // the judge's whole deferral budget. Any other verdict
+                    // has the transcript on its way.
+                    let deferred = o.payload.as_bool() == Some(false);
+                    let asked = partial.as_ref().is_some_and(|(t, _)| finished_question(t));
+                    early_due = if deferred && asked && !self.holding() {
+                        Some(tokio::time::Instant::now() + EARLY_START_SILENCE)
+                    } else {
+                        None
+                    };
+                    continue;
+                }
+                VOICE_ACTIVITY => {
+                    // They went on talking: whatever we were about to
+                    // answer early was not the whole question.
+                    if barge_in(&o) && early_due.take().is_some() {
+                        tracing::debug!("voice resumed before the early start");
+                    }
+                    continue;
+                }
+                _ => continue,
             }
             // Answer what was just said, never what was said a while ago:
             // with the channel a few slots deep, an utterance that queued
             // behind a turn used to be answered after it -- the user heard
             // the reply to their previous question.
-            let age = self.clock.now().saturating_duration_since(o.at);
+            let age = now.saturating_duration_since(o.at);
             if age > STALE_UTTERANCE {
                 tracing::info!(age_ms = age.as_millis(), "stale utterance skipped");
                 continue;
@@ -831,6 +1067,17 @@ impl Session {
                 // is the correct response to nothing.
                 continue;
             };
+            // The transcript of speech an early turn already answered:
+            // the answer is out, this is not a second question.
+            if let Some((answered, at)) = early_answered.take() {
+                let same = now.saturating_duration_since(at) < EARLY_MATCH_WINDOW
+                    && same_thought(text, &answered);
+                if same {
+                    tracing::info!(text, "already answered early");
+                    self.ui("idle");
+                    continue;
+                }
+            }
             let speaker = o
                 .entity
                 .as_ref()
@@ -873,25 +1120,41 @@ impl Session {
                 self.ui("idle");
                 continue;
             }
+            if is_hold_request(text) {
+                self.hold();
+                last_cancelled = None;
+                continue;
+            }
+            // Anything else they say is what they wanted us to wait for.
+            self.holding_until = None;
+            // The rest of a thought whose first half we started answering:
+            // one user turn, with the half answer unsaid, not two.
+            let text = match last_cancelled.take() {
+                Some((first, at)) if now.saturating_duration_since(at) < CONTINUATION_WINDOW => {
+                    let n = self.conversation.retract_last_turn();
+                    tracing::info!(first, second = text, retracted = n, "continuation joined");
+                    format!("{first} {text}")
+                }
+                _ => text.to_owned(),
+            };
             let token = shutdown.child_token();
             *current.lock() = Some(token.clone());
-            match self
-                .handle_utterance(text, speaker.as_ref(), &mut obs, token)
-                .await
-            {
-                Ok(_) => {}
+            let end = self
+                .handle_utterance(&text, speaker.as_ref(), &mut obs, token)
+                .await;
+            *current.lock() = None;
+            match end {
+                Ok(TurnEnd::Cancelled) => {
+                    last_cancelled = Some((text, self.clock.now()));
+                }
+                Ok(TurnEnd::Done) => {}
                 Err(e) => tracing::warn!(error = %e, "turn failed"),
             }
-            *current.lock() = None;
             // Whatever queued during the turn: keep the newest utterance
             // only. Two questions asked while the bot was busy get one
             // answer, to the last one; the staleness check above decides
             // whether even that is still worth answering.
-            while let Ok(queued) = obs.try_recv() {
-                if queued.modality == UTTERANCE {
-                    pending = Some(queued);
-                }
-            }
+            pending = newest_utterance(&mut obs);
         }
         tracing::info!("deliberate loop exiting");
     }
@@ -906,6 +1169,11 @@ impl Session {
         current: &Arc<Mutex<Option<CancellationToken>>>,
     ) {
         if let Some((entity, name)) = small_talk_target(&cmd) {
+            if self.holding() {
+                // The lull is the one they asked for.
+                tracing::info!("small talk suppressed: holding");
+                return;
+            }
             let token = shutdown.child_token();
             *current.lock() = Some(token.clone());
             if let Err(e) = self.small_talk(entity.as_ref(), &name, obs, token).await {
@@ -926,6 +1194,88 @@ impl Session {
             .retain(|_, at| now.saturating_duration_since(*at) < IGNORE_TTL);
         self.ignore.remove(id).is_some()
     }
+}
+
+/// Drain what queued during a turn and keep only the newest utterance.
+fn newest_utterance(obs: &mut mpsc::Receiver<Observation>) -> Option<Observation> {
+    let mut newest = None;
+    while let Ok(queued) = obs.try_recv() {
+        if queued.modality == UTTERANCE {
+            newest = Some(queued);
+        }
+    }
+    newest
+}
+
+/// Words, lower-cased, with punctuation stripped: "Hold on!" and "hold
+/// on" are the same request, and "France?" and "france" the same word.
+fn words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'')
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// The ways people ask for a moment. Matched as the whole utterance or
+/// its start ("hold on a sec", "wait, wait"), and only on short
+/// utterances: "wait, what did you say about Ada?" is a question, and
+/// answering it with "Sure." would be maddening.
+const HOLD_PHRASES: [&str; 12] = [
+    "wait",
+    "hold on",
+    "one sec",
+    "one second",
+    "hang on",
+    "let me think",
+    "give me a moment",
+    "give me a sec",
+    "give me a second",
+    "just a moment",
+    "shh",
+    "not now",
+];
+
+/// Longest utterance, in words, that can still be a hold request.
+/// "wait wait hold on one sec" is five; a sixth word is content.
+const HOLD_MAX_WORDS: usize = 5;
+
+/// Whether `text` asks us to wait (see [`HOLD_PHRASES`]).
+pub fn is_hold_request(text: &str) -> bool {
+    let ws = words(text);
+    if ws.is_empty() || ws.len() > HOLD_MAX_WORDS {
+        return false;
+    }
+    let joined = ws.join(" ");
+    HOLD_PHRASES.iter().any(|p| {
+        joined == *p || joined.starts_with(&format!("{p} ")) || joined.ends_with(&format!(" {p}"))
+    })
+}
+
+/// Whether a partial transcript reads as a question asked in full: ends
+/// with "?" and has at least [`EARLY_MIN_WORDS`] words.
+pub fn finished_question(text: &str) -> bool {
+    text.trim_end().ends_with('?') && text.split_whitespace().count() >= EARLY_MIN_WORDS
+}
+
+/// Whether the sense's final transcript `text` is the speech an early
+/// turn answered as `answered`: the same words, allowing the STT to have
+/// re-heard a word or two, or a trailing "please" the partial had not
+/// caught. A transcript that goes on for three or more words beyond it
+/// asked something more and gets its own turn.
+fn same_thought(text: &str, answered: &str) -> bool {
+    let a = words(answered);
+    let t = words(text);
+    if a.is_empty() || t.len() < a.len() {
+        return false;
+    }
+    let differ = a.iter().zip(&t).filter(|(x, y)| x != y).count();
+    // One word in five may differ (a re-heard word); the tail must be short.
+    differ <= a.len() / 5 && t.len() - a.len() < 3
 }
 
 /// Whether `text` brings up a person who is not in `view`: a capitalised
@@ -2196,5 +2546,452 @@ mod tests {
             .collect();
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert!(asked[0].ends_with("first"), "{}", asked[0]);
+    }
+    /// [`Session::run`] on a task, with the handles a test drives it by.
+    /// The clock is shared so a test can move it between utterances.
+    struct Loop {
+        obs_tx: mpsc::Sender<Observation>,
+        itx: mpsc::UnboundedSender<Command>,
+        llm: Arc<MockLlm>,
+        commands: Arc<CommandQueue>,
+        clock: Arc<FakeClock>,
+        current: Arc<Mutex<Option<CancellationToken>>>,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn start(scripts: Vec<Script>, people: Vec<ViewEntity>) -> Loop {
+        let llm = MockLlm::new(scripts);
+        let commands = Arc::new(CommandQueue::new());
+        let clock = Arc::new(FakeClock::new());
+        let session = Session::new(
+            llm.clone(),
+            Config::default(),
+            room_with(people),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            clock.clone(),
+        );
+        let (obs_tx, obs_rx) = mpsc::channel(OBSERVATION_BACKLOG);
+        let (itx, irx) = mpsc::unbounded_channel::<Command>();
+        let shutdown = CancellationToken::new();
+        let current = Arc::new(Mutex::new(None));
+        let task = tokio::spawn(session.run(obs_rx, irx, shutdown.clone(), Arc::clone(&current)));
+        Loop {
+            obs_tx,
+            itx,
+            llm,
+            commands,
+            clock,
+            current,
+            shutdown,
+            task,
+        }
+    }
+
+    impl Loop {
+        fn john() -> EntityHint {
+            EntityHint::Known(EntityId::new("john"))
+        }
+
+        async fn send(&self, modality: &str, payload: Payload) {
+            self.obs_tx
+                .send(
+                    Observation::new("mic0", modality, Instant::now())
+                        .with_entity(Self::john())
+                        .with_payload(payload),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn utter(&self, text: &str) {
+            self.send(UTTERANCE, Payload::Text(text.to_owned())).await;
+        }
+
+        async fn voice(&self, on: bool) {
+            self.send(VOICE_ACTIVITY, Payload::Bool(on)).await;
+        }
+
+        /// Poll until `n` requests were made (or 3 s pass); returns whether.
+        async fn requests_reach(&self, n: usize) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.llm.requests().len() < n && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.llm.requests().len() >= n
+        }
+
+        /// Poll until no turn is in flight.
+        async fn idle(&self) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.current.lock().is_some() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn stop(self) -> (Vec<ChatRequest>, Vec<(String, String, String)>) {
+            self.shutdown.cancel();
+            self.task.await.unwrap();
+            (self.llm.requests(), drain(&self.commands))
+        }
+    }
+
+    /// The user-role messages of a request, as sent.
+    fn user_turns(req: &ChatRequest) -> Vec<String> {
+        req.messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn hold_requests_are_recognised() {
+        for yes in [
+            "wait",
+            "Wait!",
+            "hold on",
+            "Hold on a sec.",
+            "one sec",
+            "hang on",
+            "let me think",
+            "Give me a moment.",
+            "shh",
+            "not now",
+            "wait, wait",
+            "hmm, hold on",
+        ] {
+            assert!(is_hold_request(yes), "{yes}");
+        }
+        for no in [
+            "wait, what did you say about Ada?",
+            "hold on, is that the right time for the meeting?",
+            "what time is it?",
+            "",
+            "I can't wait for the weekend, it's been long",
+            "waiter",
+        ] {
+            assert!(!is_hold_request(no), "{no}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_request_costs_no_turn_and_suppresses_small_talk_and_greetings() {
+        let l = start(vec![Script::text(&["Paris."])], vec![person("john", true)]);
+        l.utter("hold on a sec").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            l.llm.requests().is_empty(),
+            "a hold request reached the model"
+        );
+        let cmds = drain(&l.commands);
+        assert_eq!(
+            cmds,
+            [
+                ("speaker".into(), "backchannel".into(), HOLD_ACK.into()),
+                ("ui".into(), "idle".into(), String::new()),
+            ],
+            "{cmds:?}"
+        );
+        // While holding: the lull rule and the planner's hello are declined.
+        l.itx
+            .send(intent(
+                r#"{"decision":"small_talk","name":"John","entity":"john","goal":"small_talk"}"#,
+            ))
+            .unwrap();
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(l.llm.requests().is_empty(), "small talk ran during a hold");
+        assert!(
+            drain(&l.commands).is_empty(),
+            "greeting spoken during a hold"
+        );
+        // The next utterance is answered as usual, and it ends the hold.
+        l.utter("what is the capital of France?").await;
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .ends_with("capital of France?")
+        );
+        // "hold on" is not in the transcript the model saw.
+        assert_eq!(user_turns(&reqs[0]).len(), 1);
+        assert!(says(&cmds).contains(&"Hi John.".to_owned()), "{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn hold_expires_after_the_window() {
+        let l = start(vec![], vec![person("john", true)]);
+        l.utter("wait").await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        l.clock.advance(HOLD_WINDOW + Duration::from_millis(1));
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (_, cmds) = l.stop().await;
+        assert_eq!(says(&cmds), ["Hi John."], "{cmds:?}");
+    }
+
+    /// A reply cut off by barge-in, then a second utterance either inside
+    /// or outside `CONTINUATION_WINDOW`.
+    async fn barge_then_continue(gap: Duration) -> Vec<ChatRequest> {
+        let l = start(
+            vec![
+                Script::text(&["Paris.", " Definitely.", " Yes.", " Sure.", " Right."])
+                    .with_delay(Duration::from_millis(150)),
+                Script::text(&["Paris."]),
+            ],
+            vec![person("john", true)],
+        );
+        l.utter("what is the capital").await;
+        assert!(l.requests_reach(1).await);
+        // Voice from here cancels after BARGE_IN_SUSTAIN (~400 ms).
+        l.voice(true).await;
+        l.idle().await;
+        l.clock.advance(gap);
+        l.utter("of France?").await;
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        let (reqs, _) = l.stop().await;
+        reqs
+    }
+
+    #[tokio::test]
+    async fn utterance_soon_after_barge_in_joins_the_cut_off_one() {
+        let reqs = barge_then_continue(Duration::from_millis(500)).await;
+        let users = user_turns(&reqs[1]);
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(
+            users[0].ends_with("john says: what is the capital of France?"),
+            "{}",
+            users[0]
+        );
+        // The half answer is unsaid: nothing from the model precedes it.
+        assert!(reqs[1].messages.iter().all(|m| m.role != Role::Assistant));
+    }
+
+    #[tokio::test]
+    async fn utterance_after_the_continuation_window_is_a_new_turn() {
+        let reqs = barge_then_continue(CONTINUATION_WINDOW).await;
+        let users = user_turns(&reqs[1]);
+        assert_eq!(users.len(), 2, "{users:?}");
+        assert!(users[0].ends_with("what is the capital"), "{}", users[0]);
+        assert!(users[1].ends_with("of France?"), "{}", users[1]);
+        // The sentences already spoken stay in the transcript.
+        assert!(reqs[1].messages.iter().any(|m| m.role == Role::Assistant));
+    }
+
+    #[tokio::test]
+    async fn deferred_question_is_answered_after_a_short_silence() {
+        let l = start(
+            vec![Script::text(&["Paris."]), Script::text(&["Again?"])],
+            vec![person("john", true)],
+        );
+        let t0 = Instant::now();
+        l.send(
+            PARTIAL_UTTERANCE,
+            Payload::Text("what is the capital of France?".into()),
+        )
+        .await;
+        l.send(TURN_ENDED, Payload::Bool(false)).await;
+        assert!(l.requests_reach(1).await, "no early start");
+        let waited = t0.elapsed();
+        assert!(
+            waited >= EARLY_START_SILENCE.saturating_sub(Duration::from_millis(20)),
+            "started after {waited:?}"
+        );
+        l.idle().await;
+        // The sense closes the turn and sends its own transcript of the
+        // same words: already answered, so no second request, and the
+        // face is released.
+        l.send(TURN_ENDED, Payload::Bool(true)).await;
+        l.utter("What is the capital of France?").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(reqs.len(), 1, "the final transcript was answered again");
+        assert!(
+            reqs[0]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .ends_with("capital of France?")
+        );
+        assert_eq!(says(&cmds), ["Paris."]);
+        let ui: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c.0 == "ui")
+            .map(|c| c.1.as_str())
+            .collect();
+        assert_eq!(ui, ["thinking", "idle", "idle"]);
+    }
+
+    #[tokio::test]
+    async fn early_start_needs_a_finished_question() {
+        assert!(finished_question("what is the capital of France?"));
+        assert!(!finished_question("what is the capital of France"));
+        assert!(!finished_question("and you?"));
+        let l = start(vec![Script::text(&["?"])], vec![person("john", true)]);
+        l.send(PARTIAL_UTTERANCE, Payload::Text("and then you?".into()))
+            .await;
+        l.send(TURN_ENDED, Payload::Bool(false)).await;
+        tokio::time::sleep(EARLY_START_SILENCE + Duration::from_millis(150)).await;
+        let (reqs, _) = l.stop().await;
+        assert!(reqs.is_empty(), "started early on a fragment");
+    }
+
+    #[tokio::test]
+    async fn voice_before_the_early_start_disarms_it() {
+        let l = start(vec![Script::text(&["Paris."])], vec![person("john", true)]);
+        l.send(
+            PARTIAL_UTTERANCE,
+            Payload::Text("what is the capital of France?".into()),
+        )
+        .await;
+        l.send(TURN_ENDED, Payload::Bool(false)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        l.voice(true).await;
+        tokio::time::sleep(EARLY_START_SILENCE + Duration::from_millis(150)).await;
+        assert!(
+            l.llm.requests().is_empty(),
+            "started early over their voice"
+        );
+        // The finished question arrives the ordinary way and is answered.
+        l.send(TURN_ENDED, Payload::Bool(true)).await;
+        l.utter("what is the capital of France, and of Spain?")
+            .await;
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        let (reqs, _) = l.stop().await;
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .ends_with("and of Spain?")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_during_an_early_turn_abandons_it_and_keeps_nothing() {
+        let l = start(
+            vec![
+                Script::text(&["Paris.", " Definitely.", " Yes."])
+                    .with_delay(Duration::from_millis(250)),
+                Script::text(&["Paris and Madrid."]),
+            ],
+            vec![person("john", true)],
+        );
+        l.send(
+            PARTIAL_UTTERANCE,
+            Payload::Text("what is the capital of France?".into()),
+        )
+        .await;
+        l.send(TURN_ENDED, Payload::Bool(false)).await;
+        assert!(l.requests_reach(1).await);
+        // The first voiced frame ends the early turn, no sustain: before
+        // the first sentence (due 250 ms in) is out.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        l.voice(true).await;
+        l.idle().await;
+        l.send(TURN_ENDED, Payload::Bool(true)).await;
+        l.utter("what is the capital of France, and of Spain?")
+            .await;
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        // The second request has one user turn -- the finished question --
+        // and no trace of the abandoned one.
+        let users = user_turns(&reqs[1]);
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users[0].ends_with("and of Spain?"), "{}", users[0]);
+        assert!(reqs[1].messages.iter().all(|m| m.role != Role::Assistant));
+        assert_eq!(says(&cmds), ["Paris and Madrid."], "{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn late_first_token_gets_one_thinking_backchannel() {
+        let mut r = rig(
+            vec![
+                Script::text(&["Paris.", " Definitely."])
+                    .with_delay(FIRST_TOKEN_GRACE + Duration::from_millis(200)),
+            ],
+            vec![person("john", true)],
+        );
+        let t0 = Instant::now();
+        r.session
+            .handle_utterance(
+                "what is the capital of France?",
+                Some(&EntityId::new("john")),
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let cmds = drain(&r.commands);
+        let kinds: Vec<&str> = cmds.iter().map(|c| c.1.as_str()).collect();
+        // Once, before the first sentence, and not again for the second
+        // (which is another FIRST_TOKEN_GRACE + 200 ms late).
+        assert_eq!(
+            kinds,
+            ["thinking", "backchannel", "say", "say", "idle"],
+            "{cmds:?}"
+        );
+        assert_eq!(cmds[1].2, THINKING_LINE);
+        assert!(t0.elapsed() >= 2 * FIRST_TOKEN_GRACE);
+    }
+
+    #[tokio::test]
+    async fn prompt_first_token_needs_no_backchannel() {
+        let mut r = rig(
+            vec![Script::text(&["Paris."]).with_delay(Duration::from_millis(30))],
+            vec![],
+        );
+        r.session
+            .handle_utterance(
+                "capital of France?",
+                None,
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(drain(&r.commands).iter().all(|c| c.1 != "backchannel"));
+    }
+
+    #[test]
+    fn same_thought_tolerates_a_reheard_word_but_not_more_question() {
+        let asked = "what is the capital of France?";
+        assert!(same_thought("What is the capital of France?", asked));
+        assert!(same_thought("what is the capital of France please?", asked));
+        assert!(same_thought("what is the capital of France", asked));
+        assert!(!same_thought(
+            "what is the capital of France, and of Spain?",
+            asked
+        ));
+        assert!(!same_thought("what time is it?", asked));
+        assert!(!same_thought("", asked));
     }
 }

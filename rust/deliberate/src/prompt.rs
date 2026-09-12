@@ -438,6 +438,26 @@ impl Conversation {
         self.pending.extend(dropped);
     }
 
+    /// Drop the last user turn and everything the model said or called
+    /// after it. Returns how many messages went.
+    ///
+    /// Two turn-taking cases need a turn unsaid: a reply cut off by
+    /// barge-in whose next utterance continues the same thought (the two
+    /// halves are re-pushed as one user turn), and an early start on a
+    /// deferred transcript that the person then kept talking over (the
+    /// final transcript replaces the partial one). Rewriting history costs
+    /// a prefix cache miss on the local server, but only of the last turn:
+    /// ~100 tokens, a few hundred ms of prefill, against reading the same
+    /// question twice.
+    pub fn retract_last_turn(&mut self) -> usize {
+        let Some(i) = self.history.iter().rposition(|m| m.role == Role::User) else {
+            return 0;
+        };
+        let n = self.history.len() - i;
+        self.history.truncate(i);
+        n
+    }
+
     /// Take the batch to condense, if one is due and no job is running.
     /// The caller must report back with [`Conversation::condensed`] or
     /// [`Conversation::condense_failed`], otherwise the next batch never
@@ -588,6 +608,24 @@ mod tests {
         c.condensed("s".into());
         assert_eq!(c.summary(), "s");
         assert!(c.pending().is_empty());
+    }
+
+    #[test]
+    fn retract_drops_the_last_user_turn_and_its_reply() {
+        let mut c = Conversation::local();
+        c.push(Message::user("one"));
+        c.push(Message::assistant("a1"));
+        c.push(Message::user("two"));
+        let _ = c.prepare(&note("john"), Some("john"));
+        c.push(Message::assistant("half a"));
+        assert_eq!(c.retract_last_turn(), 2);
+        let left: Vec<&str> = c.history().iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(left, ["one", "a1"]);
+        // Nothing to retract is a no-op, not a panic.
+        let mut empty = Conversation::local();
+        empty.push(Message::assistant("hi"));
+        assert_eq!(empty.retract_last_turn(), 0);
+        assert_eq!(empty.history().len(), 1);
     }
 
     #[test]
