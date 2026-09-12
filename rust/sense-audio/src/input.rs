@@ -163,6 +163,12 @@ pub struct MicInput {
 impl MicInput {
     /// Open the microphone. `device` selects by substring of the device
     /// name; `None` is the system default input.
+    ///
+    /// Blocks for as long as macOS shows the microphone-permission prompt
+    /// (TCC): `stream.play()` on an input unit does not return until the
+    /// person has clicked, which from a `.app` bundle is the first thing
+    /// they see. Never call this on the thread that must reach the event
+    /// loop; see [`AudioSenseHandle::attach_later`](crate::AudioSenseHandle::attach_later).
     pub fn open(device: Option<&str>) -> Result<Self, Error> {
         let host = cpal::default_host();
         let dev = match device {
@@ -221,7 +227,27 @@ fn build_stream(
     format: cpal::SampleFormat,
     mut push: impl FnMut(&[f32]) + Send + 'static,
 ) -> Result<cpal::Stream, Error> {
-    let err_cb = |e: cpal::Error| tracing::error!(error = %e, "mic stream error");
+    // `Xrun` here is CoreAudio's `kAudioDeviceProcessorOverload`: the
+    // device's IO cycle missed its deadline, which cpal 0.18 reports on
+    // every firing. It is not our queue (the callback only `try_send`s)
+    // and one is routine at start-up -- observed: exactly one "buffer
+    // underrun" as the input unit spins up while whisper's Metal warm-up
+    // and the window are competing for the machine. A single overrun is
+    // a debug line; a run of them means the audio thread is being starved
+    // and is worth a warning, at power-of-two counts so it cannot flood.
+    let mut overruns: u64 = 0;
+    let err_cb = move |e: cpal::Error| {
+        if e.kind() == cpal::ErrorKind::Xrun {
+            overruns += 1;
+            if overruns == 1 {
+                tracing::debug!(error = %e, "mic overrun (one at start-up is normal)");
+            } else if overruns.is_power_of_two() {
+                tracing::warn!(overruns, error = %e, "mic overruns; audio thread starved");
+            }
+            return;
+        }
+        tracing::error!(error = %e, "mic stream error");
+    };
     let map = |e: cpal::Error| Error::Device(e.to_string());
     let stream = match format {
         cpal::SampleFormat::F32 => {

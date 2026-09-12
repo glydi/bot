@@ -160,7 +160,13 @@ impl TurnGate {
 
 /// Everything the pipeline thread owns.
 pub(crate) struct Pipeline {
-    pub source: Box<dyn FrameSource>,
+    /// `None` until a deferred source is attached (see
+    /// [`AudioSense::spawn_deferred`](crate::AudioSense::spawn_deferred)).
+    pub source: Option<Box<dyn FrameSource>>,
+    /// Where a late source arrives.
+    pub source_rx: Receiver<Box<dyn FrameSource>>,
+    /// Set once frames are being pulled; read by `SourceSlot`.
+    pub listening: Arc<AtomicBool>,
     pub vad: Box<dyn Detector>,
     pub gate: TurnGate,
     pub max_utterance_samples: usize,
@@ -201,10 +207,29 @@ impl Pipeline {
         // "my name is" for "So my name is". Keeping the last few frames and
         // prepending them on speech start costs nothing and fixes it.
         let mut preroll: VecDeque<Vec<f32>> = VecDeque::with_capacity(self.preroll_frames + 1);
-        tracing::info!(source = %self.source.describe(), "listening");
+        if let Some(s) = &self.source {
+            tracing::info!(source = %s.describe(), "listening");
+            self.listening.store(true, Ordering::Release);
+        }
 
         while !self.stop.load(Ordering::Relaxed) {
-            match self.source.pull(&mut frame, Duration::from_millis(500)) {
+            // No source yet (the microphone is still behind the permission
+            // prompt): idle on the slot, and emit nothing -- not even
+            // levels, so the meter shows "no mic" instead of silence.
+            let Some(source) = self.source.as_mut() else {
+                match self.source_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(s) => {
+                        tracing::info!(source = %s.describe(), "listening");
+                        self.source = Some(s);
+                        self.listening.store(true, Ordering::Release);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    // The handle is gone; nothing can ever arrive.
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+                continue;
+            };
+            match source.pull(&mut frame, Duration::from_millis(500)) {
                 Ok(Pull::Frame) => {}
                 Ok(Pull::Idle) => continue,
                 Ok(Pull::Ended) => break,
@@ -287,6 +312,7 @@ impl Pipeline {
                 break;
             }
         }
+        self.listening.store(false, Ordering::Release);
         tracing::info!("pipeline stopped");
     }
 

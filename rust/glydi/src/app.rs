@@ -36,8 +36,8 @@ use memory::{Gates, MemoryWorker, Store, WorkerHandle};
 use mind::rules::cognitive_rules;
 use mind::{Event, Reflex, ReflexHandle, WorldView};
 use parking_lot::Mutex;
-use sense_audio::input::FrameSource;
-use sense_audio::{AudioConfig, AudioSense, AudioSenseHandle};
+use sense_audio::input::{FrameSource, MicInput};
+use sense_audio::{AudioConfig, AudioSense, AudioSenseHandle, SourceOpener};
 use smol_str::SmolStr;
 
 use crate::config::{Config, Tts};
@@ -57,6 +57,15 @@ const EVENT_TAP_CAPACITY: usize = 1024;
 /// Whisper mid-utterance and an LLM turn in flight are the slow cases;
 /// both are cancelled first, so this is generous.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the microphone (and the camera) may take to open before the
+/// run carries on without them and says so. The only thing that takes
+/// this long is the macOS permission prompt, which blocks the open until
+/// someone clicks; 15 s is enough to read the dialog, and the device is
+/// hot-plugged whenever the click comes. Observed without this: a `.app`
+/// launch logged "vad configured" and then hung at 0% CPU, window never
+/// shown, Quit timing out, because the open was on the main thread.
+const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the caller supplies (or leaves default) to change the wiring:
 /// flags from the command line, mocks from tests.
@@ -82,6 +91,12 @@ pub struct Parts {
     pub no_models: bool,
     /// A frame source instead of the microphone (the mock input).
     pub frames: Option<Box<dyn FrameSource>>,
+    /// A frame source *constructor* instead of the microphone, opened the
+    /// way the microphone is: on a helper thread with
+    /// [`DEVICE_OPEN_TIMEOUT`], the sense idling until it returns. Tests
+    /// hand in one that blocks, to stand in for the permission prompt.
+    /// Ignored when `frames` is set.
+    pub open_frames: Option<SourceOpener>,
     /// A synth and output instead of the configured backend.
     pub speaker: Option<(Box<dyn Synth>, Box<dyn Output>)>,
     /// A chat backend for both the conversation and fact extraction,
@@ -112,7 +127,7 @@ pub struct App {
     ui: Option<UiParts>,
     headless: Option<Headless>,
     #[cfg(feature = "vision")]
-    vision: Option<sense_vision::VisionSenseHandle>,
+    vision: Option<DeferredVision>,
     audio: Option<AudioSenseHandle>,
     speaker: Option<SpeakerHandle>,
     bridges: Vec<JoinHandle<()>>,
@@ -303,6 +318,27 @@ impl App {
             move || mind_bridge(&mind_rx, &tx, &view, &*clock)
         })?);
 
+        // -- ui ---------------------------------------------------------
+        // Before the devices: the window's inputs are only channels, and
+        // `main` needs them the moment `build` returns to reach the event
+        // loop. Everything below is either instant or deferred to a helper
+        // thread, so a microphone stuck behind the permission prompt no
+        // longer stands between the person and the window.
+        let sources = ui_sources(&reflex, epoch);
+        let (ui, headless) = if parts.headless {
+            let h = Headless::spawn(ui_rx, ui_obs_rx).context("spawning headless ui")?;
+            (None, Some(h))
+        } else {
+            (
+                Some(UiParts {
+                    commands: ui_rx,
+                    observations: ui_obs_rx,
+                    sources,
+                }),
+                None,
+            )
+        };
+
         // -- speaker ----------------------------------------------------
         let self_speaking = Arc::new(AtomicBool::new(false));
         let speaker = spawn_speaker(
@@ -333,22 +369,6 @@ impl App {
             Arc::clone(&clock),
             obs_tx.clone(),
         );
-
-        // -- ui ---------------------------------------------------------
-        let sources = ui_sources(&reflex, epoch);
-        let (ui, headless) = if parts.headless {
-            let h = Headless::spawn(ui_rx, ui_obs_rx).context("spawning headless ui")?;
-            (None, Some(h))
-        } else {
-            (
-                Some(UiParts {
-                    commands: ui_rx,
-                    observations: ui_obs_rx,
-                    sources,
-                }),
-                None,
-            )
-        };
 
         Ok(Self {
             clock,
@@ -410,11 +430,20 @@ impl App {
         self.reflex.as_deref()
     }
 
-    /// Whether the microphone (or mock) stage is running.
+    /// Whether the microphone (or mock) stage is running. True while the
+    /// sense waits for a deferred microphone too; see
+    /// [`audio_listening`](Self::audio_listening) for frames flowing.
     pub fn audio_running(&self) -> bool {
         self.audio
             .as_ref()
             .is_some_and(AudioSenseHandle::is_running)
+    }
+
+    /// Whether the audio sense has a source and is pulling frames from it.
+    pub fn audio_listening(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(AudioSenseHandle::is_listening)
     }
 
     /// Take the window's inputs. `None` when headless or already taken.
@@ -446,8 +475,15 @@ impl App {
         tracing::info!("stopping");
         #[cfg(feature = "vision")]
         if let Some(v) = self.vision.take() {
-            join_timeout("vision", move || v.stop(), JOIN_TIMEOUT);
+            // A camera still behind its prompt is simply never taken; the
+            // opener thread stops it itself when it finally returns.
+            if let Some(h) = v.take() {
+                join_timeout("vision", move || h.stop(), JOIN_TIMEOUT);
+            }
         }
+        // With no source attached the pipeline is polling its slot at
+        // 500 ms, so this returns promptly; the thread stuck in the
+        // permission prompt (if any) is detached and not waited for.
         if let Some(mut a) = self.audio.take() {
             join_timeout("audio", move || a.stop(), JOIN_TIMEOUT);
         }
@@ -787,6 +823,10 @@ fn spawn_audio(
         };
     }
 
+    // The mock source (tests, the bench) is opened already: hand it over
+    // and start. The microphone is opened *after* the sense is up, on a
+    // helper thread with a deadline, because the open blocks in the
+    // permission prompt on first launch; see `DEVICE_OPEN_TIMEOUT`.
     let source: Option<Box<dyn FrameSource>> = parts.frames.take();
     let attempt = |cfg: AudioConfig, source: Option<Box<dyn FrameSource>>| match source {
         Some(s) => AudioSense::spawn_with_source(
@@ -796,7 +836,7 @@ fn spawn_audio(
             tx.clone(),
             Arc::clone(self_speaking),
         ),
-        None => AudioSense::spawn(
+        None => AudioSense::spawn_deferred(
             cfg,
             Arc::clone(clock),
             tx.clone(),
@@ -804,15 +844,11 @@ fn spawn_audio(
         ),
     };
     // The mock source is consumed by the first attempt; a retry without
-    // models only makes sense for the real microphone.
-    let retry_source = source.is_none();
-    match attempt(cfg.clone(), source) {
+    // models only makes sense for the deferred microphone.
+    let deferred = source.is_none();
+    let handle = match attempt(cfg.clone(), source) {
         Ok(h) => Some(h),
-        Err(sense_audio::Error::Device(e)) => {
-            tracing::warn!(error = %e, "microphone unavailable; audio sense disabled");
-            None
-        }
-        Err(e) if retry_source => {
+        Err(e) if deferred => {
             tracing::warn!(error = %e, "speech models failed to load; running VAD only");
             match attempt(cfg.without_models(), None) {
                 Ok(h) => Some(h),
@@ -826,7 +862,17 @@ fn spawn_audio(
             tracing::warn!(error = %e, "audio sense disabled");
             None
         }
+    };
+    if deferred && let Some(h) = &handle {
+        let open: SourceOpener = parts.open_frames.take().unwrap_or_else(|| {
+            let device = config.mic_device.clone();
+            Box::new(move || {
+                MicInput::open(device.as_deref()).map(|m| Box::new(m) as Box<dyn FrameSource>)
+            })
+        });
+        h.attach_later(DEVICE_OPEN_TIMEOUT, open);
     }
+    handle
 }
 
 /// `Some(path)` if the file exists, else a warning and `None`: the stage
@@ -840,6 +886,36 @@ fn present(what: &str, path: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+/// The camera, opened on a helper thread: [`VisionSense::spawn`] returns
+/// only once the device is up, and on macOS that can mean the camera
+/// permission prompt, the same start-up hang the microphone had. The
+/// handle lands in the slot when the open finishes; [`App::stop`] takes
+/// whatever is there and marks the slot closed so a late arrival stops
+/// itself instead of running a camera nobody reads.
+#[cfg(feature = "vision")]
+struct DeferredVision {
+    slot: Arc<Mutex<VisionSlot>>,
+}
+
+#[cfg(feature = "vision")]
+enum VisionSlot {
+    Pending,
+    Ready(sense_vision::VisionSenseHandle),
+    Closed,
+}
+
+#[cfg(feature = "vision")]
+impl DeferredVision {
+    /// Take the handle if the camera opened; either way, no later arrival
+    /// is kept.
+    fn take(&self) -> Option<sense_vision::VisionSenseHandle> {
+        match std::mem::replace(&mut *self.slot.lock(), VisionSlot::Closed) {
+            VisionSlot::Ready(h) => Some(h),
+            VisionSlot::Pending | VisionSlot::Closed => None,
+        }
+    }
+}
+
 #[cfg(feature = "vision")]
 fn spawn_vision(
     config: &Config,
@@ -847,7 +923,7 @@ fn spawn_vision(
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     tx: RingSender,
-) -> Option<sense_vision::VisionSenseHandle> {
+) -> Option<DeferredVision> {
     use sense_vision::{Source, VisionConfig, VisionSense};
     if parts.no_camera {
         tracing::info!("camera off (--no-camera)");
@@ -872,13 +948,46 @@ fn spawn_vision(
         return None;
     }
     let gallery: Arc<dyn sense_vision::FaceGallery> = Arc::new(StoreFaces(store));
-    match VisionSense::spawn(cfg, clock, tx, gallery) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            tracing::warn!(error = %e, "camera unavailable; running voice-only");
-            None
+    let slot = Arc::new(Mutex::new(VisionSlot::Pending));
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+    let opener = spawn_named("glydi-camera-open", {
+        let slot = Arc::clone(&slot);
+        move || {
+            let result = VisionSense::spawn(cfg, clock, tx, gallery);
+            let _ = done_tx.send(());
+            match result {
+                Ok(h) => {
+                    let mut guard = slot.lock();
+                    match *guard {
+                        VisionSlot::Pending => *guard = VisionSlot::Ready(h),
+                        // The app stopped while we were in the prompt.
+                        VisionSlot::Ready(_) | VisionSlot::Closed => {
+                            drop(guard);
+                            h.stop();
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "camera unavailable; running voice-only"),
+            }
         }
+    });
+    if let Err(e) = opener {
+        tracing::warn!(error = %e, "camera opener not started; running voice-only");
+        return None;
     }
+    // Only for the log line: the opener itself is not waited on.
+    if let Err(e) = spawn_named("glydi-camera-wait", move || {
+        if done_rx.recv_timeout(DEVICE_OPEN_TIMEOUT).is_err() {
+            tracing::warn!(
+                timeout = ?DEVICE_OPEN_TIMEOUT,
+                "camera not open yet -- allow GLYDI under System Settings > Privacy & Security > \
+                 Camera; running voice-only for now"
+            );
+        }
+    }) {
+        tracing::debug!(error = %e, "camera wait thread not started");
+    }
+    Some(DeferredVision { slot })
 }
 
 /// The debug panel's readers, over the reflex's lock-free snapshots.
@@ -937,5 +1046,98 @@ impl sense_vision::FaceGallery for StoreFaces {
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), sense_vision::Error> {
         memory::FaceGallery::enrol(&*self.0, id.clone(), emb)
             .map_err(|e| sense_vision::Error::Model(e.to_string()))
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use act_speaker::{MockSynth, NullOutput, SAMPLE_RATE};
+    use deliberate::mock::MockLlm;
+    use sense_audio::mock::MockInput;
+
+    fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    fn parts(open_frames: SourceOpener, tag: &str) -> (Parts, PathBuf) {
+        let db = std::env::temp_dir().join(format!("glydi-app-{tag}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let p = Parts {
+            headless: true,
+            no_camera: true,
+            no_models: true,
+            db: Some(db.clone()),
+            open_frames: Some(open_frames),
+            speaker: Some((
+                Box::new(MockSynth::new()),
+                Box::new(NullOutput::new(SAMPLE_RATE)),
+            )),
+            backend: Some(MockLlm::new(vec![]) as Arc<dyn ChatBackend>),
+            ..Parts::default()
+        };
+        (p, db)
+    }
+
+    /// The observed failure: a microphone open that blocks in the
+    /// permission prompt. Build must return at once (the window needs the
+    /// main thread), the sense must be up and waiting, and stop must not
+    /// wait for the prompt.
+    #[test]
+    fn build_and_stop_do_not_wait_for_a_blocked_microphone() {
+        let config = Config::load(None).expect("defaults load");
+        let (parts, db) = parts(
+            Box::new(|| {
+                std::thread::sleep(Duration::from_secs(20));
+                Ok(Box::new(MockInput::tone_with_silence(0.1, 0.1, 0.1, 0.3))
+                    as Box<dyn FrameSource>)
+            }),
+            "blocked",
+        );
+        let t0 = Instant::now();
+        let app = App::build(&config, parts).expect("builds");
+        let built = t0.elapsed();
+        assert!(built < Duration::from_secs(2), "build took {built:?}");
+        assert!(app.audio_running(), "the sense waits for its source");
+        assert!(!app.audio_listening(), "nothing to listen to yet");
+
+        let t1 = Instant::now();
+        app.stop();
+        let stopped = t1.elapsed();
+        assert!(stopped < Duration::from_secs(6), "stop took {stopped:?}");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The prompt answered: the source arrives after build and the sense
+    /// hot-plugs it, so observations reach the reflex.
+    #[test]
+    fn late_microphone_is_attached_and_heard() {
+        let config = Config::load(None).expect("defaults load");
+        let (parts, db) = parts(
+            Box::new(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(
+                    Box::new(MockInput::tone_with_silence(0.2, 1.0, 1.0, 0.3).realtime(true))
+                        as Box<dyn FrameSource>,
+                )
+            }),
+            "late",
+        );
+        let app = App::build(&config, parts).expect("builds");
+        let before = app.reflex().expect("reflex").stats().observations;
+        assert!(wait_for(Duration::from_secs(3), || app.audio_listening()));
+        assert!(wait_for(Duration::from_secs(3), || {
+            app.reflex().expect("reflex").stats().observations > before
+        }));
+        app.stop();
+        let _ = std::fs::remove_file(&db);
     }
 }

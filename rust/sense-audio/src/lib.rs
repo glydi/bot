@@ -40,8 +40,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use common::{Clock, RingSender};
+use crossbeam_channel::{Sender, TrySendError};
 use smol_str::SmolStr;
 
 use crate::input::{FrameSource, MicInput};
@@ -294,15 +296,141 @@ fn open_vad(
     }
 }
 
+/// The constructor a deferred source is opened with, on a helper thread
+/// (see [`AudioSenseHandle::attach_later`]).
+pub type SourceOpener = Box<dyn FnOnce() -> Result<Box<dyn FrameSource>, Error> + Send>;
+
+/// Where a late source is handed in: the sending half of the pipeline's
+/// one-slot source channel. Cloneable and `Send`, so the thread that
+/// finally gets the microphone (after the permission prompt) can attach it
+/// without holding the [`AudioSenseHandle`], which the app owns.
+#[derive(Clone)]
+pub struct SourceSlot {
+    tx: Sender<Box<dyn FrameSource>>,
+    listening: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SourceSlot {
+    /// Hand the pipeline its source. Fails if the pipeline has already
+    /// stopped (the source is returned inside the error so it is dropped
+    /// here, closing the device) or if a source is already queued.
+    pub fn attach(&self, source: Box<dyn FrameSource>) -> Result<(), Error> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(Error::Device("audio sense has stopped".into()));
+        }
+        match self.tx.try_send(source) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(Error::Device("audio sense has stopped".into()))
+            }
+            Err(TrySendError::Full(_)) => Err(Error::Device(
+                "a source is already waiting to be attached".into(),
+            )),
+        }
+    }
+
+    /// Whether the pipeline has taken a source and is pulling frames.
+    pub fn is_listening(&self) -> bool {
+        self.listening.load(Ordering::Acquire)
+    }
+}
+
 /// The running sense. Dropping it stops the threads.
 pub struct AudioSenseHandle {
     stop: Arc<AtomicBool>,
     pipeline: Option<JoinHandle<()>>,
     worker: Option<JoinHandle<()>>,
     stats: Arc<Stats>,
+    slot: SourceSlot,
 }
 
 impl AudioSenseHandle {
+    /// Give a sense started by [`AudioSense::spawn_deferred`] its frames.
+    /// See [`SourceSlot::attach`].
+    pub fn attach(&self, source: Box<dyn FrameSource>) -> Result<(), Error> {
+        self.slot.attach(source)
+    }
+
+    /// A detachable way to [`attach`](Self::attach) from another thread.
+    pub fn slot(&self) -> SourceSlot {
+        self.slot.clone()
+    }
+
+    /// Whether frames are being pulled: a source was attached (or given at
+    /// spawn) and the pipeline thread is on it.
+    pub fn is_listening(&self) -> bool {
+        self.is_running() && self.slot.is_listening()
+    }
+
+    /// Open a source on a helper thread and attach it whenever it arrives,
+    /// warning after `deadline` if it has not.
+    ///
+    /// Why a thread and a deadline: on macOS the first `MicInput::open`
+    /// from a bundled app blocks *inside* the system microphone-permission
+    /// prompt (TCC) until the person clicks Allow. Observed: the process
+    /// logged "vad configured" and then sat at 0% CPU forever, because the
+    /// open ran on the main thread before the event loop existed -- so the
+    /// window never appeared and even Quit (an `AppleEvent`) timed out. The
+    /// open now runs here, the caller carries on without frames, and the
+    /// mic is hot-plugged the moment the prompt is answered. Both helper
+    /// threads are detached: a prompt nobody answers must not hold up
+    /// shutdown either.
+    ///
+    /// If the open fails, or the sense stops before it returns, the source
+    /// is dropped (closing the device) and the failure is a warning: the
+    /// bot stays up without a microphone, as it did before with a missing
+    /// camera.
+    pub fn attach_later(&self, deadline: Duration, open: SourceOpener) {
+        let slot = self.slot();
+        let (tx, rx) = crossbeam_channel::bounded::<Result<Box<dyn FrameSource>, Error>>(1);
+        let opener = std::thread::Builder::new()
+            .name("audio-open".into())
+            .spawn(move || {
+                let _ = tx.send(open());
+            });
+        if let Err(e) = opener {
+            tracing::warn!(error = %e, "could not start the source opener; running without audio");
+            return;
+        }
+        let waiter = std::thread::Builder::new()
+            .name("audio-attach".into())
+            .spawn(move || {
+                let result = match rx.recv_timeout(deadline) {
+                    Ok(r) => r,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            ?deadline,
+                            "microphone not open yet -- on macOS this is the permission \
+                             prompt: allow GLYDI under System Settings > Privacy & Security > \
+                             Microphone; running without it for now"
+                        );
+                        match rx.recv() {
+                            Ok(r) => r,
+                            // The opener panicked; nothing to attach.
+                            Err(_) => return,
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                };
+                match result {
+                    Ok(source) => {
+                        let what = source.describe();
+                        match slot.attach(source) {
+                            Ok(()) => tracing::info!(source = %what, "microphone attached"),
+                            Err(e) => tracing::info!(error = %e, "late microphone not attached"),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "microphone unavailable; running without it");
+                    }
+                }
+            });
+        if let Err(e) = waiter {
+            tracing::warn!(error = %e, "could not start the source attacher; running without audio");
+        }
+    }
+
     /// Stop listening and wait for both threads. The worker finishes any
     /// utterance it is on, so a sentence spoken just before stop is not
     /// lost.
@@ -375,7 +503,30 @@ impl AudioSense {
         // for the first seconds of every run.
         let prepared = Self::prepare(&config)?;
         let mic = MicInput::open(config.device.as_deref())?;
-        Self::start(config, prepared, Box::new(mic), clock, tx, self_speaking)
+        Self::start(
+            config,
+            prepared,
+            Some(Box::new(mic)),
+            clock,
+            tx,
+            self_speaking,
+        )
+    }
+
+    /// Load the models and start the threads with *no* source: the
+    /// pipeline idles (emitting nothing) until one is handed in through
+    /// [`AudioSenseHandle::attach`], usually from
+    /// [`AudioSenseHandle::attach_later`]. What the app uses for the real
+    /// microphone, so a permission prompt cannot stall start-up; see there
+    /// for the failure this replaces.
+    pub fn spawn_deferred(
+        config: AudioConfig,
+        clock: Arc<dyn Clock>,
+        tx: RingSender,
+        self_speaking: Arc<AtomicBool>,
+    ) -> Result<AudioSenseHandle, Error> {
+        let prepared = Self::prepare(&config)?;
+        Self::start(config, prepared, None, clock, tx, self_speaking)
     }
 
     /// Like [`spawn`](Self::spawn) but with any [`FrameSource`]: the mock
@@ -388,7 +539,7 @@ impl AudioSense {
         self_speaking: Arc<AtomicBool>,
     ) -> Result<AudioSenseHandle, Error> {
         let prepared = Self::prepare(&config)?;
-        Self::start(config, prepared, source, clock, tx, self_speaking)
+        Self::start(config, prepared, Some(source), clock, tx, self_speaking)
     }
 
     /// Load the models and configure the VAD, on the caller's thread so a
@@ -451,11 +602,12 @@ impl AudioSense {
         })
     }
 
-    /// Start the pipeline and worker threads over an open source.
+    /// Start the pipeline and worker threads, over `source` if there is
+    /// one, otherwise waiting for [`AudioSenseHandle::attach`].
     fn start(
         config: AudioConfig,
         prepared: Prepared,
-        source: Box<dyn FrameSource>,
+        source: Option<Box<dyn FrameSource>>,
         clock: Arc<dyn Clock>,
         tx: RingSender,
         self_speaking: Arc<AtomicBool>,
@@ -472,9 +624,20 @@ impl AudioSense {
         // One in flight plus one queued. A third means whisper is more than
         // a turn behind, and answering stale speech is worse than dropping.
         let (jobs_tx, jobs_rx) = crossbeam_channel::bounded(2);
+        // One slot: a source attached while another waits is a bug in the
+        // caller, and `attach` reports it rather than queueing devices.
+        let (source_tx, source_rx) = crossbeam_channel::bounded(1);
+        let listening = Arc::new(AtomicBool::new(false));
+        let slot = SourceSlot {
+            tx: source_tx,
+            listening: Arc::clone(&listening),
+            stop: Arc::clone(&stop),
+        };
 
         let pipeline = Pipeline {
             source,
+            source_rx,
+            listening,
             vad,
             gate: TurnGate::new(judge, config.max_deferrals),
             max_utterance_samples: (config.max_utterance_secs * config.sample_rate as f32) as usize,
@@ -512,6 +675,113 @@ impl AudioSense {
             pipeline: Some(pipeline),
             worker: Some(worker),
             stats,
+            slot,
         })
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::time::Instant;
+
+    use common::{ObservationRing, Payload, RealClock};
+
+    use super::*;
+    use crate::mock::MockInput;
+
+    fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    fn deferred() -> (AudioSenseHandle, common::RingReceiver) {
+        let mut cfg = AudioConfig::default().without_models();
+        cfg.warm_up = false;
+        let (tx, rx) = ObservationRing::bounded(4096);
+        let h = AudioSense::spawn_deferred(
+            cfg,
+            Arc::new(RealClock),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("no models, nothing to fail");
+        (h, rx)
+    }
+
+    #[test]
+    fn deferred_sense_idles_then_hears_a_late_source() {
+        let (mut h, rx) = deferred();
+        assert!(h.is_running());
+        assert!(!h.is_listening(), "nothing to listen to yet");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50))
+                .is_ok_and(|o| o.is_none()),
+            "an idle pipeline emits nothing, not even levels"
+        );
+
+        let tone = MockInput::tone_with_silence(0.2, 1.0, 1.0, 0.3);
+        h.attach(Box::new(tone)).expect("pipeline is running");
+        // The mock ends by itself (in milliseconds, unpaced); the pipeline
+        // drains it and stops, which is the proof it was attached.
+        assert!(wait_for(Duration::from_secs(3), || !h.is_running()));
+        h.join();
+        let mut seen = Vec::new();
+        while let Ok(Some(o)) = rx.recv_timeout(Duration::from_millis(50)) {
+            seen.push(o);
+        }
+        let activity: Vec<bool> = seen
+            .iter()
+            .filter(|o| o.modality == "voice_activity")
+            .filter_map(|o| match o.payload {
+                Payload::Bool(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activity, vec![true, false], "{seen:?}");
+        assert!(seen.iter().any(|o| o.modality == "audio_level"));
+    }
+
+    #[test]
+    fn attach_later_hands_over_after_the_deadline() {
+        let (mut h, rx) = deferred();
+        // The "prompt": the constructor takes longer than the deadline, so
+        // the warn path runs, and the source still arrives afterwards.
+        h.attach_later(
+            Duration::from_millis(50),
+            Box::new(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(Box::new(MockInput::tone_with_silence(0.1, 0.5, 1.0, 0.3))
+                    as Box<dyn FrameSource>)
+            }),
+        );
+        assert!(!h.is_listening());
+        assert!(wait_for(Duration::from_secs(3), || !h.is_running()));
+        h.join();
+        let mut n = 0;
+        while let Ok(Some(_)) = rx.recv_timeout(Duration::from_millis(50)) {
+            n += 1;
+        }
+        assert!(n > 0, "observations flowed from the late source");
+    }
+
+    #[test]
+    fn stop_while_no_source_is_prompt_and_drops_a_late_one() {
+        let (mut h, _rx) = deferred();
+        let slot = h.slot();
+        let t0 = Instant::now();
+        h.stop();
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert!(!h.is_running());
+        // Whoever finally opens the device learns it is not wanted.
+        let late = Box::new(MockInput::tone_with_silence(0.1, 0.1, 0.1, 0.3));
+        assert!(slot.attach(late).is_err());
     }
 }

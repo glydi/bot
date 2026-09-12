@@ -12,12 +12,26 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use deliberate::OpenAiBackend;
+use sense_audio::input::{FrameSource, MicInput, Pull};
+use sense_audio::vad::FRAMES_PER_BUFFER;
 
 use crate::config::{Config, Tts};
 
 /// How long to wait for the model server. Local Ollama answers `/models`
 /// in milliseconds; anything past this is "not running".
 const LLM_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long the microphone gets to open before the check calls it
+/// "prompt pending". Opening a stream is milliseconds once permission is
+/// granted; the only thing that takes longer is the macOS prompt itself,
+/// which blocks the open until someone clicks (the same block that hung
+/// the `.app` at start-up before the sense deferred it).
+const MIC_OPEN_PROBE: Duration = Duration::from_secs(3);
+
+/// How long to listen for the first frame once the stream is open. A
+/// denied microphone opens fine and delivers silence forever; a granted
+/// one delivers ~10 ms chunks at once.
+const MIC_FIRST_FRAME: Duration = Duration::from_secs(1);
 
 /// One line of the report.
 pub struct Line {
@@ -49,6 +63,7 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
         ort(&config.ort_lib),
         db(&config.db),
         mic(config.mic_device.as_deref()),
+        mic_permission(config.mic_device.as_deref()),
         camera(),
         llm(config),
         speaker(tts.unwrap_or(config.tts)),
@@ -147,6 +162,54 @@ fn mic(device: Option<&str>) -> Line {
         what: "microphone",
         ok: found.is_some(),
         required: true,
+        detail,
+    }
+}
+
+/// The TCC state, observed rather than queried: open the stream on a
+/// helper thread and see whether it returns in time and whether audio
+/// then flows. Without `AVCaptureDevice.authorizationStatus` (an
+/// `AVFoundation` dependency this crate does not carry) that is the best
+/// non-blocking read of it; the helper is detached, so a prompt left
+/// unanswered does not hang the check. Running this *is* what triggers the
+/// prompt on first use, which is a feature: better here than mid-run.
+fn mic_permission(device: Option<&str>) -> Line {
+    let device = device.map(str::to_owned);
+    let (tx, rx) = crossbeam_channel::bounded::<Result<(bool, f32), String>>(1);
+    let spawned = std::thread::Builder::new()
+        .name("check-mic-open".into())
+        .spawn(move || {
+            let probe = MicInput::open(device.as_deref())
+                .map_err(|e| e.to_string())
+                .map(|mut mic| {
+                    let mut frame = vec![0.0f32; FRAMES_PER_BUFFER];
+                    match mic.pull(&mut frame, MIC_FIRST_FRAME) {
+                        Ok(Pull::Frame) => (true, sense_audio::vad::rms(&frame)),
+                        _ => (false, 0.0),
+                    }
+                });
+            let _ = tx.send(probe);
+        });
+    let settings = "allow GLYDI under System Settings > Privacy & Security > Microphone";
+    let (ok, detail) = match spawned.map(|_| rx.recv_timeout(MIC_OPEN_PROBE)) {
+        Ok(Ok(Ok((true, rms)))) => (true, format!("granted (audio flowing, rms {rms:.4})")),
+        Ok(Ok(Ok((false, _)))) => (
+            false,
+            format!("stream open but silent after {MIC_FIRST_FRAME:?}: denied? -- {settings}"),
+        ),
+        Ok(Ok(Err(e))) => (false, format!("could not open: {e}")),
+        Ok(Err(_)) => (
+            false,
+            format!("no answer in {MIC_OPEN_PROBE:?}: prompt pending / denied? -- {settings}"),
+        ),
+        Err(e) => (false, format!("probe thread not started: {e}")),
+    };
+    Line {
+        what: "mic permission",
+        ok,
+        // A pending prompt on first run must not fail the check outright;
+        // the detail says what to do.
+        required: false,
         detail,
     }
 }
