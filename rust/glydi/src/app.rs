@@ -135,6 +135,7 @@ pub struct App {
     deliberator: Option<DeliberatorHandle>,
     tee: Option<TeeHandle>,
     stash: Option<JoinHandle<()>>,
+    timeline_thread: Option<JoinHandle<()>>,
     reflex: Option<Arc<ReflexHandle>>,
     memory: Option<WorkerHandle>,
 }
@@ -174,7 +175,10 @@ impl App {
         // name given later can be bound to the face and voice that gave it.
         let (front_tx, front_rx) = ObservationRing::bounded(RING_CAPACITY);
         let (stash_tx, stash_rx) = ObservationRing::bounded(RING_CAPACITY);
-        let mut outs = vec![reflex_tx, stash_tx];
+        // Per-turn latency: "why is it slow" from one log line per turn.
+        let timeline = Arc::new(common::TurnTimeline::new());
+        let (tl_tx, tl_rx) = ObservationRing::bounded(RING_CAPACITY);
+        let mut outs = vec![reflex_tx, stash_tx, tl_tx];
         let ui_obs_rx = want_ui_obs.then(|| {
             let (tx, rx) = ObservationRing::bounded(RING_CAPACITY);
             outs.push(tx);
@@ -288,10 +292,19 @@ impl App {
             let view = reflex.view();
             move || stash_strangers(&stash_rx, &store, &view)
         })?);
+        let timeline_thread = Some(spawn_named("glydi-timeline", {
+            let tl = Arc::clone(&timeline);
+            move || {
+                while let Some(o) = tl_rx.recv() {
+                    tl.observe(&o);
+                }
+            }
+        })?);
         let mut bridges = Vec::new();
         let (speaker_cmd_tx, speaker_cmd_rx) = crossbeam_channel::unbounded();
-        bridges.push(spawn_named("glydi-speaker-bridge", move || {
-            speaker_bridge(&speaker_rx, &speaker_cmd_tx, &last_reply);
+        bridges.push(spawn_named("glydi-speaker-bridge", {
+            let tl = Arc::clone(&timeline);
+            move || speaker_bridge(&speaker_rx, &speaker_cmd_tx, &last_reply, &tl)
         })?);
         bridges.push(spawn_named("glydi-intent-bridge", {
             let intents = deliberator.as_ref().map(DeliberatorHandle::intent_sender);
@@ -324,7 +337,7 @@ impl App {
         // loop. Everything below is either instant or deferred to a helper
         // thread, so a microphone stuck behind the permission prompt no
         // longer stands between the person and the window.
-        let sources = ui_sources(&reflex, epoch);
+        let sources = ui_sources(&reflex, &timeline, epoch);
         let (ui, headless) = if parts.headless {
             let h = Headless::spawn(ui_rx, ui_obs_rx).context("spawning headless ui")?;
             (None, Some(h))
@@ -388,6 +401,7 @@ impl App {
             deliberator,
             tee,
             stash,
+            timeline_thread,
             reflex: Some(reflex),
             memory: Some(memory),
         })
@@ -519,6 +533,9 @@ impl App {
         if let Some(h) = self.stash.take() {
             join_timeout("stash", move || h.join().ok(), JOIN_TIMEOUT);
         }
+        if let Some(h) = self.timeline_thread.take() {
+            join_timeout("timeline", move || h.join().ok(), JOIN_TIMEOUT);
+        }
         if let Some(r) = self.reflex.take() {
             match Arc::try_unwrap(r) {
                 Ok(h) => {
@@ -592,8 +609,10 @@ fn speaker_bridge(
     from: &Receiver<Command>,
     to: &crossbeam_channel::Sender<Command>,
     last_reply: &Mutex<String>,
+    timeline: &common::TurnTimeline,
 ) {
     for c in from {
+        timeline.command(&c);
         if c.kind == "say"
             && let Some(text) = c.payload.as_text()
         {
@@ -991,12 +1010,20 @@ fn spawn_vision(
 }
 
 /// The debug panel's readers, over the reflex's lock-free snapshots.
-fn ui_sources(reflex: &Arc<ReflexHandle>, epoch: Instant) -> Sources {
+fn ui_sources(
+    reflex: &Arc<ReflexHandle>,
+    timeline: &Arc<common::TurnTimeline>,
+    epoch: Instant,
+) -> Sources {
     let view = reflex.view();
     let events = Arc::clone(reflex);
     let mut s = Sources::empty(epoch);
     s.view = Box::new(move || view.load_full());
     s.events = Box::new(move |n| events.recent_events(n));
+    s.latency = Some(Box::new({
+        let tl = Arc::clone(timeline);
+        move || tl.recent()
+    }));
     s
 }
 
