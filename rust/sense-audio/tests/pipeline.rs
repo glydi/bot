@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use ::common::{EntityHint, ObservationRing, RealClock};
 use common::{config_with_models, drain, events, run_to_end};
+use sense_audio::input::{FrameSource, Pull};
 use sense_audio::mock::MockInput;
 use sense_audio::turn::{SmartTurn, TurnJudge};
+use sense_audio::vad::{Detector, FRAMES_PER_BUFFER, SileroVad};
 use sense_audio::voiceid::{InMemoryGallery, VoiceGallery};
 use sense_audio::wav::load_wav;
 use sense_audio::{AudioConfig, AudioSense};
@@ -93,6 +95,101 @@ fn stop_returns_promptly() {
     h.stop();
     assert!(!h.is_running());
     assert!(t0.elapsed() < Duration::from_secs(1));
+}
+
+/// The Silero model path, or `None` (with a note) if it or the runtime is
+/// missing. Kept apart from `config_with_models` so this test runs without
+/// whisper and the turn model on disk.
+fn silero_model() -> Option<std::path::PathBuf> {
+    let root = common::repo_root();
+    let model = root.join(sense_audio::DEFAULT_VAD_MODEL);
+    if !model.is_file() {
+        eprintln!(
+            "skipping: silero model not present at {} (curl -L the URL in sense_audio::vad)",
+            model.display()
+        );
+        return None;
+    }
+    let ort = AudioConfig::default().ort_lib;
+    if !ort.is_file() {
+        eprintln!("skipping: onnxruntime not present at {}", ort.display());
+        return None;
+    }
+    Some(model)
+}
+
+#[test]
+fn vad_model_present_matches_the_disk() {
+    let models = common::repo_root().join("models");
+    assert_eq!(
+        sense_audio::vad_model_present(&models),
+        models.join("vad/silero_vad.onnx").is_file()
+    );
+    assert!(!sense_audio::vad_model_present("/nonexistent"));
+}
+
+/// The reason Silero exists here: a pure tone (a bell, a whistle) must not
+/// be voice activity, and a sentence must.
+#[test]
+fn silero_ignores_a_tone_and_hears_speech() {
+    let Some(model) = silero_model() else {
+        return;
+    };
+    let mut cfg = AudioConfig::default().without_models();
+    cfg.vad_model = Some(model.clone());
+
+    // Frame-level probabilities first, so a failure says how close it was.
+    let mut vad = SileroVad::open(&model, &cfg.ort_lib).unwrap_or_else(|e| panic!("{e}"));
+    vad.warm_up().unwrap_or_else(|e| panic!("{e}"));
+    let mut tone = MockInput::tone_with_silence(0.5, 1.0, 1.0, 0.3);
+    let mut frame = vec![0.0f32; FRAMES_PER_BUFFER];
+    let mut tone_max = 0.0f32;
+    let t0 = std::time::Instant::now();
+    let mut n = 0;
+    while let Ok(Pull::Frame) = tone.pull(&mut frame, Duration::from_millis(1)) {
+        tone_max = tone_max.max(vad.infer(&frame).unwrap_or_else(|e| panic!("{e}")));
+        n += 1;
+    }
+    let per_frame = t0.elapsed() / n;
+    vad.reset();
+    let speech = clip("complete.wav");
+    let speech_max = speech
+        .chunks(FRAMES_PER_BUFFER)
+        .map(|f| vad.infer(f).unwrap_or_else(|e| panic!("{e}")))
+        .fold(0.0f32, f32::max);
+    eprintln!(
+        "silero: tone max p={tone_max:.3}, speech max p={speech_max:.3}, {per_frame:?}/frame"
+    );
+    assert!(tone_max < 0.5, "tone scored {tone_max}");
+    assert!(speech_max > 0.5, "speech scored {speech_max}");
+    assert!(
+        per_frame < Duration::from_millis(8),
+        "{per_frame:?} per frame"
+    );
+
+    // And through the pipeline, which the energy VAD would fail (it fires
+    // on this very tone in `vad_starts_and_stops_on_a_tone`).
+    let obs = run_to_end(
+        cfg.clone(),
+        Box::new(MockInput::tone_with_silence(0.5, 1.0, 1.0, 0.3)),
+    );
+    assert!(events(&obs).is_empty(), "{:?}", events(&obs));
+
+    let src =
+        MockInput::from_wav(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/complete.wav"))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .with_trailing_silence(1.0);
+    let obs = run_to_end(cfg, Box::new(src));
+    let ev = events(&obs);
+    assert_eq!(
+        ev,
+        vec![
+            ("voice_activity".to_string(), Some(true)),
+            ("voice_activity".to_string(), Some(false)),
+            ("turn_ended".to_string(), Some(true)),
+        ],
+        "{ev:?}"
+    );
 }
 
 fn clip(name: &str) -> Vec<f32> {

@@ -49,7 +49,8 @@ pub use crate::pipeline::{MAX_DEFERRALS, Stats};
 use crate::pipeline::{Pipeline, TurnGate, Worker};
 use crate::stt::{Transcriber, Whisper};
 use crate::turn::{SmartTurn, TurnJudge};
-use crate::vad::{Detector, EnergyVad};
+pub use crate::vad::DEFAULT_VAD_MODEL;
+use crate::vad::{Detector, EnergyVad, SileroVad};
 use crate::voiceid::{Encoder, InMemoryGallery, VoiceGallery};
 
 /// Everything that can go wrong in this crate.
@@ -150,6 +151,10 @@ pub struct AudioConfig {
     pub whisper_model: Option<PathBuf>,
     /// ECAPA ONNX model; `None` disables speaker id.
     pub voiceid_model: Option<PathBuf>,
+    /// Silero VAD ONNX model. When set and loadable, voice activity means
+    /// *speech* (bells, music and typing stay silent); otherwise the energy
+    /// VAD runs, with a warning, and `voice_activity` means "loud".
+    pub vad_model: Option<PathBuf>,
     /// ONNX Runtime dylib.
     pub ort_lib: PathBuf,
     /// Energy VAD tuning.
@@ -179,6 +184,7 @@ impl std::fmt::Debug for AudioConfig {
             .field("turn_model", &self.turn_model)
             .field("whisper_model", &self.whisper_model)
             .field("voiceid_model", &self.voiceid_model)
+            .field("vad_model", &self.vad_model)
             .field("ort_lib", &self.ort_lib)
             .field("vad", &self.vad)
             .field("turn_threshold", &self.turn_threshold)
@@ -208,6 +214,7 @@ impl AudioConfig {
             turn_model: Some(dir.join("turn/smart-turn-v3.2-cpu.onnx")),
             whisper_model: Some(dir.join("whisper/ggml-tiny.en.bin")),
             voiceid_model: Some(dir.join("voiceid/ecapa.onnx")),
+            vad_model: Some(dir.join(vad_model_relative())),
             ort_lib: PathBuf::from(onnx::DEFAULT_ORT_LIBRARY),
             vad: VadConfig::default(),
             turn_threshold: turn::DEFAULT_THRESHOLD,
@@ -228,7 +235,62 @@ impl AudioConfig {
         self.turn_model = None;
         self.whisper_model = None;
         self.voiceid_model = None;
+        self.vad_model = None;
         self
+    }
+}
+
+/// [`DEFAULT_VAD_MODEL`] minus its leading `models/`, i.e. the path under a
+/// `models_dir`.
+fn vad_model_relative() -> &'static str {
+    DEFAULT_VAD_MODEL
+        .strip_prefix("models/")
+        .unwrap_or(DEFAULT_VAD_MODEL)
+}
+
+/// Whether the Silero VAD model is under `models_dir`, for `glydi check`:
+/// without it the bot still runs, but on the energy VAD, and a bell will
+/// interrupt it.
+pub fn vad_model_present(models_dir: impl AsRef<std::path::Path>) -> bool {
+    models_dir.as_ref().join(vad_model_relative()).is_file()
+}
+
+/// Silero when it loads, otherwise energy: a missing model must not stop
+/// the bot, but it must be loud in the log, because the failure mode
+/// (replies cancelled by a bell) looks like a mind bug.
+fn open_vad(
+    config: &AudioConfig,
+    energy: EnergyVad,
+    turn_model: bool,
+    hangover_ms: u128,
+) -> Result<Box<dyn Detector>, Error> {
+    let Some(path) = &config.vad_model else {
+        tracing::info!(hangover_ms, turn_model, "vad configured: energy");
+        return Ok(Box::new(energy));
+    };
+    match SileroVad::open(path, &config.ort_lib) {
+        Ok(mut s) => {
+            s.start_frames = config.vad.start_frames;
+            s.hangover_frames = config.vad.hangover_frames;
+            s.min_speech_frames = config.vad.min_speech_frames;
+            if config.warm_up {
+                s.warm_up()?;
+            }
+            tracing::info!(
+                model = %path.display(),
+                hangover_ms,
+                turn_model,
+                "vad configured: silero"
+            );
+            Ok(Box::new(s))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "silero vad unavailable; falling back to energy vad (bells and music will count as speech)"
+            );
+            Ok(Box::new(energy))
+        }
     }
 }
 
@@ -292,7 +354,7 @@ struct Prepared {
     stt: Option<Box<dyn Transcriber>>,
     encoder: Option<Encoder>,
     gallery: Arc<dyn VoiceGallery>,
-    vad: EnergyVad,
+    vad: Box<dyn Detector>,
 }
 
 impl AudioSense {
@@ -372,16 +434,14 @@ impl AudioSense {
             .clone()
             .unwrap_or_else(|| Arc::new(InMemoryGallery::default()));
 
-        let mut vad = EnergyVad::new();
-        vad.threshold = config.vad.threshold;
-        vad.start_frames = config.vad.start_frames;
-        vad.hangover_frames = config.vad.hangover_frames;
-        vad.min_speech_frames = config.vad.min_speech_frames;
-        tracing::info!(
-            hangover_ms = vad.hangover_duration(config.sample_rate).as_millis(),
-            turn_model = judge.is_some(),
-            "vad configured"
-        );
+        let mut energy = EnergyVad::new();
+        energy.threshold = config.vad.threshold;
+        energy.start_frames = config.vad.start_frames;
+        energy.hangover_frames = config.vad.hangover_frames;
+        energy.min_speech_frames = config.vad.min_speech_frames;
+        let hangover_ms = energy.hangover_duration(config.sample_rate).as_millis();
+
+        let vad = open_vad(config, energy, judge.is_some(), hangover_ms)?;
         Ok(Prepared {
             judge,
             stt,
@@ -415,7 +475,7 @@ impl AudioSense {
 
         let pipeline = Pipeline {
             source,
-            vad: Box::new(vad) as Box<dyn Detector>,
+            vad,
             gate: TurnGate::new(judge, config.max_deferrals),
             max_utterance_samples: (config.max_utterance_secs * config.sample_rate as f32) as usize,
             // Everything before the frame that tipped the VAD over.

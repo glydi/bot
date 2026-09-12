@@ -102,12 +102,93 @@ impl Transcriber for Whisper {
             text.push_str(&seg.to_str_lossy()?);
         }
         let text = text.trim();
-        if text == BLANK_AUDIO || is_non_speech(text) {
+        if text == BLANK_AUDIO
+            || is_non_speech(text)
+            || is_hallucination(text, speech_secs(samples))
+        {
+            tracing::debug!(text = %text, "dropped as non-speech");
             return Ok(String::new());
         }
         // A longer transcript can still carry the sentinel inline.
         Ok(text.replace(BLANK_AUDIO, "").trim().to_string())
     }
+}
+
+/// Under this much voiced audio a lone filler word is far more likely to be
+/// whisper filling silence than a person speaking. Measured against the
+/// live log: the bells and keyboard clicks that got through the VAD were
+/// 0.2-0.5 s of sound followed by the hangover, and came back as "you",
+/// "Thank you." or "Bye." -- whisper's well-known outputs for near-silence.
+/// A real "bye" is not the whole turn at 0.6 s either: the VAD needs
+/// 8 frames (256 ms) of speech and a person saying one word takes ~0.4 s.
+pub const MIN_FILLER_SECS: f32 = 0.6;
+
+/// Whisper's stock answers to audio that holds no words. Only rejected when
+/// they are the *entire* transcript and the audio is short; "thank you" at
+/// the end of a sentence is speech.
+const FILLERS: &[&str] = &[
+    "you",
+    "thank you",
+    "thanks",
+    "bye",
+    "goodbye",
+    "okay",
+    "ok",
+    "yeah",
+    "yes",
+    "no",
+    "so",
+    "the",
+    "oh",
+    "uh",
+    "um",
+    "hmm",
+    "mm",
+    "huh",
+    "thank you for watching",
+    "thanks for watching",
+];
+
+/// Below this mean-abs level a frame is treated as the trailing silence the
+/// VAD hangover appended, not something that was said. A third of the
+/// energy VAD's fixed threshold: quieter than any speech it would pass.
+const TRAILING_QUIET: f32 = 0.005;
+
+/// Seconds of audio up to the last frame that was not near-silent.
+///
+/// The raw utterance length is never a useful "how much was said": the VAD
+/// hangover appends ~640 ms of quiet to every turn, so even a bell ding
+/// arrives as a second of audio. Trimming the quiet tail gives a length the
+/// filler guard can compare against [`MIN_FILLER_SECS`].
+pub fn speech_secs(samples: &[f32]) -> f32 {
+    const FRAME: usize = crate::vad::FRAMES_PER_BUFFER;
+    let voiced_end = samples
+        .chunks(FRAME)
+        .rposition(|f| crate::vad::mean_abs(f) >= TRAILING_QUIET)
+        .map_or(0, |i| ((i + 1) * FRAME).min(samples.len()));
+    voiced_end as f32 / 16_000.0
+}
+
+/// Whisper's hallucination shapes, beyond the bracketed notes
+/// [`is_non_speech`] handles: a transcript under two characters (a stray
+/// punctuation mark or letter) is never worth a reply, and a lone stock
+/// filler on less than [`MIN_FILLER_SECS`] of voiced audio is whisper
+/// guessing at silence, not the person speaking.
+pub fn is_hallucination(text: &str, secs: f32) -> bool {
+    let text = text.trim();
+    if text.chars().count() < 2 {
+        return true;
+    }
+    if secs >= MIN_FILLER_SECS {
+        return false;
+    }
+    let normalised = text
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let normalised = normalised.split_whitespace().collect::<Vec<_>>().join(" ");
+    FILLERS.contains(&normalised.as_str())
 }
 
 /// Whisper describes sounds it recognises but cannot transcribe as a
@@ -138,8 +219,59 @@ fn is_non_speech(text: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod non_speech_tests {
-    use super::is_non_speech;
+    use super::{MIN_FILLER_SECS, is_hallucination, is_non_speech, speech_secs};
+
+    #[test]
+    fn short_and_filler_transcripts_on_short_audio_are_dropped() {
+        for t in [
+            "",
+            ".",
+            "a",
+            "you",
+            "You.",
+            "Thank you.",
+            "Bye!",
+            " thanks for watching ",
+        ] {
+            assert!(is_hallucination(t, 0.4), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn fillers_on_enough_audio_are_kept() {
+        // A real "bye" or "thank you" is a whole turn; only the length
+        // decides.
+        for t in ["Bye.", "Thank you.", "Okay"] {
+            assert!(!is_hallucination(t, MIN_FILLER_SECS), "{t:?}");
+            assert!(!is_hallucination(t, 2.0), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn real_words_on_short_audio_are_kept() {
+        for t in ["Hi there", "What?", "Thank you Bob", "42"] {
+            assert!(!is_hallucination(t, 0.3), "{t:?}");
+        }
+        // Under two characters is dropped whatever the length.
+        assert!(is_hallucination("?", 5.0));
+    }
+
+    #[test]
+    fn speech_secs_trims_the_hangover_tail() {
+        // 0.3 s of tone, then 0.7 s of digital silence (the hangover).
+        let mut v: Vec<f32> = (0..4800)
+            .map(|i| if i % 2 == 0 { 0.1 } else { -0.1 })
+            .collect();
+        v.extend(std::iter::repeat_n(0.0, 11_200));
+        let secs = speech_secs(&v);
+        assert!((0.28..=0.33).contains(&secs), "{secs}");
+        assert_eq!(speech_secs(&vec![0.0; 16_000]), 0.0);
+        assert_eq!(speech_secs(&[]), 0.0);
+        // No quiet tail: the whole length.
+        assert!((speech_secs(&v[..4800]) - 0.3).abs() < 0.01);
+    }
 
     #[test]
     fn bracketed_notes_are_blank() {
