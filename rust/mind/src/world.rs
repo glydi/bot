@@ -13,6 +13,7 @@ use common::{EntityHint, EntityId, Observation, Payload};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
+use crate::belief::BeliefSet;
 use crate::event::{Event, EventKind};
 
 /// A presence older than this has left the room -- the person walked off.
@@ -72,6 +73,10 @@ pub struct Entity {
     pub spoke_at: Option<Instant>,
     /// Start of the current unbroken run of speech; `None` when silent.
     pub speaking_since: Option<Instant>,
+    /// What we think is going on with them, as distributions
+    /// (Phase 8). Fed by every observation about them in [`World::fold`],
+    /// decayed in [`World::tick`].
+    pub beliefs: BeliefSet,
 }
 
 impl Entity {
@@ -89,6 +94,7 @@ impl Entity {
             is_speaking: false,
             spoke_at: None,
             speaking_since: None,
+            beliefs: BeliefSet::default(),
         }
     }
 
@@ -155,6 +161,12 @@ impl World {
         self.entities.get(id)
     }
 
+    /// Look up an entity, mutably (forcing a belief in tests; a rule with
+    /// evidence of its own).
+    pub fn get_mut(&mut self, id: &EntityId) -> Option<&mut Entity> {
+        self.entities.get_mut(id)
+    }
+
     /// Everyone seen this session, present or not.
     pub fn entities(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values()
@@ -205,6 +217,13 @@ impl World {
             .as_ref()
             .map(|h| self.sight(h, now, confidence, &mut out));
 
+        // Every observation about a person is evidence for their beliefs,
+        // whatever the modality: that is what keeps belief tables
+        // modality-blind.
+        if let Some(e) = id.as_ref().and_then(|id| self.entities.get_mut(id)) {
+            e.beliefs.observe(o);
+        }
+
         match o.modality.as_str() {
             "voice_activity" => {
                 let started = o.payload.as_bool().unwrap_or(true);
@@ -239,6 +258,10 @@ impl World {
     pub fn tick(&mut self, now: Instant) -> Events {
         let mut out = Events::new();
         for e in self.entities.values_mut() {
+            // Beliefs relax toward their priors whether or not the person
+            // is here; the "unseen while present" nudge inside only fires
+            // for someone still counted present.
+            e.beliefs.tick(now, e.last_seen);
             if e.status == Status::Present
                 && now.saturating_duration_since(e.last_seen) >= PRESENCE_TTL
             {

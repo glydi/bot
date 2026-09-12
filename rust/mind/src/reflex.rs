@@ -27,9 +27,25 @@ use crossbeam_channel::{Sender, TrySendError};
 use smallvec::SmallVec;
 
 use crate::event::{Event, EventLog};
+use crate::goal::GoalStack;
 use crate::rules::default_rules;
 use crate::view::WorldView;
+use crate::working::WorkingMemory;
 use crate::world::World;
+
+/// What a rule's [`Rule::plan`] step sees: the room after the fold, plus
+/// the reflex's working memory and goals, mutably, so a planner can record
+/// that it acted (asked, greeted) without holding state of its own.
+pub struct Cognition<'a> {
+    /// The observation's (or tick's) time.
+    pub now: Instant,
+    /// The room.
+    pub world: &'a World,
+    /// Scratch state.
+    pub working: &'a mut WorkingMemory,
+    /// What we are trying to do.
+    pub goals: &'a mut GoalStack,
+}
 
 /// Commands from one rule pass. Four inline: barge-in + attend + backchannel
 /// is the most any single observation produces today.
@@ -48,6 +64,14 @@ pub trait Rule: Send {
     fn on_tick(&self, now: Instant, w: &World, out: &mut Commands) {
         let _ = (now, w, out);
     }
+
+    /// Act on goals and working memory, after `apply`/`on_tick` and after
+    /// both have been updated from this fold's events. Default: nothing.
+    /// Only the planner needs this; it is a separate step so the existing
+    /// `apply` signature stays as it was.
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        let _ = (cx, out);
+    }
 }
 
 /// How often the loop ticks the world when nothing is arriving. Presence
@@ -63,6 +87,8 @@ pub struct Reflex {
     log: EventLog,
     view: Arc<ArcSwap<WorldView>>,
     last_tick: Instant,
+    working: WorkingMemory,
+    goals: GoalStack,
 }
 
 impl Reflex {
@@ -83,6 +109,48 @@ impl Reflex {
             log: EventLog::new(session_id),
             view: Arc::new(ArcSwap::new(WorldView::empty(now))),
             last_tick: now,
+            working: WorkingMemory::new(),
+            goals: GoalStack::new(),
+        }
+    }
+
+    /// Working memory: topic, open questions, attention.
+    pub fn working(&self) -> &WorkingMemory {
+        &self.working
+    }
+
+    /// Working memory, mutably (recording a question the deliberate path
+    /// asked on its own).
+    pub fn working_mut(&mut self) -> &mut WorkingMemory {
+        &mut self.working
+    }
+
+    /// The goal stack.
+    pub fn goals(&self) -> &GoalStack {
+        &self.goals
+    }
+
+    /// The goal stack, mutably (pushing a goal from outside the
+    /// heuristics).
+    pub fn goals_mut(&mut self) -> &mut GoalStack {
+        &mut self.goals
+    }
+
+    /// Update working memory and goals from a fold's events, then give
+    /// every rule its `plan` step.
+    fn cognise(&mut self, events: &[Event], now: Instant, out: &mut Commands) {
+        // Working memory first: the goal heuristics read the thread a
+        // SAID just stored.
+        self.working.on_events(events);
+        self.goals.from_events(events, &self.world, &self.working);
+        let mut cx = Cognition {
+            now,
+            world: &self.world,
+            working: &mut self.working,
+            goals: &mut self.goals,
+        };
+        for r in &self.rules {
+            r.plan(&mut cx, out);
         }
     }
 
@@ -118,6 +186,7 @@ impl Reflex {
         for r in &self.rules {
             r.apply(o, &self.world, &mut out);
         }
+        self.cognise(&events, o.at, &mut out);
         self.record(events, o.at);
         out
     }
@@ -130,6 +199,7 @@ impl Reflex {
         for r in &self.rules {
             r.on_tick(now, &self.world, &mut out);
         }
+        self.cognise(&events, now, &mut out);
         self.record(events, now);
         out
     }
@@ -139,7 +209,8 @@ impl Reflex {
             tracing::debug!(entity = %e.entity, kind = e.kind.tag(), "event");
         }
         self.log.extend(events);
-        self.view.store(WorldView::snapshot(&self.world, now));
+        self.view
+            .store(WorldView::snapshot_with(&self.world, &self.working, now));
     }
 
     /// Run on a dedicated thread named `glydi-reflex` until the ring's

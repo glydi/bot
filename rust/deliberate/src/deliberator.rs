@@ -573,6 +573,7 @@ mod tests {
             at: Instant::now(),
             people,
             bot_speaking: false,
+            working: mind::WorkingSnapshot::default(),
         });
         Box::new(move || Arc::clone(&view))
     }

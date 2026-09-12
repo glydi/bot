@@ -61,6 +61,7 @@ fn live_turn_streams_sentences() {
             returned: None,
         }],
         bot_speaking: false,
+        working: mind::WorkingSnapshot::default(),
     });
     let facts = Arc::new(InMemoryFacts::new());
     facts.remember(&EntityId::new("john"), "John teaches maths at Yaju school.");

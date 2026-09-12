@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use common::EntityId;
 use smol_str::SmolStr;
 
+use crate::belief::{
+    ABOUT_TO_LEAVE, CONFIDENT, ENGAGED_WITH_BOT, FINISHED_TASK, NO, WANTS_RESPONSE, YES,
+};
+use crate::working::{WorkingMemory, WorkingSnapshot};
 use crate::world::{Status, World};
 
 /// Rendered when no one is visible. Identical to the Python `NOBODY`: with
@@ -75,11 +79,25 @@ pub struct WorldView {
     pub people: Vec<ViewEntity>,
     /// Whether the speaker actuator is producing audio.
     pub bot_speaking: bool,
+    /// Working memory and per-person beliefs at the time of the snapshot
+    /// (Phase 8). `Default` (empty) for a `WorldView` built by hand.
+    pub working: WorkingSnapshot,
 }
 
 impl WorldView {
-    /// Take a snapshot.
+    /// Take a snapshot of the room alone. Beliefs are included (they live
+    /// on the entities); working memory is empty. `Reflex` uses
+    /// [`WorldView::snapshot_with`].
     pub fn snapshot(world: &World, at: Instant) -> Arc<Self> {
+        Self::build(world, WorkingSnapshot::capture(None, world), at)
+    }
+
+    /// Take a snapshot of the room and working memory.
+    pub fn snapshot_with(world: &World, working: &WorkingMemory, at: Instant) -> Arc<Self> {
+        Self::build(world, WorkingSnapshot::capture(Some(working), world), at)
+    }
+
+    fn build(world: &World, working: WorkingSnapshot, at: Instant) -> Arc<Self> {
         let mut people: Vec<ViewEntity> = world
             .entities()
             .filter(|e| e.status == Status::Present)
@@ -99,6 +117,7 @@ impl WorldView {
             at,
             people,
             bot_speaking: world.bot_speaking(),
+            working,
         })
     }
 
@@ -108,6 +127,7 @@ impl WorldView {
             at,
             people: Vec::new(),
             bot_speaking: false,
+            working: WorkingSnapshot::default(),
         })
     }
 
@@ -139,6 +159,41 @@ impl WorldView {
         render_room(&people, self.speaker().map(ViewEntity::label).as_deref())
     }
 
+    /// [`WorldView::describe`] plus, for each known person about whom a
+    /// belief is confident (≥ [`CONFIDENT`]), one line such as
+    ///
+    /// ```text
+    /// Currently: John seems to be talking to someone else (78%)
+    /// ```
+    ///
+    /// Only the noteworthy side of each belief is rendered: "seems about
+    /// to leave", never "seems not about to leave". Beliefs that are still
+    /// flat say nothing, which is the point of holding them as
+    /// distributions. The percentage is deliberate here, unlike on the
+    /// name line: "seems … (78%)" is a hedge the model is meant to
+    /// carry into its answer, whereas a recognition score became an
+    /// invented fact. A separate method so `describe`'s measured output
+    /// is byte-for-byte what it was.
+    pub fn describe_with_beliefs(&self, facts: &dyn Fn(&EntityId) -> Vec<String>) -> String {
+        let mut s = self.describe(facts);
+        for p in self.people.iter().filter(|p| p.is_known()) {
+            let Some(eb) = self.working.beliefs_of(&p.id) else {
+                continue;
+            };
+            let name = p.label();
+            for b in eb.beliefs.iter().filter(|b| b.p >= CONFIDENT) {
+                if let Some(phrase) = belief_phrase(&b.name, &b.most_likely) {
+                    let _ = write!(
+                        s,
+                        "\nCurrently: {name} {phrase} ({}%)",
+                        (b.p * 100.0).round() as u32
+                    );
+                }
+            }
+        }
+        s
+    }
+
     /// "back after N min" for someone who recently came back from a real
     /// absence (see [`RETURN_NOTE_TTL`], [`RETURN_NOTE_MIN_AWAY`]).
     fn return_extra(&self, p: &ViewEntity) -> Option<String> {
@@ -149,6 +204,20 @@ impl WorldView {
         }
         Some(format!("back after {} min", away.as_secs() / 60))
     }
+}
+
+/// How a confident belief reads on the "Currently:" line; `None` for the
+/// unremarkable side (nobody needs "does not seem about to leave").
+fn belief_phrase(belief: &str, hypothesis: &str) -> Option<&'static str> {
+    Some(match (belief, hypothesis) {
+        (ENGAGED_WITH_BOT, YES) => "seems to be talking to you",
+        (ENGAGED_WITH_BOT, NO) => "seems to be talking to someone else",
+        (ABOUT_TO_LEAVE, YES) => "seems about to leave",
+        (WANTS_RESPONSE, YES) => "seems to be waiting for you to answer",
+        (FINISHED_TASK, YES) => "seems to have finished what they were working on",
+        (FINISHED_TASK, NO) => "seems not to have finished what they were working on",
+        _ => return None,
+    })
 }
 
 /// The `[room]` note, shared by every path that builds one.

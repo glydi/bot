@@ -137,3 +137,13 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     v.push(Box::new(BackchannelAfterLongSpeech::new()));
     v
 }
+
+/// [`default_rules`] plus the [`PlannerRule`](crate::PlannerRule), which
+/// emits `deliberate/intent` commands. Opt-in rather than default so that
+/// consumers counting commands from `Reflex::new` see exactly what they
+/// did before Phase 8; wire it in with `Reflex::with_rules`.
+pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
+    let mut v = default_rules();
+    v.push(Box::new(crate::plan::PlannerRule));
+    v
+}

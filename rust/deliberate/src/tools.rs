@@ -8,9 +8,13 @@
 //! tool call in prose instead of emitting one holds a lovely conversation
 //! and forgets everyone.
 //!
-//! Only `recall_person` and `remember` live here. Enrolment and forgetting
-//! touch the face/voice gallery, which is an identity concern the memory
-//! crate owns; they are not on this crate's surface.
+//! `recall_person` and `remember` live here in full. `remember_name`,
+//! `remember_fact` and `forget_person` -- the other three the local prompt
+//! names -- touch the face/voice gallery, an identity concern the memory
+//! crate owns, so they reach it through the default-method hooks on
+//! [`FactSource`]: their specs are in [`memory_tool_specs`], their handlers
+//! forward to the hooks, and a source that does not override a hook answers
+//! the model with a plain `failed` it can talk around.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +33,36 @@ pub trait FactSource: Send + Sync {
 
     /// Store one fact about `entity`.
     fn remember(&self, entity: &EntityId, fact: &str);
+
+    /// The entity a name refers to, if the source knows one by that name
+    /// (case-insensitive). The default knows nobody, so callers fall back
+    /// to the lower-cased name as the id -- which is what an in-memory
+    /// source keys by anyway.
+    fn resolve_name(&self, name: &str) -> Option<EntityId> {
+        let _ = name;
+        None
+    }
+
+    /// Every known person as `(id, display name)`, sorted by name. Feeds
+    /// the `known_people` list a failed recall answers with.
+    fn everyone(&self) -> Vec<(EntityId, String)> {
+        Vec::new()
+    }
+
+    /// Attach `name` to whoever is talking (`speaker`, possibly a stranger
+    /// track) and return the id they are known by from now on. The memory
+    /// crate binds the stashed face/voice samples of that track here; the
+    /// default has no gallery and refuses with a reason for the model.
+    fn remember_name(&self, speaker: Option<&EntityId>, name: &str) -> Result<EntityId, String> {
+        let _ = (speaker, name);
+        Err("no gallery to attach that name to".to_owned())
+    }
+
+    /// Delete `entity` and every trace of them. `false` if unknown.
+    fn forget(&self, entity: &EntityId) -> bool {
+        let _ = entity;
+        false
+    }
 }
 
 /// A `FactSource` that forgets everything at exit. For tests and for running
@@ -84,6 +118,13 @@ pub struct FunctionSpec {
 pub const RECALL_PERSON: &str = "recall_person";
 /// Name of the store-a-fact tool.
 pub const REMEMBER: &str = "remember";
+/// Name of the attach-a-name tool (memory crate).
+pub const REMEMBER_NAME: &str = "remember_name";
+/// Name of the store-a-fact tool under the reference `tools.py` name; same
+/// handler as [`REMEMBER`].
+pub const REMEMBER_FACT: &str = "remember_fact";
+/// Name of the delete-a-person tool (memory crate).
+pub const FORGET_PERSON: &str = "forget_person";
 
 /// The tool surface, independent of any handler. The warm-up sends these
 /// too: Llama and Qwen templates put tool definitions ahead of the system
@@ -130,6 +171,75 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// The three tools that need a gallery behind the [`FactSource`], with the
+/// descriptions from `tools.py` verbatim. Offered to the model only when a
+/// source implements the hooks (see [`full_tool_specs`]).
+pub fn memory_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: REMEMBER_NAME,
+                description: "Attach a name to the person you are currently talking to, so you \
+                              recognise their face and voice next time. Call this as soon as \
+                              someone tells you their name, but only if you do not already know \
+                              them.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The name the person gave you."}
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: REMEMBER_FACT,
+                description: "Store something worth remembering about a person you already know \
+                              -- what they do, what they like, something they asked you to keep \
+                              track of. Do not store things they would not expect you to keep.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Who the fact is about."},
+                        "fact": {
+                            "type": "string",
+                            "description": "One short sentence, written in the third person."
+                        }
+                    },
+                    "required": ["name", "fact"]
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: FORGET_PERSON,
+                description: "Permanently delete a person and every stored face and voice sample \
+                              of them. Call this whenever someone asks you to forget them; treat \
+                              the request as final and confirm once it is done.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The person to forget."}
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+    ]
+}
+
+/// The whole surface the local prompt names: [`tool_specs`] plus
+/// [`memory_tool_specs`], `recall_person` first as in `tools.py`.
+pub fn full_tool_specs() -> Vec<ToolSpec> {
+    let mut all = tool_specs();
+    all.extend(memory_tool_specs());
+    all
+}
+
 /// Runs tool calls against a [`FactSource`] and the current room.
 pub struct Tools {
     facts: Arc<dyn FactSource>,
@@ -160,18 +270,50 @@ impl Tools {
     pub fn invoke(&self, name: &str, args: &Value, view: &WorldView) -> Value {
         match name {
             RECALL_PERSON => self.recall_person(args, view),
-            REMEMBER => self.remember(args, view),
+            REMEMBER | REMEMBER_FACT => self.remember(args, view),
+            REMEMBER_NAME => self.remember_name(args, view),
+            FORGET_PERSON => self.forget_person(args, view),
             _ => fail(&format!("unknown tool {name}")),
+        }
+    }
+
+    fn remember_name(&self, args: &Value, view: &WorldView) -> Value {
+        let name = str_arg(args, "name");
+        if name.is_empty() {
+            return fail("name is required");
+        }
+        // The speaker may be a stranger track; that is the whole point.
+        let speaker = view.speaker().map(|p| &p.id);
+        match self.facts.remember_name(speaker, &name) {
+            Ok(id) => {
+                tracing::info!(who = %id, name, "enrolled");
+                json!({"status": "ok", "remembered": name, "entity": id.as_str()})
+            }
+            Err(reason) => fail(&reason),
+        }
+    }
+
+    fn forget_person(&self, args: &Value, view: &WorldView) -> Value {
+        let name = str_arg(args, "name");
+        let Some((id, _)) = self.resolve(&name, view) else {
+            return fail("I do not know anyone by that name");
+        };
+        if self.facts.forget(&id) {
+            tracing::info!(who = %id, "forgotten");
+            json!({"status": "ok"})
+        } else {
+            fail("I do not know anyone by that name")
         }
     }
 
     /// Find a person from a name, falling back to whoever is being spoken to
     /// when the model omits it ("what do you know about me?").
     ///
-    /// A name that matches nobody visible is still an entity id: facts are
-    /// keyed by the lower-cased name, which is what the gallery uses for
-    /// enrolled people, so someone who left the room can still be looked up.
-    fn resolve(name: &str, view: &WorldView) -> Option<(EntityId, String)> {
+    /// A name that matches nobody visible is asked of the source
+    /// ([`FactSource::resolve_name`]), so someone who left the room can
+    /// still be looked up; a source that does not know names keys facts by
+    /// the lower-cased name, and that is the last resort.
+    fn resolve(&self, name: &str, view: &WorldView) -> Option<(EntityId, String)> {
         if !name.is_empty() {
             let lower = name.to_lowercase();
             if let Some(p) = view
@@ -182,7 +324,11 @@ impl Tools {
             {
                 return Some((p.id.clone(), p.label()));
             }
-            return Some((EntityId::new(lower), name.to_owned()));
+            let id = self
+                .facts
+                .resolve_name(name)
+                .unwrap_or_else(|| EntityId::new(lower));
+            return Some((id, name.to_owned()));
         }
         view.speaker()
             .filter(|p| p.is_known())
@@ -191,7 +337,7 @@ impl Tools {
 
     fn recall_person(&self, args: &Value, view: &WorldView) -> Value {
         let name = str_arg(args, "name");
-        let Some((id, label)) = Self::resolve(&name, view) else {
+        let Some((id, label)) = self.resolve(&name, view) else {
             return json!({"status": "unknown", "known_people": Self::known_names(view)});
         };
         let facts = self.facts.recall(&id);
@@ -207,7 +353,7 @@ impl Tools {
         if fact.is_empty() {
             return fail("nothing to remember");
         }
-        let Some((id, label)) = Self::resolve(&name, view) else {
+        let Some((id, label)) = self.resolve(&name, view) else {
             return fail("I do not know anyone by that name yet");
         };
         self.facts.remember(&id, &fact);
@@ -231,6 +377,7 @@ mod tests {
     use mind::ViewEntity;
 
     use super::*;
+    use crate::prompt::LOCAL_SYSTEM_PROMPT;
 
     fn person(id: &str, speaking: bool) -> ViewEntity {
         ViewEntity {
@@ -248,6 +395,7 @@ mod tests {
             at: Instant::now(),
             people,
             bot_speaking: false,
+            working: mind::WorkingSnapshot::default(),
         }
     }
 
@@ -285,6 +433,32 @@ mod tests {
         let r = tools.invoke(REMEMBER, &json!({"name": "john"}), &view);
         assert_eq!(r["status"], "failed");
         assert_eq!(tools.invoke("nope", &json!({}), &view)["status"], "failed");
+    }
+
+    #[test]
+    fn full_specs_name_every_tool_in_the_local_prompt() {
+        let names: Vec<&str> = full_tool_specs().iter().map(|t| t.function.name).collect();
+        for t in [REMEMBER_NAME, REMEMBER_FACT, FORGET_PERSON, RECALL_PERSON] {
+            assert!(names.contains(&t), "{t} missing");
+            assert!(LOCAL_SYSTEM_PROMPT.contains(t), "{t} not in prompt");
+        }
+    }
+
+    #[test]
+    fn hook_tools_fail_softly_without_a_gallery() {
+        let tools = Tools::new(Arc::new(InMemoryFacts::new()));
+        let view = room(vec![person("john", true)]);
+        let r = tools.invoke(REMEMBER_NAME, &json!({"name": "Ada"}), &view);
+        assert_eq!(r["status"], "failed");
+        let r = tools.invoke(FORGET_PERSON, &json!({"name": "john"}), &view);
+        assert_eq!(r["status"], "failed");
+        // remember_fact is the reference name for remember.
+        let r = tools.invoke(
+            REMEMBER_FACT,
+            &json!({"name": "john", "fact": "John paints."}),
+            &view,
+        );
+        assert_eq!(r["status"], "ok");
     }
 
     #[test]

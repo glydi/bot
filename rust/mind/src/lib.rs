@@ -12,13 +12,28 @@
 //! path. Other threads read the room through an [`arc_swap`] snapshot of
 //! [`WorldView`].
 
+//!
+//! Phase 8 adds cognition on the same thread: per-entity [`Belief`]s
+//! (distributions, not facts), a bounded [`WorkingMemory`], a [`GoalStack`]
+//! raised from events, and a [`Planner`] that turns the top goal into an
+//! `intent` command for the deliberate path. All deterministic and
+//! allocation-light, so property 1 still holds.
+
+pub mod belief;
 pub mod event;
+pub mod goal;
+pub mod plan;
 pub mod reflex;
 pub mod rules;
 pub mod view;
+pub mod working;
 pub mod world;
 
+pub use belief::{Belief, BeliefSet, Likelihood, Pattern};
 pub use event::{Event, EventKind, EventLog};
-pub use reflex::{Reflex, ReflexHandle, Rule};
+pub use goal::{Goal, GoalStack};
+pub use plan::{Decision, Planner, PlannerRule};
+pub use reflex::{Cognition, Reflex, ReflexHandle, Rule};
 pub use view::{NOBODY, ViewEntity, WorldView};
+pub use working::{Question, WorkingMemory, WorkingSnapshot};
 pub use world::{Entity, PRESENCE_TTL, SPEAKING_TTL, Status, World};
