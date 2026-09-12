@@ -5,6 +5,19 @@
 //! realtime. That is roughly 3x faster than the Python faster-whisper build
 //! it replaced, and it is the one place where moving off Python bought real
 //! latency rather than just a smaller binary.
+//!
+//! # Language
+//!
+//! A `.en` model transcribes English and nothing else. A multilingual
+//! model (`ggml-base.bin`, from
+//! <https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin>)
+//! either transcribes the language it is told ([`Whisper::open`] with
+//! `Some("hi")`) or, with `None`, detects it per utterance and transcribes
+//! in it; [`Transcriber::last_language`] reports which. Measured on an M2
+//! on Metal, 3 s clip, warm state (`tests/language.rs`, `--release`):
+//! `base.en` 169 ms; `base` forced English 170 ms; `base` auto-detect
+//! 284 ms -- whisper.cpp runs the encoder once more for the detection
+//! pass, so auto costs ~115 ms (two thirds of a transcription) on top.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -33,6 +46,13 @@ pub const DEFAULT_MODEL_PATH: &str = "models/whisper/ggml-tiny.en.bin";
 pub trait Transcriber: Send {
     /// The text, or `""` if the audio held no speech.
     fn transcribe(&mut self, samples: &[f32]) -> Result<String, Error>;
+
+    /// ISO 639-1 code of the language of the last transcript ("en",
+    /// "hi", ...): the configured one, or the detected one in auto mode.
+    /// `None` when the transcriber does not know.
+    fn last_language(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 static LOG_HOOKS: Once = Once::new();
@@ -54,12 +74,31 @@ pub struct Whisper {
     /// same either way.
     state: WhisperState,
     threads: i32,
+    /// The language to force, or `None` to detect (multilingual models
+    /// only; a `.en` model is always `Some("en")`).
+    language: Option<String>,
+    /// Whether the loaded model is multilingual.
+    multilingual: bool,
+    /// What the last `transcribe` decoded in.
+    last_language: Option<&'static str>,
 }
 
 impl Whisper {
-    /// Load a ggml model. `threads` is the decoder thread count; 4 is the
-    /// whisper.cpp default and plenty for `tiny.en`.
+    /// Load a ggml model in English. `threads` is the decoder thread
+    /// count; 4 is the whisper.cpp default and plenty for `tiny.en`.
     pub fn open(model_path: impl AsRef<Path>, threads: usize) -> Result<Self, Error> {
+        Self::open_with_language(model_path, threads, Some("en"))
+    }
+
+    /// Load a ggml model for `language` (ISO 639-1), or for whichever
+    /// language each utterance turns out to be in when `None`. An
+    /// English-only model ignores the request, with a warning if it was
+    /// for another language.
+    pub fn open_with_language(
+        model_path: impl AsRef<Path>,
+        threads: usize,
+        language: Option<&str>,
+    ) -> Result<Self, Error> {
         let model_path = model_path.as_ref();
         if !model_path.is_file() {
             return Err(Error::MissingModel {
@@ -76,19 +115,57 @@ impl Whisper {
         })?;
         let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())?;
         let state = ctx.create_state()?;
+        let multilingual = ctx.is_multilingual();
+        let language = match (multilingual, language) {
+            (true, Some(l)) => Some(l.to_owned()),
+            (true, None) => None,
+            (false, l) => {
+                if l.is_some_and(|l| l != "en") {
+                    tracing::warn!(
+                        requested = l,
+                        model = %model_path.display(),
+                        "english-only whisper model; language forced to en (use ggml-base.bin for others)"
+                    );
+                }
+                Some("en".to_owned())
+            }
+        };
+        tracing::info!(
+            model = %model_path.display(),
+            multilingual,
+            language = language.as_deref().unwrap_or("auto"),
+            "whisper loaded"
+        );
         Ok(Self {
             ctx,
             state,
             threads: i32::try_from(threads.max(1)).unwrap_or(4),
+            language,
+            multilingual,
+            last_language: None,
         })
     }
 
+    /// Whether the loaded model can transcribe languages other than
+    /// English.
+    pub fn is_multilingual(&self) -> bool {
+        self.multilingual
+    }
+
     /// Decode `samples` into `state`. Shared by the warm path and the
-    /// fresh-state check in the tests.
-    fn run(state: &mut WhisperState, threads: i32, samples: &[f32]) -> Result<String, Error> {
+    /// fresh-state check in the tests. `language` `None` is auto-detect.
+    fn run(
+        state: &mut WhisperState,
+        threads: i32,
+        language: Option<&str>,
+        samples: &[f32],
+    ) -> Result<String, Error> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(threads);
-        params.set_language(Some("en"));
+        // `None` makes whisper.cpp detect the language on the first 30 s
+        // window (one extra encoder pass) and decode in it.
+        params.set_language(language);
+        params.set_detect_language(false);
         params.set_translate(false);
         // The decoder must not see the previous utterance: whisper.cpp
         // otherwise feeds the last transcript in as the prompt, and one
@@ -141,8 +218,20 @@ impl Whisper {
 
 impl Transcriber for Whisper {
     fn transcribe(&mut self, samples: &[f32]) -> Result<String, Error> {
-        let text = Self::run(&mut self.state, self.threads, samples)?;
+        let text = Self::run(
+            &mut self.state,
+            self.threads,
+            self.language.as_deref(),
+            samples,
+        )?;
+        // What the decoder actually used: the forced language, or the
+        // detected one. whisper.cpp keeps it on the state.
+        self.last_language = whisper_rs::get_lang_str(self.state.full_lang_id_from_state());
         Ok(Self::clean(&text, samples))
+    }
+
+    fn last_language(&self) -> Option<&'static str> {
+        self.last_language
     }
 }
 
@@ -386,7 +475,7 @@ mod warm_state_tests {
             let mut fresh = w.ctx.create_state().unwrap();
             create_ms.push(t.elapsed().as_secs_f64() * 1e3);
             let want = Whisper::clean(
-                &Whisper::run(&mut fresh, w.threads, &samples).unwrap(),
+                &Whisper::run(&mut fresh, w.threads, Some("en"), &samples).unwrap(),
                 &samples,
             );
             fresh_ms.push(t.elapsed().as_secs_f64() * 1e3);

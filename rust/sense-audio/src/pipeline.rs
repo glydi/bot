@@ -74,6 +74,8 @@ use parking_lot::Mutex;
 use smol_str::SmolStr;
 
 use crate::aec::Aec;
+use crate::affect::{Calibrator, prosody};
+use crate::events::EventDetector;
 use crate::input::{FrameSource, Pull};
 use crate::stt::Transcriber;
 use crate::turn::TurnJudge;
@@ -140,6 +142,10 @@ pub struct Stats {
     pub whisper_us: AtomicU64,
     /// Last utterance: microseconds the speaker embedding took (0 if none).
     pub embed_us: AtomicU64,
+    /// `audio_event` observations emitted.
+    pub audio_events: AtomicU64,
+    /// `partial_utterance` observations emitted.
+    pub partials: AtomicU64,
 }
 
 /// One finished utterance, on its way to the worker.
@@ -170,6 +176,35 @@ pub(crate) struct Speculation {
 /// newer pause simply replaces an older one the worker has not picked up
 /// yet -- there is never any point transcribing a superseded guess.
 pub(crate) type SpecSlot = Arc<Mutex<Option<Speculation>>>;
+
+/// What the pipeline and the worker share about `partial_utterance`: the
+/// transcript of the latest speculation, whether the gate is holding a
+/// deferred turn open, and which speculation has already gone out, so
+/// the two threads never emit the same partial twice.
+///
+/// The ordering the deliberate path wants (`deliberate/src/deliberator.rs`,
+/// `PARTIAL_UTTERANCE`): the partial *before* the `turn_ended(false)` it
+/// belongs to, because that verdict arms the early answer only if a
+/// partial is already in hand. Two cases:
+///
+/// * the worker finished the speculation under the hangover (the usual
+///   one, ~100 ms against ~480 ms): the pipeline finds it here at the
+///   deferral and emits it itself, then the verdict;
+/// * the worker is still on it: the pipeline marks the turn deferred and
+///   the worker emits the partial when it is done, after the verdict --
+///   the next pause of the same turn then gets the ordering right.
+#[derive(Default)]
+pub(crate) struct PartialShared {
+    /// The gate is holding a deferred turn open.
+    pub deferred: bool,
+    /// The latest speculation's transcript and who it was pinned on.
+    pub ready: Option<(u64, String, Option<EntityId>)>,
+    /// The speculation id last emitted as a partial.
+    pub emitted: Option<u64>,
+}
+
+/// The shared handle to [`PartialShared`].
+pub(crate) type PartialSlot = Arc<Mutex<PartialShared>>;
 
 /// The deferral state machine from the Go `Run` loop, separated so it can
 /// be tested with a fake judge and no audio thread.
@@ -298,6 +333,10 @@ pub(crate) struct Pipeline {
     pub spec_slot: SpecSlot,
     /// Nudges the worker after a speculation is put in the slot.
     pub spec_wake: Sender<()>,
+    /// See [`PartialShared`].
+    pub partial: PartialSlot,
+    /// Sound-class awareness (`audio_event`), `None` when disabled.
+    pub events: Option<EventDetector>,
     pub source_name: SmolStr,
     pub clock: Arc<dyn Clock>,
     pub tx: RingSender,
@@ -424,6 +463,23 @@ impl Pipeline {
             }
 
             let state = self.vad.push(&frame);
+            // Sound classes ride on the same frame, after the VAD so the
+            // heuristic knows whether it is hearing speech. Muted frames
+            // (the bot's own voice) never get here.
+            let heard = self
+                .events
+                .as_mut()
+                .map(|d| d.push(&frame, state == State::Speaking))
+                .unwrap_or_default();
+            for ev in heard {
+                self.stats.audio_events.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(class = %ev.label, confidence = ev.confidence, "audio event");
+                self.emit(
+                    self.obs("audio_event")
+                        .with_confidence(ev.confidence)
+                        .with_payload(Payload::Text(ev.label.to_string())),
+                );
+            }
             if state == State::Speaking {
                 if !speaking {
                     speaking = true;
@@ -541,7 +597,33 @@ impl Pipeline {
                 // The speculation for this pause stays in the worker's
                 // cache but is never committed: the next voiced frame
                 // starts a new one over the held audio plus what follows.
+                // What it transcribed goes out as the partial, ahead of
+                // the verdict, if the worker has it (see PartialShared).
                 self.stats.deferrals.fetch_add(1, Ordering::Relaxed);
+                let partial = {
+                    let mut p = self.partial.lock();
+                    p.deferred = true;
+                    match (&p.ready, speculation) {
+                        (Some((id, text, who)), Some(sid))
+                            if *id == sid && p.emitted != Some(sid) =>
+                        {
+                            let out = (text.clone(), who.clone());
+                            p.emitted = Some(sid);
+                            Some(out)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((text, who)) = partial {
+                    self.stats.partials.fetch_add(1, Ordering::Relaxed);
+                    let mut o = self
+                        .obs("partial_utterance")
+                        .with_payload(Payload::Text(text));
+                    if let Some(id) = who {
+                        o = o.with_entity(EntityHint::Known(id));
+                    }
+                    self.emit(o);
+                }
                 self.emit(
                     self.obs("turn_ended")
                         .with_confidence(prob)
@@ -549,6 +631,7 @@ impl Pipeline {
                 );
             }
             Verdict::Emit { samples, judged } => {
+                self.partial.lock().deferred = false;
                 if let Some((complete, prob)) = judged {
                     self.emit(
                         self.obs("turn_ended")
@@ -600,6 +683,8 @@ struct Analysis {
     /// `None` without an encoder, or for a clip under
     /// [`crate::voiceid::MIN_SAMPLES`].
     voice: Option<Voice>,
+    /// What the transcript is in (see [`Transcriber::last_language`]).
+    language: Option<&'static str>,
     whisper: Duration,
     embed: Duration,
 }
@@ -609,9 +694,13 @@ pub(crate) struct Worker {
     pub jobs: Receiver<Utterance>,
     pub spec_slot: SpecSlot,
     pub spec_wake: Receiver<()>,
+    /// See [`PartialShared`].
+    pub partial: PartialSlot,
     pub stt: Option<Box<dyn Transcriber>>,
     pub encoder: Option<Encoder>,
     pub gallery: Arc<dyn VoiceGallery>,
+    /// Per-speaker prosody baselines for `voice_affect`; `None` disables.
+    pub affect: Option<Calibrator>,
     pub source_name: SmolStr,
     pub clock: Arc<dyn Clock>,
     pub tx: RingSender,
@@ -671,6 +760,7 @@ impl Worker {
                         embed_ms = analysis.embed.as_millis(),
                         "speculation ready"
                     );
+                    self.offer_partial(spec.id, &analysis, last_match.as_ref());
                     if cached.replace((spec, analysis)).is_some() {
                         self.stats.speculations_wasted.fetch_add(1, Ordering::Relaxed);
                     }
@@ -678,6 +768,49 @@ impl Worker {
             }
         }
         tracing::info!("utterance worker stopped");
+    }
+
+    /// A speculation was transcribed: leave the text where the pipeline
+    /// finds it at a deferral, and if the turn is already deferred send
+    /// it out now (see [`PartialShared`]).
+    fn offer_partial(&self, id: u64, analysis: &Analysis, last_match: Option<&(EntityId, f32)>) {
+        let Some(text) = analysis
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        else {
+            return;
+        };
+        let who = analysis
+            .voice
+            .as_ref()
+            .and_then(|v| v.hit.as_ref())
+            .or(last_match)
+            .map(|(id, _)| id.clone());
+        let emit_now = {
+            let mut p = self.partial.lock();
+            p.ready = Some((id, text.to_owned(), who.clone()));
+            if p.deferred && p.emitted != Some(id) {
+                p.emitted = Some(id);
+                true
+            } else {
+                false
+            }
+        };
+        if emit_now {
+            self.stats.partials.fetch_add(1, Ordering::Relaxed);
+            let mut o = Observation::new(
+                self.source_name.clone(),
+                "partial_utterance",
+                self.clock.now(),
+            )
+            .with_payload(Payload::Text(text.to_owned()));
+            if let Some(id) = who {
+                o = o.with_entity(EntityHint::Known(id));
+            }
+            self.emit(o);
+        }
     }
 
     /// Whisper on this thread, ECAPA on a scoped helper: the two share
@@ -691,7 +824,7 @@ impl Worker {
             gallery,
             ..
         } = self;
-        let (text, whisper, voice, embed) = std::thread::scope(|s| {
+        let (text, whisper, voice, embed, language) = std::thread::scope(|s| {
             let voice = encoder.as_mut().map(|enc| {
                 s.spawn(move || {
                     let t0 = Instant::now();
@@ -702,6 +835,7 @@ impl Worker {
             let t0 = Instant::now();
             let text = stt.as_mut().map(|stt| stt.transcribe(samples));
             let whisper = t0.elapsed();
+            let language = stt.as_ref().and_then(|stt| stt.last_language());
             let (voice, embed) = match voice.map(std::thread::ScopedJoinHandle::join) {
                 Some(Ok((Ok(embedding), took))) => {
                     let hit = gallery.best_match(&embedding);
@@ -717,7 +851,7 @@ impl Worker {
                 }
                 None => (None, Duration::ZERO),
             };
-            (text, whisper, voice, embed)
+            (text, whisper, voice, embed, language)
         });
         let text = match text {
             Some(Ok(t)) => Some(t),
@@ -730,6 +864,7 @@ impl Worker {
         Analysis {
             text,
             voice,
+            language,
             whisper,
             embed,
         }
@@ -737,6 +872,7 @@ impl Worker {
 
     /// The turn is over: use the speculation if it is the one this
     /// utterance extends, otherwise run the models now, then emit.
+    #[allow(clippy::too_many_lines)]
     fn commit(
         &mut self,
         job: &Utterance,
@@ -844,12 +980,56 @@ impl Worker {
             text = %text,
             "heard"
         );
+        let who = last_match.as_ref().map(|(id, _)| id.clone());
         let mut o = Observation::new(self.source_name.clone(), "utterance", job.at)
             .with_payload(Payload::Text(text));
-        if let Some((id, _)) = &*last_match {
+        if let Some(id) = &who {
             o = o.with_entity(EntityHint::Known(id.clone()));
         }
         self.emit(o);
+
+        // The language the transcript is in, as its own observation so the
+        // deliberate path can answer in kind (the prompt language and the
+        // Kokoro voice are its and the speaker's business, not this
+        // crate's).
+        if let Some(lang) = analysis.language {
+            let mut o = Observation::new(self.source_name.clone(), "language", job.at)
+                .with_payload(Payload::Text(lang.to_owned()));
+            if let Some(id) = &who {
+                o = o.with_entity(EntityHint::Known(id.clone()));
+            }
+            self.emit(o);
+        }
+
+        // How it was said, against this speaker's own baseline.
+        if let Some(cal) = self.affect.as_mut()
+            && let Some(p) = prosody(&job.samples)
+        {
+            let key = who.as_ref().map_or(Calibrator::UNKNOWN, EntityId::as_str);
+            let affect = cal.rate(key, &p);
+            let confidence = (p.voiced_secs / p.span_secs.max(0.01)).clamp(0.0, 1.0);
+            tracing::debug!(
+                who = key,
+                arousal = affect.arousal,
+                valence = affect.valence,
+                pitch_hz = affect.pitch_hz,
+                rate_sps = affect.rate_sps,
+                "voice affect"
+            );
+            let arousal = affect.arousal;
+            let mut a = Observation::new(self.source_name.clone(), "voice_affect", job.at)
+                .with_confidence(confidence)
+                .with_payload(Payload::Opaque(Arc::new(affect)));
+            let mut l = Observation::new(self.source_name.clone(), "arousal", job.at)
+                .with_confidence(confidence)
+                .with_payload(Payload::Level(arousal));
+            if let Some(id) = &who {
+                a = a.with_entity(EntityHint::Known(id.clone()));
+                l = l.with_entity(EntityHint::Known(id.clone()));
+            }
+            self.emit(a);
+            self.emit(l);
+        }
     }
 }
 
@@ -998,9 +1178,11 @@ mod tests {
             jobs: jobs_rx,
             spec_slot: slot.clone(),
             spec_wake: wake_rx,
+            partial: Arc::default(),
             stt: Some(Box::new(CountingStt(calls.clone()))),
             encoder: None,
             gallery: Arc::new(InMemoryGallery::default()),
+            affect: None,
             source_name: "mic0".into(),
             clock: Arc::new(RealClock),
             tx,
@@ -1114,6 +1296,142 @@ mod tests {
         assert_eq!(r.calls.load(Ordering::Relaxed), 1);
         let s = r.finish();
         assert_eq!(s.speculations.load(Ordering::Relaxed), 1);
+    }
+
+    /// The deliberate path's early answer needs the transcript so far
+    /// while the judge holds a turn open: at each pause of a deferred
+    /// turn, one `partial_utterance` from the speculation, ahead of the
+    /// `turn_ended(false)` that follows it (see `PartialShared`).
+    #[cfg(feature = "mock")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_deferred_turn_emits_partials_at_each_pause() {
+        use crate::mock::MockInput;
+        use crate::vad::EnergyVad;
+
+        // Tone, pause, tone, pause: the judge defers the first pause and
+        // accepts the second. Paced at real time so the worker (a fake,
+        // instant) is always ahead of the 480 ms hangover, which is what
+        // happens with whisper (~100 ms) too.
+        let mut samples = Vec::new();
+        let tone = |secs: f32| {
+            (0..(secs * 16_000.0) as usize)
+                .map(|i| 0.3 * (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0).sin())
+        };
+        samples.extend(std::iter::repeat_n(0.0, 3200));
+        samples.extend(tone(0.8));
+        samples.extend(std::iter::repeat_n(0.0, 16_000));
+        samples.extend(tone(0.4));
+        samples.extend(std::iter::repeat_n(0.0, 16_000));
+        let source = MockInput::from_samples(&samples, 16_000, "two pauses").realtime(true);
+
+        let (jobs_tx, jobs_rx) = crossbeam_channel::bounded(2);
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let (source_tx, source_rx) = crossbeam_channel::bounded(1);
+        let _keep_source_tx = source_tx;
+        let slot: SpecSlot = Arc::default();
+        let partial: PartialSlot = Arc::default();
+        let (tx, rx) = ObservationRing::bounded(256);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Stats::default());
+        let clock: Arc<dyn Clock> = Arc::new(RealClock);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = Worker {
+            jobs: jobs_rx,
+            spec_slot: slot.clone(),
+            spec_wake: wake_rx,
+            partial: partial.clone(),
+            stt: Some(Box::new(CountingStt(calls.clone()))),
+            encoder: None,
+            gallery: Arc::new(InMemoryGallery::default()),
+            affect: None,
+            source_name: "mic0".into(),
+            clock: clock.clone(),
+            tx: tx.clone(),
+            stats: stats.clone(),
+        };
+        let pipeline = Pipeline {
+            source: Some(Box::new(source)),
+            aec: None,
+            source_rx,
+            listening: Arc::default(),
+            vad: Box::new(EnergyVad::new()),
+            gate: gate(vec![Ok((false, 0.2)), Ok((true, 0.9))]),
+            max_utterance_samples: 16_000 * 20,
+            preroll_frames: 2,
+            speculate_after_frames: 1,
+            spec_slot: slot,
+            spec_wake: wake_tx,
+            partial,
+            events: None,
+            source_name: "mic0".into(),
+            clock,
+            tx,
+            self_speaking: Arc::default(),
+            stop,
+            jobs: jobs_tx,
+            stats: stats.clone(),
+        };
+        let worker = std::thread::spawn(move || worker.run());
+        pipeline.run();
+        worker.join().ok();
+
+        let mut seen = Vec::new();
+        while let Ok(Some(o)) = rx.recv_timeout(Duration::from_millis(50)) {
+            seen.push(o);
+        }
+        let kinds: Vec<(String, Option<bool>, Option<String>)> = seen
+            .iter()
+            .filter(|o| o.modality != "audio_level")
+            .map(|o| {
+                (
+                    o.modality.to_string(),
+                    o.payload.as_bool(),
+                    o.payload.as_text().map(str::to_owned),
+                )
+            })
+            .collect();
+        eprintln!("{kinds:?}");
+        // The VAD edges land where the hangover puts them (the second
+        // partial goes out *during* the hangover, the worker being
+        // instant); what matters is each partial ahead of its verdict.
+        let kinds: Vec<_> = kinds
+            .into_iter()
+            .filter(|k| k.0 != "voice_activity")
+            .collect();
+        let names: Vec<&str> = kinds.iter().map(|k| k.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "partial_utterance",
+                "turn_ended",
+                "partial_utterance",
+                "turn_ended",
+                "utterance",
+            ],
+            "{kinds:?}"
+        );
+        assert_eq!(kinds[1].1, Some(false), "first verdict is a deferral");
+        assert_eq!(kinds[3].1, Some(true));
+        // The second partial covers the held audio plus the continuation,
+        // so it is longer than the first; the utterance is the same
+        // speculation reused (the fake reports the sample count).
+        let n = |t: &Option<String>| -> usize {
+            t.as_deref()
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        let (p1, p2, utt) = (n(&kinds[0].2), n(&kinds[2].2), n(&kinds[4].2));
+        assert!(p1 > 0 && p2 > p1, "{p1} {p2}");
+        assert_eq!(utt, p2, "the utterance reused the second speculation");
+        assert_eq!(stats.partials.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.deferrals.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "two speculations, no re-run"
+        );
     }
 
     #[test]

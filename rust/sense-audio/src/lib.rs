@@ -27,8 +27,15 @@
 //! | `turn_ended`     | `Bool(complete)`     | after each VAD end; confidence is the model's probability |
 //! | `voice_identity` | `Embedding`, entity `Known(id)` if matched | per utterance >= 1 s |
 //! | `utterance`      | `Text`, entity from the latest voice match | per transcribed utterance |
+//! | `partial_utterance` | `Text` (transcript so far), same entity | while the judge holds a turn open (see [`pipeline::PartialShared`]) |
+//! | `language`       | `Text("en"\|"hi"\|...)`, same entity | with each `utterance`; detected when [`AudioConfig::language`] is `None` on a multilingual model |
+//! | `voice_affect`   | `Opaque(Arc<`[`affect::Affect`]`>)`, same entity | with each `utterance` (>= 0.3 s voiced) |
+//! | `arousal`        | `Level(0..1)`, same entity | with each `voice_affect` |
+//! | `audio_event`    | `Text("music"\|"doorbell"\|"laughter"\|"knock"\|...)` | <= 1/s per class; `music` per beat (see [`events`]) |
 
 pub mod aec;
+pub mod affect;
+pub mod events;
 pub mod features;
 pub mod fft;
 pub mod input;
@@ -194,6 +201,18 @@ pub struct AudioConfig {
     /// What the speaker is playing, stamped with when: the reference the
     /// canceller subtracts. `None` means no cancellation (mute instead).
     pub far_end: Option<Arc<dyn aec::FarEndSource>>,
+    /// Language for whisper, ISO 639-1 (`"en"`, `"hi"`). `None` detects
+    /// per utterance -- with a multilingual model (`ggml-base.bin`); a
+    /// `.en` model is English whatever this says. Reported on the
+    /// `language` observation either way.
+    pub language: Option<String>,
+    /// `YAMNet` ONNX model for `audio_event`; `None` (or a load failure)
+    /// runs the DSP heuristic instead. See [`events`].
+    pub sound_model: Option<PathBuf>,
+    /// Whether to emit `audio_event` at all.
+    pub audio_events: bool,
+    /// Whether to emit `voice_affect` / `arousal` with each utterance.
+    pub affect: bool,
 }
 
 impl std::fmt::Debug for AudioConfig {
@@ -217,6 +236,10 @@ impl std::fmt::Debug for AudioConfig {
             .field("warm_up", &self.warm_up)
             .field("aec", &self.aec)
             .field("far_end", &self.far_end.as_ref().map(|_| "set"))
+            .field("language", &self.language)
+            .field("sound_model", &self.sound_model)
+            .field("audio_events", &self.audio_events)
+            .field("affect", &self.affect)
             .finish()
     }
 }
@@ -252,6 +275,10 @@ impl AudioConfig {
             warm_up: true,
             aec: true,
             far_end: None,
+            language: None,
+            sound_model: Some(dir.join("yamnet/yamnet.onnx")),
+            audio_events: true,
+            affect: true,
         }
     }
 
@@ -263,6 +290,7 @@ impl AudioConfig {
         self.whisper_model = None;
         self.voiceid_model = None;
         self.vad_model = None;
+        self.sound_model = None;
         self
     }
 }
@@ -508,6 +536,7 @@ struct Prepared {
     encoder: Option<Encoder>,
     gallery: Arc<dyn VoiceGallery>,
     vad: Box<dyn Detector>,
+    events: Option<events::EventDetector>,
 }
 
 impl AudioSense {
@@ -593,7 +622,11 @@ impl AudioSense {
         };
         let stt: Option<Box<dyn Transcriber>> = match &config.whisper_model {
             Some(p) => {
-                let mut w = Whisper::open(p, config.whisper_threads)?;
+                let mut w = Whisper::open_with_language(
+                    p,
+                    config.whisper_threads,
+                    config.language.as_deref(),
+                )?;
                 if config.warm_up {
                     w.warm_up()?;
                 }
@@ -618,12 +651,21 @@ impl AudioSense {
         let hangover_ms = energy.hangover_duration(config.sample_rate).as_millis();
 
         let vad = open_vad(config, energy, judge.is_some(), hangover_ms)?;
+        // Never fatal: the heuristic stands in for a missing YAMNet.
+        let events = config.audio_events.then(|| {
+            events::EventDetector::open(
+                config.sound_model.as_deref(),
+                &config.ort_lib,
+                config.warm_up,
+            )
+        });
         Ok(Prepared {
             judge,
             stt,
             encoder,
             gallery,
             vad,
+            events,
         })
     }
 
@@ -643,6 +685,7 @@ impl AudioSense {
             encoder,
             gallery,
             vad,
+            events,
         } = prepared;
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
@@ -655,6 +698,7 @@ impl AudioSense {
         // Speculations go through a one-slot mailbox plus a wake-up; a
         // newer pause replaces an older one nobody has picked up.
         let spec_slot: pipeline::SpecSlot = Arc::default();
+        let partial: pipeline::PartialSlot = Arc::default();
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         let listening = Arc::new(AtomicBool::new(false));
         let slot = SourceSlot {
@@ -692,6 +736,8 @@ impl AudioSense {
             },
             spec_slot: spec_slot.clone(),
             spec_wake: wake_tx,
+            partial: partial.clone(),
+            events,
             source_name: config.source_name.clone(),
             clock: clock.clone(),
             tx: tx.clone(),
@@ -704,9 +750,11 @@ impl AudioSense {
             jobs: jobs_rx,
             spec_slot,
             spec_wake: wake_rx,
+            partial,
             stt,
             encoder,
             gallery,
+            affect: config.affect.then(affect::Calibrator::new),
             source_name: config.source_name,
             clock,
             tx,
