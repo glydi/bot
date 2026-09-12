@@ -70,7 +70,27 @@ struct Intent {
     entity: Option<String>,
     #[serde(default)]
     goal: Option<String>,
+    /// `greet` only: the display name, when the world knows it.
+    #[serde(default)]
+    name: Option<String>,
+    /// `greet` only: this is a return after this long away.
+    #[serde(default)]
+    returned_after_secs: Option<u64>,
 }
+
+/// What the bot says to someone it does not know. Once per track (the
+/// planner guarantees that); the answer is handled by [`Session::pending_name`].
+pub const ASK_NAME_LINE: &str = "Hi! I don't think we've met. What's your name?";
+
+/// How long after asking for a name the next utterance counts as the
+/// answer. Longer and an unrelated remark gets a name forced out of it.
+pub const NAME_ANSWER_WINDOW: Duration = Duration::from_secs(20);
+
+/// Prefixed to the utterance that answers the name question. A small
+/// model given only the transcript "Ada" replies "Hi Ada!" and never calls
+/// `remember_name`; told what the exchange is, it calls the tool 6/6.
+pub const NAME_ANSWER_HINT: &str = "[note] You just asked this person their name and this is their \
+answer. Call remember_name with the name they give, then greet them by it.";
 
 /// Settings for the deliberate path.
 #[derive(Clone, Debug)]
@@ -147,6 +167,9 @@ pub struct Session {
     prefetched: HashMap<EntityId, Vec<String>>,
     /// When we last spoke an intent, per entity (`None` = no entity).
     last_intent_say: HashMap<Option<EntityId>, Instant>,
+    /// Who we asked for a name, and when; the next utterance within
+    /// [`NAME_ANSWER_WINDOW`] is the answer.
+    pending_name: Option<(Option<EntityId>, Instant)>,
 }
 
 impl Session {
@@ -175,6 +198,7 @@ impl Session {
             condense_rx,
             prefetched: HashMap::new(),
             last_intent_say: HashMap::new(),
+            pending_name: None,
         }
     }
 
@@ -241,10 +265,66 @@ impl Session {
                 };
                 let facts = self.facts.recall(&id);
                 tracing::info!(%id, n = facts.len(), "prefetched for the next prompt");
-                self.prefetched.insert(id, facts);
+                self.prefetched.insert(id.clone(), facts);
+                // A recall raised for a greeting is a greeting: the person
+                // walked in and the world has no name for them yet. Say
+                // hello now rather than after they speak first.
+                if intent.goal.as_deref() == Some("greet") {
+                    self.proactive(Some(id), "Hi there.".to_owned());
+                }
+            }
+            "greet" => {
+                let line = match (&intent.name, intent.returned_after_secs) {
+                    (Some(n), Some(away)) => {
+                        let ago = if away >= 3600 {
+                            format!("{} hours", away / 3600)
+                        } else {
+                            format!("{} minutes", (away / 60).max(1))
+                        };
+                        format!("Welcome back, {n}. You were gone about {ago}.")
+                    }
+                    (Some(n), None) => format!("Hi {n}."),
+                    (None, Some(_)) => "Welcome back.".to_owned(),
+                    (None, None) => "Hi there.".to_owned(),
+                };
+                // What they were last talking about, if memory has it: the
+                // most recent fact is the most relevant thing to pick up.
+                let line = match entity.as_ref().and_then(|id| self.facts.recall(id).pop()) {
+                    Some(fact) if intent.returned_after_secs.is_some() => {
+                        format!("{line} Last time: {}", fact.trim_end_matches('.'))
+                    }
+                    _ => line,
+                };
+                self.proactive(entity, line);
+            }
+            "ask_name" => {
+                if self.proactive(entity.clone(), ASK_NAME_LINE.to_owned()) {
+                    self.pending_name = Some((entity, self.clock.now()));
+                }
             }
             other => tracing::warn!(decision = other, "unknown intent decision"),
         }
+    }
+
+    /// Say something the planner decided on, without an LLM round-trip.
+    /// One line per entity per [`INTENT_SAY_GAP`] and never over the bot's
+    /// own voice; returns whether it was said. Pushed into history as an
+    /// assistant turn so the model knows it already greeted.
+    fn proactive(&mut self, entity: Option<EntityId>, line: String) -> bool {
+        let now = self.clock.now();
+        let recently = self
+            .last_intent_say
+            .get(&entity)
+            .is_some_and(|t| now.saturating_duration_since(*t) < INTENT_SAY_GAP);
+        if recently {
+            tracing::debug!(?entity, "intent suppressed: spoke to them recently");
+            return false;
+        }
+        self.last_intent_say.insert(entity, now);
+        tracing::info!(line, "proactive");
+        self.conversation.push(Message::assistant(&line));
+        self.say(line);
+        true
     }
 
     /// After a tool ran: a successful `remember_name` has attached a name
@@ -337,7 +417,17 @@ impl Session {
     ) -> Result<TurnEnd, LlmError> {
         let started = self.clock.now();
         self.ui("thinking");
-        self.conversation.push(Message::user(text));
+        // The reply to "what's your name?" arrives as an ordinary utterance;
+        // the model is told what it is so it enrols rather than just chats.
+        let answering_name = self.pending_name.take().is_some_and(|(_, asked)| {
+            started.saturating_duration_since(asked) < NAME_ANSWER_WINDOW
+        });
+        if answering_name {
+            self.conversation
+                .push(Message::user(format!("{NAME_ANSWER_HINT}\n\n{text}")));
+        } else {
+            self.conversation.push(Message::user(text));
+        }
         let result = self.respond(speaker, obs, &cancel).await;
         // Prefetched facts were for this prompt; the next turn reads the
         // store, which may have gained a `remember` since.
@@ -1358,8 +1448,12 @@ mod tests {
             session.prefetched(&EntityId::new("john")),
             Some(["John is writing a Rust project.".to_owned()].as_slice())
         );
-        // Nothing is said for a recall: it is preparation, not speech.
-        assert!(drain(&commands).is_empty());
+        // A recall raised for a greeting says hello now; the facts wait
+        // for the next prompt.
+        let said = drain(&commands);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].1, "say");
+        assert_eq!(said[0].2, "Hi there.");
 
         let (_tx, mut rx) = mpsc::channel(1);
         session
@@ -1492,5 +1586,84 @@ mod tests {
         drop(obs_tx);
         drop(tx);
         handle.shutdown();
+    }
+
+    #[test]
+    fn greet_intents_speak_once_per_entity_and_phrase_returns() {
+        let r = rig(vec![], vec![person("john", true)]);
+        let mut session = r.session;
+        session.handle_intent(&intent(
+            r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+        ));
+        let said = drain(&r.commands);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].2, "Hi John.");
+        // Within the gap, nothing more for the same person.
+        session.handle_intent(&intent(
+            r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+        ));
+        assert!(drain(&r.commands).is_empty());
+        // A different person, returning after 11 minutes.
+        session.handle_intent(&intent(
+            r#"{"decision":"greet","name":"Ada","returned_after_secs":660,"entity":"ada","goal":"greet"}"#,
+        ));
+        let said = drain(&r.commands);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].2.starts_with("Welcome back, Ada."), "{}", said[0].2);
+        assert!(said[0].2.contains("11 minutes"), "{}", said[0].2);
+        // The greeting is in the history, so the model knows it happened.
+        assert!(
+            session
+                .conversation()
+                .history()
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content == "Hi John.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_answer_is_flagged_for_the_model() {
+        let mut r = rig(vec![Script::text(&["Hi Ada."])], vec![]);
+        r.session.handle_intent(&intent(
+            r#"{"decision":"ask_name","entity":"track:7","goal":"ask_name"}"#,
+        ));
+        let said = drain(&r.commands);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].2, ASK_NAME_LINE);
+        r.session
+            .handle_utterance("Ada", None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        let req = &r.llm.requests()[0];
+        let last_user = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(
+            last_user.content.contains(NAME_ANSWER_HINT),
+            "{}",
+            last_user.content
+        );
+        assert!(last_user.content.ends_with("Ada"), "{}", last_user.content);
+        // Consumed: the next utterance is ordinary.
+        r.session
+            .handle_utterance(
+                "How are you?",
+                None,
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .ok();
+        let req = &r.llm.requests()[1];
+        let last_user = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(!last_user.content.contains(NAME_ANSWER_HINT));
     }
 }
