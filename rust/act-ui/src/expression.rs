@@ -344,6 +344,23 @@ impl FaceState {
         self.activity_at = now;
     }
 
+    /// Something happened that is not a state change -- a face came into
+    /// view -- which still means the bot is not alone, so it must not
+    /// nod off (and wakes if it had).
+    pub fn touch(&mut self, now: Instant) {
+        self.activity_at = now;
+    }
+
+    /// How long since anything last happened: the clock behind
+    /// [`SLEEP_AFTER`], which the companion layer uses to doze off ahead
+    /// of it. Zero while the bot is busy.
+    pub fn idle_for(&self, now: Instant) -> Duration {
+        if self.speaking || self.hearing || self.thinking.is_some() {
+            return Duration::ZERO;
+        }
+        now.saturating_duration_since(self.activity_at)
+    }
+
     /// The raw level, 0..1.
     pub fn level(&self) -> f32 {
         self.level

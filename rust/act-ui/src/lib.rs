@@ -10,6 +10,16 @@
 //!   alias, see [`Expression`].
 //! * `listening` / `thinking` / `speaking` / `idle` -- the loop's own
 //!   transitions.
+//! * `react` (`Payload::Text`) -- a short one-shot reaction played over
+//!   whatever the face is doing, see [`Reaction`]: `nod`, `shake`,
+//!   `wink`, `gasp`, `laugh`, `hmm` (each at most 1.5 s), plus the idle
+//!   repertoire's own moves `yawn`, `stretch`, `look_around`,
+//!   `double_take`. A reaction is not a state change: it does not clear
+//!   `thinking`, does not count as activity for the sleep timer, and a
+//!   second `react` replaces the first. Unknown names are logged and
+//!   dropped. While the bot is speaking a reaction's mouth (the laugh's
+//!   open smile, the gasp's O) is not drawn -- the lips belong to the
+//!   audio -- but its body movement still is.
 //!
 //! It also reads observations when it is given a ring: `self_speaking`,
 //! `audio_level` and `spoke` from the speaker (source `"speaker"`) drive
@@ -18,6 +28,29 @@
 //! actual audio rather than a generic talking animation -- lip movement
 //! that disagrees with the sound is worse than no lip movement at all
 //! (`go/internal/ui/face.go`).
+//!
+//! Two more observations feed the companion layer ([`behaviour`]):
+//!
+//! * `face` (from the camera, any payload) and a true `voice_activity`
+//!   mean someone is here: the idle repertoire runs less often, the
+//!   sleep timer is held off, and a sleeping face wakes with a blink.
+//! * `audio_event` with `Payload::Text("music")` -- the contract for a
+//!   sense that does not exist yet (a music detector on the mic): send
+//!   one per detected beat, or at least one every 2 s while music is
+//!   heard. The face sways to it, taking the beat from the spacing of
+//!   the events when that lands between 0.5 and 1 Hz (one event per
+//!   beat at 30-60 bpm, or every other beat at 60-120), otherwise at
+//!   0.7 Hz. The sway stops 2 s after the last event. `source` is free
+//!   (`mic0` is expected); `confidence` is not consulted -- the sense
+//!   should not send an event it does not believe.
+//!
+//! # Being a companion
+//!
+//! Idle for more than 8 s, the face starts doing things on its own on a
+//! seeded random schedule: looking around, yawning, stretching, a
+//! double-take; after three minutes its eyes drift shut and it sleeps
+//! until a voice or a face wakes it. None of that runs while the loop is
+//! listening, thinking or speaking. See [`behaviour`].
 //!
 //! # The face
 //!
@@ -42,6 +75,7 @@
 //! for `common` (see `router.rs`). Both actuators take a
 //! `crossbeam_channel::Receiver<Command>`.
 
+pub mod behaviour;
 pub mod debug;
 pub mod expression;
 pub mod face;
@@ -56,6 +90,7 @@ use std::time::{Duration, Instant};
 use common::{Command, RingReceiver};
 use crossbeam_channel::Receiver;
 
+pub use behaviour::{Behaviour, Overlay, Reaction};
 pub use debug::Sources;
 pub use expression::{Expression, FaceState};
 pub use router::{CommandRouter, RouterHandle};
@@ -248,6 +283,12 @@ impl eframe::App for FaceApp {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.debug, "debug");
                 ui.weak(expression.name());
+                // What the companion layer is doing, if anything.
+                if let Some(r) = self.state.behaviour.playing() {
+                    ui.weak(r.name());
+                } else if self.state.behaviour.swaying(now) {
+                    ui.weak("music");
+                }
                 // The level shows as the ring around the shell; the bar is
                 // a debugging aid: the speaker's envelope while talking,
                 // the mic's level otherwise.
@@ -281,6 +322,7 @@ impl eframe::App for FaceApp {
                     &self.motion,
                     expression,
                     self.state.face.mouth_open(now),
+                    &self.state.overlay(now),
                     now,
                 );
             }
@@ -289,8 +331,12 @@ impl eframe::App for FaceApp {
         // 60 fps while anything moves (a blink, a transition, speech), 30
         // when the face is only breathing: the idle window should not cost
         // a core.
-        ui.ctx()
-            .request_repaint_after(self.motion.repaint_after(now, expression));
+        let wait = if self.state.behaviour.busy(now) {
+            face::ACTIVE_FRAME
+        } else {
+            self.motion.repaint_after(now, expression)
+        };
+        ui.ctx().request_repaint_after(wait);
     }
 }
 
@@ -356,6 +402,7 @@ impl Headless {
                             state.on_observation(&o, now);
                         }
                     }
+                    state.tick(now);
                     // Log transitions only: headless runs are read from logs,
                     // and a line per frame would bury everything else.
                     let e = state.expression(now);

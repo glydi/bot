@@ -5,6 +5,8 @@
 //!     cargo run -p act-ui --example face -- listen          # same, short form
 //!     cargo run -p act-ui --example face -- idle --debug    # with the panel open
 //!     cargo run -p act-ui --example face -- --level-demo    # talks
+//!     cargo run -p act-ui --example face -- --react laugh   # a reaction every 2.5 s
+//!     cargo run -p act-ui --example face -- --music         # sways to a 0.8 Hz beat
 //!
 //! Runs on the main thread, like the binary must. The screenshots in
 //! `docs/` come from `--state <name>`, captured a few seconds in; the
@@ -26,15 +28,36 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let level_demo = args.iter().any(|a| a == "--level-demo");
     let debug = args.iter().any(|a| a == "--debug");
+    let music = args.iter().any(|a| a == "--music");
+    // `--react <name>`: play that reaction over the held state every
+    // 2.5 s (the yawn is 1.6 s; the pause between lets it read as one).
+    let react = args
+        .iter()
+        .position(|a| a == "--react")
+        .and_then(|i| args.get(i + 1))
+        .map(|a| {
+            act_ui::Reaction::parse(a).unwrap_or_else(|| {
+                eprintln!("unknown reaction {a:?}; try nod, shake, wink, gasp, laugh, hmm, yawn");
+                std::process::exit(2);
+            })
+        });
     // `--state <name>`, or a bare state name anywhere in the arguments;
     // `--level-demo` is `--state speaking`.
     let hold = args
         .iter()
         .position(|a| a == "--state")
         .and_then(|i| args.get(i + 1))
-        .or_else(|| args.iter().find(|a| !a.starts_with("--")))
+        .or_else(|| {
+            // A bare state name, skipping the value of `--react`.
+            let mut skip = false;
+            args.iter().find(|a| {
+                let take = !skip && !a.starts_with("--");
+                skip = *a == "--react";
+                take
+            })
+        })
         .map(String::as_str)
-        .or_else(|| level_demo.then_some("speaking"))
+        .or_else(|| (level_demo || react.is_some() || music).then_some("idle"))
         .and_then(|a| {
             let e = Expression::parse(a);
             if e.is_none() {
@@ -50,10 +73,34 @@ fn main() {
     let _router = router.spawn().unwrap_or_else(|e| panic!("router: {e}"));
     let (obs_tx, obs_rx) = ObservationRing::bounded(64);
 
-    // A driver: either one state held, or a tour of all twelve, with a
-    // speech-shaped level while speaking so the mouth has something to
-    // follow.
-    std::thread::spawn(move || {
+    std::thread::spawn(move || drive(hold, react, music, &queue, &obs_tx));
+
+    let sources = demo_sources();
+
+    // The panel is off by default, as in the binary: the face is the
+    // product and the panel is for whoever is debugging it.
+    let config = UiConfig {
+        debug,
+        ..UiConfig::default()
+    };
+    if let Err(e) = run_ui(&config, ui_rx, Some(obs_rx), sources) {
+        eprintln!("ui: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// The driver: either one state held, or a tour of all twelve, with a
+/// speech-shaped level while speaking so the mouth has something to
+/// follow; a reaction every 2.5 s with `--react`, a beat every 1.25 s
+/// with `--music`.
+fn drive(
+    hold: Option<Expression>,
+    react: Option<act_ui::Reaction>,
+    music: bool,
+    queue: &CommandQueue,
+    obs_tx: &common::RingSender,
+) {
+    {
         let states = [
             "idle",
             "listening",
@@ -73,14 +120,19 @@ fn main() {
             let name = if let Some(e) = hold {
                 e.name()
             } else {
-                let n = states[i % states.len()];
-                i += 1;
-                n
+                states[i % states.len()]
             };
-            queue.push(
-                Command::new("ui", "expression", Priority::Deliberate)
-                    .with_payload(Payload::Text(name.to_owned())),
-            );
+            // A held `idle` is sent once: an `idle` command counts as
+            // activity, and re-sending it every three seconds would keep
+            // the face from ever dozing off (`--state idle` is how to
+            // watch the idle repertoire and the doze at three minutes).
+            if hold != Some(Expression::Idle) || i == 0 {
+                queue.push(
+                    Command::new("ui", "expression", Priority::Deliberate)
+                        .with_payload(Payload::Text(name.to_owned())),
+                );
+            }
+            i += 1;
             // By the parsed state, not the name: `speaking` parses to
             // `loud`, whose name is not "speaking".
             let speaking = Expression::parse(name).is_some_and(Expression::is_speaking);
@@ -90,7 +142,22 @@ fn main() {
             );
             // Three seconds per state, at the speaker's 50 Hz block rate.
             let mut phrase_seen = usize::MAX;
-            for _ in 0..150 {
+            for tick in 0..150u32 {
+                // A reaction every 2.5 s, a music beat every 1.25 s.
+                if let Some(r) = react {
+                    if tick % 125 == 10 {
+                        queue.push(
+                            Command::new("ui", "react", Priority::Deliberate)
+                                .with_payload(Payload::Text(r.name().to_owned())),
+                        );
+                    }
+                }
+                if music && tick % 62 == 0 {
+                    obs_tx.send(
+                        Observation::new("mic0", "audio_event", Instant::now())
+                            .with_payload(Payload::Text("music".to_owned())),
+                    );
+                }
                 if speaking {
                     let t = t0.elapsed().as_secs_f32() % PATTERN_SECS;
                     let (level, phrase) = speech_level(t);
@@ -119,19 +186,6 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-    });
-
-    let sources = demo_sources();
-
-    // The panel is off by default, as in the binary: the face is the
-    // product and the panel is for whoever is debugging it.
-    let config = UiConfig {
-        debug,
-        ..UiConfig::default()
-    };
-    if let Err(e) = run_ui(&config, ui_rx, Some(obs_rx), sources) {
-        eprintln!("ui: {e}");
-        std::process::exit(1);
     }
 }
 

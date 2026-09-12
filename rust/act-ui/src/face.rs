@@ -83,6 +83,24 @@
 //! the small opening of an unstressed syllable. `docs/face-<state>.png`
 //! are screenshots of `cargo run -p act-ui --example face -- --state
 //! <state>`, for comparison when touching the drawing code.
+//!
+//! # The companion layer
+//!
+//! On top of the pose, [`draw`] applies an [`Overlay`] from
+//! [`behaviour`](crate::behaviour): the idle repertoire, the one-shot
+//! reactions, the music sway and the doze before sleep. It is added
+//! after the pose blend, never into it, and its mouths are skipped while
+//! speaking. Screenshots, all from the example:
+//!
+//! * `docs/face-yawn.png` -- `--react yawn`, mid-yawn: the tall open
+//!   mouth ([`draw_yawn`]) with the lids down and the head tipped back.
+//! * `docs/face-laugh.png` -- `--react laugh`: squinted eyes, the open
+//!   smile with teeth and tongue ([`draw_laugh`]), caught on a bounce.
+//! * `docs/face-music.png` -- `--music`: leaning into a sway with the
+//!   ring lit on the beat.
+//! * `docs/face-asleep.png` -- `--state asleep`, where `--state idle`
+//!   arrives on its own after three minutes, the lids drifting shut over
+//!   the last 2.5 s on the way there.
 
 use std::cell::Cell;
 use std::f32::consts::{PI, TAU};
@@ -90,6 +108,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, TextureHandle, Vec2, pos2, vec2};
 
+use crate::behaviour::Overlay;
 use crate::expression::Expression;
 
 /// The stage's aspect ratio, from the design HTML (and the shell image).
@@ -128,6 +147,19 @@ const GAZE_TRAVEL: Vec2 = vec2(0.16, 0.10);
 /// A glance with no direction to aim at decays over this long, then the
 /// eyes go back to their idle wandering.
 pub const GLANCE_TTL: Duration = Duration::from_millis(1200);
+
+/// An `attend` with a bearing is held this long, then the eyes drift
+/// home rather than flick: attention that lets go slowly reads as
+/// interest, a snap back reads as being startled.
+pub const ATTEND_HOLD: Duration = Duration::from_secs(3);
+
+/// Gaze easing per frame: the flick (0.35 of the remaining distance, the
+/// Go face's snap), the swing between two held bearings (two people
+/// talking in turn get a look that travels between them), and the drift
+/// home after a hold.
+const GAZE_SNAP: f32 = 0.35;
+const GAZE_SWING: f32 = 0.14;
+const GAZE_DRIFT: f32 = 0.06;
 
 /// How long a change of expression takes to play out. Short enough that a
 /// `listening` still lands before the person's second word, long enough
@@ -196,8 +228,11 @@ pub struct Motion {
     gaze_target: Vec2,
     saccade_at: Instant,
     micro_at: Instant,
-    /// Where an `attend` command is pointing, and when it landed.
+    /// Where an `attend` command is pointing, and until when it is held.
     glance: Option<(Vec2, Instant)>,
+    /// How much of the way to the target the gaze moves per frame, see
+    /// [`GAZE_SNAP`].
+    gaze_rate: f32,
     /// The talking head tilt, radians, eased toward its target; the
     /// target flips between a small angle and zero every 1-2 s while
     /// speaking, see [`Self::head_tilt`].
@@ -233,6 +268,7 @@ impl Motion {
             saccade_at: now,
             micro_at: now,
             glance: None,
+            gaze_rate: GAZE_SNAP,
             tilt: 0.0,
             tilt_target: 0.0,
             tilt_at: now,
@@ -268,9 +304,19 @@ impl Motion {
             let side = if self.rand() < 0.5 { -1.0 } else { 1.0 };
             vec2(side * (self.rand() * 0.4 + 0.5), self.rand() * 0.3 - 0.2)
         };
-        self.glance = Some((dir, now));
+        // A bearing is held for ATTEND_HOLD; a glance decays sooner. A
+        // second bearing while one is held swings the eyes over instead
+        // of flicking, so alternating attends read as following a
+        // conversation rather than twitching between two people.
+        let (hold, rate) = match (azimuth_deg, self.glance) {
+            (Some(_), Some(_)) => (ATTEND_HOLD, GAZE_SWING),
+            (Some(_), None) => (ATTEND_HOLD, GAZE_SNAP),
+            (None, _) => (GLANCE_TTL, GAZE_SNAP),
+        };
+        self.gaze_rate = rate;
+        self.glance = Some((dir, now + hold));
         self.gaze_target = dir;
-        self.saccade_at = now + GLANCE_TTL;
+        self.saccade_at = now + hold;
     }
 
     /// Advance one frame.
@@ -315,7 +361,14 @@ impl Motion {
         // speaking mostly hold eye contact, with small breaks -- staring
         // unblinkingly at someone is its own uncanny signal.
         if now >= self.saccade_at {
-            self.glance = None;
+            if self.glance.take().is_some() {
+                // The hold is over: drift home, and only then wander.
+                self.gaze_target = Vec2::ZERO;
+                self.gaze_rate = GAZE_DRIFT;
+                self.saccade_at = now + GLANCE_TTL;
+                return self.tick_tilt(now, expression);
+            }
+            self.gaze_rate = GAZE_SNAP;
             match expression {
                 Expression::Thinking => {
                     let sign = if self.rand() < 0.5 { -1.0 } else { 1.0 };
@@ -349,9 +402,14 @@ impl Motion {
             self.micro_at = now + secs(self.rand() * 0.7 + 0.25);
         }
 
-        // Snap, don't slide: 0.35 of the remaining distance per frame.
-        self.gaze += (self.gaze_target - self.gaze) * 0.35;
+        // Snap, don't slide: 0.35 of the remaining distance per frame
+        // (less while swinging between two bearings or drifting home).
+        self.gaze += (self.gaze_target - self.gaze) * self.gaze_rate;
+        self.tick_tilt(now, expression);
+    }
 
+    /// The second half of [`Self::tick`]: the talking head tilt.
+    fn tick_tilt(&mut self, now: Instant, expression: Expression) {
         // The talking head tilt: every 1-2 s, lean 1-2.5 degrees to one
         // side or come back to level, eased so it is a lean and not a
         // twitch. People move their head when they talk and hold it still
@@ -1211,6 +1269,13 @@ impl Pose {
 /// `level` is the mouth opening 0..1 (`FaceState::mouth_open`); it only
 /// moves the mouth, the jaw and the eyes while the expression is one of
 /// the speaking pair, so lip movement can never disagree with the audio.
+///
+/// `over` is the companion layer's [`Overlay`] (a reaction, an idle
+/// move, the music sway): added on top of the blended pose, never
+/// blended into it, so a nod mid-transition still ends exactly where the
+/// transition does. Its mouths (yawn, laugh, gasp) are skipped while
+/// speaking: the lips belong to the audio then.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     painter: &egui::Painter,
     rect: Rect,
@@ -1218,6 +1283,7 @@ pub fn draw(
     motion: &Motion,
     e: Expression,
     level: f32,
+    over: &Overlay,
     now: Instant,
 ) {
     let t = motion.elapsed(now);
@@ -1235,13 +1301,26 @@ pub fn draw(
     };
     motion.last_pose.set(p);
 
+    // The overlay's mouths never compete with the talking mouth.
+    let over = if e.is_speaking() {
+        Overlay {
+            yawn: 0.0,
+            laugh: 0.0,
+            gasp: 0.0,
+            ..*over
+        }
+    } else {
+        *over
+    };
+    let mouth = over.mouth();
+
     let cv = Canvas {
         painter,
         rect,
         pivot: vec2(0.5, 0.6),
-        offset: p.body.offset,
-        rot: p.body.rot + motion.head_tilt(),
-        scale: p.body.scale,
+        offset: p.body.offset + over.offset,
+        rot: p.body.rot + motion.head_tilt() + over.rot,
+        scale: p.body.scale * over.scale,
     };
     let stage = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
@@ -1272,22 +1351,44 @@ pub fn draw(
     // 2. The audio ring: a thin line hugging the shell that brightens and
     // thickens with the level. The operator's meter, drawn as part of the
     // face rather than as a bar.
-    if p.ring_alpha > 0.002 {
-        let a = p.ring_alpha * (0.30 + 0.60 * level);
+    // While music plays the ring pulses on the beat instead.
+    let ring = (p.ring_alpha * (0.30 + 0.60 * level)).max(over.ring * 0.75);
+    if ring > 0.002 {
+        let pulse = if p.ring_alpha > 0.002 {
+            level
+        } else {
+            over.ring
+        };
         cv.line(
             shell_outline(1.06).chain(shell_outline(1.06).take(1)),
-            cv.w() * (0.005 + 0.006 * level),
-            CREAM.gamma_multiply(a),
+            cv.w() * (0.005 + 0.006 * pulse),
+            CREAM.gamma_multiply(ring),
         );
     }
 
-    // 3. Eyes: the two PNGs, drawn lids, X's, each at its opacity.
-    draw_open_eyes(&cv, tex, &p, motion.gaze(), motion.lid_open(now));
+    // 3. Eyes: the two PNGs, drawn lids, X's, each at its opacity. The
+    // overlay adds to the gaze and shuts each lid on its own (a wink),
+    // and can widen the boxes (a gasp).
+    let gaze = motion.gaze() + over.gaze;
+    let gaze = vec2(gaze.x.clamp(-1.0, 1.0), gaze.y.clamp(-1.0, 1.0));
+    let lid = motion.lid_open(now);
+    let lids = [lid * over.lids[0], lid * over.lids[1]];
+    draw_open_eyes(&cv, tex, &p, gaze, lids, over.eye_scale);
     draw_lids(&cv, &p);
     draw_x_eyes(&cv, p.x_alpha);
 
-    // 4. Mouths.
+    // 4. Mouths. The expression's own mouth fades to make room for an
+    // overlay mouth, which is drawn after it.
+    let p = Pose {
+        smile_alpha: p.smile_alpha * (1.0 - mouth),
+        flat_alpha: p.flat_alpha * (1.0 - mouth),
+        wavy_alpha: p.wavy_alpha * (1.0 - mouth),
+        open_alpha: p.open_alpha.max(over.gasp),
+        ..p
+    };
     draw_mouths(&cv, tex, &p);
+    draw_yawn(&cv, over.yawn);
+    draw_laugh(&cv, over.laugh);
 
     // 5. Extras outside the features.
     draw_zzz(&cv, t, p.zzz_alpha);
@@ -1315,11 +1416,23 @@ fn draw_vignette(painter: &egui::Painter) {
     painter.add(Shape::mesh(mesh));
 }
 
-fn draw_open_eyes(cv: &Canvas, tex: &FaceTextures, p: &Pose, gaze: Vec2, open: f32) {
+fn draw_open_eyes(
+    cv: &Canvas,
+    tex: &FaceTextures,
+    p: &Pose,
+    gaze: Vec2,
+    lids: [f32; 2],
+    eye_scale: f32,
+) {
     if p.eyes_alpha <= 0.002 {
         return;
     }
-    for eye in p.eyes {
+    for (i, eye) in p.eyes.into_iter().enumerate() {
+        let open = lids[i];
+        let eye = EyeBox {
+            rect: scale_about(eye.rect, EYE_ORIGIN, eye_scale),
+            rot: eye.rot,
+        };
         cv.image(&tex.eye, eye.rect, EYE_ORIGIN, eye.rot, open, p.eyes_alpha);
         // The pupil rides inside the white, on the same canvas, offset by
         // the gaze; the travel is small enough that it stays on the white.
@@ -1496,6 +1609,90 @@ fn draw_lips(cv: &Canvas, l: &Lips, alpha: f32) {
     }
 }
 
+/// `r` scaled by `k` about the point at `origin` (fractions of `r`).
+fn scale_about(r: Rect, origin: Vec2, k: f32) -> Rect {
+    let o = r.min + r.size() * origin;
+    Rect::from_min_max(o + (r.min - o) * k, o + (r.max - o) * k)
+}
+
+/// The yawn's mouth: a tall open ellipse where the smile was, a dark
+/// interior with the cream rim, taller than the surprised O and wider
+/// at the bottom the way a jaw drops. `k` is 0 (nothing) to 1 (full
+/// stretch).
+fn draw_yawn(cv: &Canvas, k: f32) {
+    if k <= 0.002 {
+        return;
+    }
+    let w = cv.w();
+    let size = vec2(0.055 + 0.045 * k, 0.03 + 0.125 * k);
+    let bx = Rect::from_center_size(pos2(0.5, 0.665 + size.y * 0.35), size);
+    cv.ellipse(
+        bx.expand2(bx.size() * 0.06),
+        0.0,
+        CREAM.gamma_multiply(0.08 * k),
+        Stroke::NONE,
+    );
+    cv.ellipse(
+        bx,
+        0.0,
+        MOUTH_DARK.gamma_multiply(k),
+        Stroke::new(w * 0.0077, CREAM.gamma_multiply(k)),
+    );
+    // The tongue, low in the mouth.
+    let tongue = Rect::from_center_size(
+        pos2(bx.center().x, bx.max.y - bx.height() * 0.22),
+        vec2(bx.width() * 0.7, bx.height() * 0.3),
+    );
+    cv.ellipse(tongue, 0.0, TONGUE.gamma_multiply(0.85 * k), Stroke::NONE);
+}
+
+/// The laugh's mouth: an open smile, a dark D on the mouth line with a
+/// cream rim, a row of teeth under the straight upper edge and the
+/// tongue at the bottom. `k` is 0 (nothing) to 1 (full).
+fn draw_laugh(cv: &Canvas, k: f32) {
+    if k <= 0.002 {
+        return;
+    }
+    let w = cv.w();
+    let size = vec2(0.15 + 0.09 * k, 0.07 + 0.11 * k);
+    // The D is the lower half of an ellipse centred on the mouth line.
+    let bx = Rect::from_center_size(pos2(0.5, 0.668), size);
+    let stroke = Stroke::new(w * 0.0115, CREAM.gamma_multiply(k));
+    let pts: Vec<Pos2> = Canvas::arc_points(bx, 0.0, PI, 0.0)
+        .map(|p| cv.at(p))
+        .collect();
+    cv.painter.add(Shape::convex_polygon(
+        pts,
+        MOUTH_DARK.gamma_multiply(k),
+        stroke,
+    ));
+    // Teeth: a pale band along the upper edge.
+    let teeth = Rect::from_min_size(
+        pos2(bx.min.x + bx.width() * 0.1, bx.center().y),
+        vec2(bx.width() * 0.8, bx.height() * 0.13),
+    );
+    let tp: Vec<Pos2> = [
+        teeth.min.to_vec2(),
+        vec2(teeth.max.x, teeth.min.y),
+        teeth.max.to_vec2(),
+        vec2(teeth.min.x, teeth.max.y),
+    ]
+    .into_iter()
+    .map(|p| cv.at(p))
+    .collect();
+    cv.painter.add(Shape::convex_polygon(
+        tp,
+        TEETH.gamma_multiply(0.75 * k),
+        Stroke::NONE,
+    ));
+    // The tongue.
+    let tongue = Rect::from_center_size(
+        pos2(bx.center().x, bx.center().y + bx.height() * 0.3),
+        vec2(bx.width() * 0.55, bx.height() * 0.32),
+    );
+    cv.ellipse(tongue, 0.0, TONGUE.gamma_multiply(0.85 * k), Stroke::NONE);
+}
+
 /// `.zzz`: a bold z rising from the top-right of the shell and fading,
 /// every 2.7 s; three of them staggered so there is always one in flight.
 fn draw_zzz(cv: &Canvas, t: f32, alpha: f32) {
@@ -1652,6 +1849,67 @@ mod tests {
             m.tick(now + Duration::from_millis(16 * i), Expression::Listening);
         }
         assert!(m.gaze().x.abs() > 0.3, "gaze {:?}", m.gaze());
+    }
+
+    #[test]
+    fn an_attend_with_a_bearing_is_held_then_drifts_home() {
+        let now = Instant::now();
+        let mut m = Motion::new(now);
+        m.attend(Some(-40.0), now);
+        let target = -40.0 / 60.0;
+        // Held: two and a half seconds in, the eyes are still on it,
+        // whatever the saccade timer would otherwise have done.
+        let mut i = 0;
+        while i * 16 < 2500 {
+            m.tick(now + Duration::from_millis(16 * i), Expression::Idle);
+            i += 1;
+        }
+        assert!(m.attending());
+        assert!((m.gaze().x - target).abs() < 0.05, "gaze {:?}", m.gaze());
+        // Past the hold it lets go slowly: not home yet a quarter of a
+        // second later, home well within two.
+        while i * 16 < 3250 {
+            m.tick(now + Duration::from_millis(16 * i), Expression::Idle);
+            i += 1;
+        }
+        assert!(!m.attending());
+        assert!(m.gaze().x < -0.15, "gaze {:?}", m.gaze());
+        // Home before the idle wandering takes over again (GLANCE_TTL
+        // after the hold).
+        while i * 16 < 4100 {
+            m.tick(now + Duration::from_millis(16 * i), Expression::Idle);
+            i += 1;
+        }
+        assert!(m.gaze().x.abs() < 0.1, "gaze {:?}", m.gaze());
+    }
+
+    #[test]
+    fn two_attends_in_a_row_swing_smoothly_between_them() {
+        let now = Instant::now();
+        let mut m = Motion::new(now);
+        m.attend(Some(60.0), now);
+        let mut prev = m.gaze().x;
+        let mut biggest_step = 0.0f32;
+        for i in 0..150 {
+            let at = now + Duration::from_millis(16 * i);
+            if i == 60 {
+                m.attend(Some(-60.0), at);
+            }
+            m.tick(at, Expression::Listening);
+            if i > 60 {
+                biggest_step = biggest_step.max((m.gaze().x - prev).abs());
+            }
+            prev = m.gaze().x;
+        }
+        // It got there...
+        assert!(m.gaze().x < -0.9, "gaze {:?}", m.gaze());
+        // ...without the flick's 0.35-of-two-units first frame.
+        assert!(biggest_step < 0.32, "{biggest_step}");
+        // A first attend from rest still flicks.
+        let mut m = Motion::new(now);
+        m.attend(Some(60.0), now);
+        m.tick(now, Expression::Listening);
+        assert!(m.gaze().x > 0.3, "gaze {:?}", m.gaze());
     }
 
     #[test]

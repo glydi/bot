@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 use common::{Command, Observation, Payload};
 use smol_str::SmolStr;
 
+use crate::behaviour::{Behaviour, Overlay, Reaction};
 use crate::expression::{Expression, FaceState};
+
+/// `Observation.modality` of a music event, see the crate docs.
+pub const AUDIO_EVENT: &str = "audio_event";
 
 /// How many recent commands the debug panel keeps. Enough to see a whole
 /// turn (a barge-in, a few sentences, the attend that followed) without
@@ -89,6 +93,8 @@ pub struct UiState {
     pub attends: u64,
     /// Commands consumed since start.
     pub seen: u64,
+    /// The companion layer: idle repertoire, reactions, the music sway.
+    pub behaviour: Behaviour,
     /// Speaker levels waiting out the output latency, with when each is due.
     pending_levels: VecDeque<(Instant, f32)>,
     /// See [`lip_sync_delay`].
@@ -96,20 +102,33 @@ pub struct UiState {
 }
 
 impl UiState {
-    /// Fresh state at `now`.
+    /// Fresh state at `now`, with the idle repertoire seeded from the
+    /// clock.
     pub fn new(now: Instant) -> Self {
+        Self::with_behaviour(Behaviour::new(now), now)
+    }
+
+    /// Fresh state with a fixed behaviour seed, so a test can replay the
+    /// idle schedule.
+    pub fn with_seed(seed: u64, now: Instant) -> Self {
+        Self::with_behaviour(Behaviour::with_seed(seed, now), now)
+    }
+
+    fn with_behaviour(behaviour: Behaviour, now: Instant) -> Self {
         Self {
             face: FaceState::new(now),
             commands: VecDeque::with_capacity(RECENT_COMMANDS),
             attend: None,
             attends: 0,
             seen: 0,
+            behaviour,
             pending_levels: VecDeque::with_capacity(16),
             lip_sync: lip_sync_delay(),
         }
     }
 
-    /// Per frame: release the speaker levels whose moment has come.
+    /// Per frame: release the speaker levels whose moment has come, and
+    /// advance the companion layer against the expression that results.
     pub fn tick(&mut self, now: Instant) {
         while let Some(&(due, l)) = self.pending_levels.front() {
             if due > now {
@@ -118,6 +137,13 @@ impl UiState {
             self.pending_levels.pop_front();
             self.face.set_level(l, due);
         }
+        let e = self.face.expression(now);
+        self.behaviour.tick(now, e, self.face.idle_for(now));
+    }
+
+    /// What the companion layer adds to the face this frame.
+    pub fn overlay(&self, now: Instant) -> Overlay {
+        self.behaviour.overlay(now)
     }
 
     /// Apply one command. Returns the expression after it, for logs.
@@ -153,6 +179,17 @@ impl UiState {
                     tracing::warn!(%name, "ui: unknown expression");
                 }
             }
+            // A one-shot reaction over the current state, see
+            // [`Reaction`]. Not a state change: it neither clears
+            // thinking nor counts as activity.
+            "react" => {
+                let name = cmd.payload.as_text().unwrap_or_default();
+                if let Some(r) = Reaction::parse(name) {
+                    self.behaviour.react(r, now);
+                } else {
+                    tracing::warn!(%name, "ui: unknown reaction");
+                }
+            }
             "listening" => self.face.set_hearing(true, now),
             "thinking" => self.face.set_thinking(true, now),
             "speaking" => self.face.set_speaking(true, now),
@@ -165,8 +202,8 @@ impl UiState {
         self.face.expression(now)
     }
 
-    /// Apply one observation. The UI listens to four modalities and
-    /// ignores the rest; it is a consumer of the loop's output, not a
+    /// Apply one observation. The UI listens to a handful of modalities
+    /// and ignores the rest; it is a consumer of the loop's output, not a
     /// second mind.
     pub fn on_observation(&mut self, o: &Observation, now: Instant) {
         match o.modality.as_str() {
@@ -194,11 +231,29 @@ impl UiState {
                     }
                 }
             }
-            // Someone else talking.
+            // Someone else talking: company, and a wake-up.
             "voice_activity" => {
                 if let Some(b) = o.payload.as_bool() {
                     self.face.set_hearing(b, now);
+                    if b {
+                        self.behaviour.presence(now);
+                    }
                 }
+            }
+            // Someone in view: company, and a wake-up, but not a state
+            // change -- a face in the room is not a face talking to it.
+            "face" => {
+                self.face.touch(now);
+                self.behaviour.presence(now);
+            }
+            // Music heard (see the crate docs for the contract): sway.
+            AUDIO_EVENT
+                if o.payload
+                    .as_text()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("music")) =>
+            {
+                self.behaviour.music(now);
+                self.face.touch(now);
             }
             _ => {}
         }
@@ -353,6 +408,106 @@ mod tests {
             .map(|c| c.detail.clone())
             .unwrap_or_default();
         assert!(last.ends_with('…') && last.chars().count() == 61);
+    }
+
+    #[test]
+    fn asleep_after_three_minutes_and_awake_on_a_voice_or_a_face() {
+        let now = Instant::now();
+        let mut s = UiState::with_seed(1, now);
+        let mut t = now;
+        // Three minutes of nothing, ticked at 30 Hz.
+        while t < now + crate::expression::SLEEP_AFTER {
+            s.tick(t);
+            t += Duration::from_millis(33);
+        }
+        s.tick(t);
+        assert_eq!(s.expression(t), Expression::Asleep);
+        // The eyes drifted shut on the way: just before sleep the lids
+        // were down.
+        let dozing = now + crate::expression::SLEEP_AFTER.saturating_sub(Duration::from_millis(50));
+        let mut d = UiState::with_seed(1, now);
+        d.tick(dozing);
+        assert!(d.overlay(dozing).lids[0] < 0.1);
+        // Before that the repertoire ran (deterministic seed).
+        assert!(s.behaviour.idle_moves > 0);
+        // A voice wakes it into listening, with a blink.
+        let voice = Observation::new("mic0", "voice_activity", t).with_payload(Payload::Bool(true));
+        s.on_observation(&voice, t);
+        s.tick(t);
+        assert_eq!(s.expression(t), Expression::Listening);
+        let blink = t + Duration::from_millis(140);
+        assert!(s.overlay(blink).lids[0] < 0.3, "{:?}", s.overlay(blink));
+        // A face in view wakes it too, but only to idle: a face in the
+        // room is not a face talking to it.
+        let mut s = UiState::with_seed(1, now);
+        s.tick(t);
+        assert_eq!(s.expression(t), Expression::Asleep);
+        s.on_observation(&Observation::new("cam0", "face", t), t);
+        s.tick(t);
+        assert_eq!(s.expression(t), Expression::Idle);
+        // And while a face keeps being seen it never sleeps.
+        let mut s = UiState::with_seed(1, now);
+        let mut t = now;
+        while t < now + crate::expression::SLEEP_AFTER + Duration::from_secs(30) {
+            if t.duration_since(now).as_millis() % 990 == 0 {
+                s.on_observation(&Observation::new("cam0", "face", t), t);
+            }
+            s.tick(t);
+            t += Duration::from_millis(33);
+        }
+        assert_eq!(s.expression(t), Expression::Idle);
+        assert!(s.behaviour.present(t));
+    }
+
+    #[test]
+    fn react_overlays_the_state_and_leaves_it_alone() {
+        let now = Instant::now();
+        let mut s = UiState::with_seed(1, now);
+        s.on_command(&ui("thinking", Payload::None), now);
+        assert_eq!(
+            s.on_command(&ui("react", Payload::Text("laugh".into())), now),
+            Expression::Thinking
+        );
+        s.tick(now);
+        assert_eq!(s.behaviour.playing(), Some(Reaction::Laugh));
+        let mid = now + Duration::from_millis(600);
+        s.tick(mid);
+        assert!(s.overlay(mid).laugh > 0.5);
+        assert_eq!(s.expression(mid), Expression::Thinking);
+        let done = now + crate::behaviour::REACTION_MAX;
+        s.tick(done);
+        assert!(s.overlay(done).is_none());
+        assert_eq!(s.behaviour.playing(), None);
+        // An unknown name is dropped, not an error.
+        s.on_command(&ui("react", Payload::Text("moonwalk".into())), done);
+        assert_eq!(s.behaviour.playing(), None);
+        assert_eq!(s.seen, 3);
+    }
+
+    #[test]
+    fn music_events_start_and_stop_the_sway() {
+        let now = Instant::now();
+        let mut s = UiState::with_seed(1, now);
+        let beat = |at: Instant| {
+            Observation::new("mic0", AUDIO_EVENT, at).with_payload(Payload::Text("music".into()))
+        };
+        s.on_observation(&beat(now), now);
+        s.tick(now);
+        assert!(s.behaviour.swaying(now));
+        let t = now + Duration::from_millis(900);
+        s.tick(t);
+        assert!(s.overlay(t).rot.abs() > 0.01, "{:?}", s.overlay(t));
+        // Any other audio event is not music.
+        let mut quiet = UiState::with_seed(1, now);
+        let obs =
+            Observation::new("mic0", AUDIO_EVENT, now).with_payload(Payload::Text("door".into()));
+        quiet.on_observation(&obs, now);
+        assert!(!quiet.behaviour.swaying(now));
+        // Two seconds after the last beat it has stopped.
+        let stop = now + crate::behaviour::MUSIC_HOLD + Duration::from_millis(10);
+        s.tick(stop);
+        assert!(!s.behaviour.swaying(stop));
+        assert!(s.overlay(stop).is_none());
     }
 
     #[test]
