@@ -22,7 +22,28 @@ use deliberate::prompt::Message;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-/// The extractor's system prompt, verbatim from `memory.py`.
+/// The extractor's system prompt: the `memory.py` wording, plus one
+/// example of whose a fact is and small talk named as the empty case.
+/// Measured in `tests/live_ollama.rs` on qwen2.5:3b, JSON mode,
+/// temperature 0, 3 runs per case, against the `memory.py` wording:
+///
+/// * "my brother works at Google" (with the bot's reply in the exchange,
+///   and on a first turn without): the reference prompt wrote "Mukesh's
+///   brother works at Google" 3/3 and 3/3 and filed it under Mukesh 0/3;
+///   so does this one. A stricter draft ("A fact is about THIS person ...
+///   never move it onto the person") made the model return nothing 3/3,
+///   losing the brother -- a rule that costs a true fact to prevent a
+///   failure the model was not making. The guard against the failure
+///   lives in code instead ([`Extracted::sanitised`]), where it costs
+///   nothing when the model is right.
+/// * "yeah" / "ok cool": 0/3 and 0/3 invented under either wording. The
+///   worker never asks in the first place ([`is_small_talk`]); the
+///   sentence here is for what slips past that gate.
+/// * "I'm working on my Rust project": "John is working on his Rust
+///   project." 3/3 under either wording.
+/// * The example relation ("Sony") was never parroted (0/12); the
+///   example fact ("Mukesh's brother") is only ever produced for the
+///   brother exchange. Compare [`SUMMARY_PROMPT`], where an example was.
 pub const EXTRACT_PROMPT: &str =
     "You extract durable facts about a person from a snippet of conversation.
 
@@ -36,7 +57,8 @@ right now), anything you inferred rather than heard, pleasantries, and anything 
 sensitive they did not clearly volunteer -- health, beliefs, money.
 
 Write each fact as one short sentence in the third person, starting with their \
-name.
+name. When they talk about someone else -- \"my brother works at Google\" -- say \
+whose it is: \"Mukesh's brother works at Google\".
 
 People they mention by name go in \"relations\", not in facts: {\"relation\": \
 \"friend\", \"other\": \"Sony\"} means \"their friend is Sony\". Use one plain word for \
@@ -45,8 +67,8 @@ daughter, colleague, boss, teacher, classmate, neighbour, partner). Only when a 
 name and a relation were both actually said.
 
 Return strict JSON: {\"facts\": [\"...\"], \"relations\": [{\"relation\": \"...\", \
-\"other\": \"...\"}]}. Return empty lists if there is nothing worth keeping -- that \
-is the common case and is fine.";
+\"other\": \"...\"}]}. Return empty lists if there is nothing worth keeping -- \
+small talk, agreement, greetings, thanks -- that is the common case and is fine.";
 
 /// `max_tokens` for the extractor call: two or three facts and a relation
 /// fit in far less, and a ceiling this low stops a chatty model explaining
@@ -58,22 +80,42 @@ pub const MAX_TOKENS: u32 = 200;
 /// other on the room line, and a summary that invents or editorialises
 /// while the facts under it are strictly heard would read as two authors.
 /// The difference is the horizon: a fact must hold for a month, a summary
-/// only has to be true of *this* visit, so what they were doing and what
-/// they said they are about to do belong here and nowhere else.
+/// only has to be true of *this* visit.
+///
+/// Measured in `tests/live_ollama.rs` (qwen2.5:3b, temperature 0, 3 runs
+/// per case) against the first draft, which asked for "anything they said
+/// they are going to do (\"is preparing for an interview on Friday\")":
+///
+/// * John's visit, "I'm working on my Rust project": the draft wrote
+///   "John is preparing for an interview on Friday." 3/3 -- its own
+///   example, verbatim, Rust project 0/3. Ada's visit padded with "yeah"
+///   and "ok cool" got the same sentence 3/3. A 3B model copies an
+///   example it is shown, so the prompt has none for the output, only for
+///   what to discard.
+/// * Without the example but still asking for "any plan they mentioned":
+///   Rust project 3/3, and "he'll continue working on it this weekend"
+///   3/3 -- a plan he never mentioned. Asking for plans invents them.
+/// * This wording: "John mentioned he's working on his Rust project."
+///   3/3, plans invented 0/3, example parroted 0/3; the padded visit is
+///   "Ada said she teaches maths." 3/3 and mentions the small talk 0/3.
+/// * The bot's own line left in the visit ("What are you working on these
+///   days?") is attributed to Ada 3/3 under any wording: the summariser
+///   cannot tell, so the worker drops echoes first
+///   ([`crate::worker::is_echo`]).
 pub const SUMMARY_PROMPT: &str =
     "You summarise one visit by a person, for a companion that will see them \
 again and wants to pick up where they left off.
 
-Write one or two short sentences in the third person, starting with their \
-name: what they talked about, and anything they said they are going to do \
-(\"is preparing for an interview on Friday\").
+Write one short sentence in the third person, starting with their name, \
+saying what they talked about.
 
-Keep only what was actually said. Discard: anything you inferred rather than \
-heard, pleasantries and small talk, their mood, and anything sensitive they \
-did not clearly volunteer -- health, beliefs, money.
+Only what was actually said: do not add plans, details, reasons or feelings \
+they did not mention, and do not copy their words back. Discard: pleasantries \
+and small talk (\"yeah\", \"ok cool\", \"thanks\"), their mood, and anything \
+sensitive they did not clearly volunteer -- health, beliefs, money.
 
-Return the sentences as plain text with nothing before or after them. Return \
-nothing at all if there was nothing worth picking up next time -- that is \
+Return the sentence as plain text with nothing before or after it. Return \
+nothing at all if they said nothing worth picking up next time -- that is \
 common and is fine.";
 
 /// `max_tokens` for the summariser: two sentences. A ceiling this low is
@@ -87,6 +129,293 @@ pub struct Extracted {
     pub facts: Vec<String>,
     /// `(relation, other)`, relation lower-cased.
     pub relations: Vec<(String, String)>,
+}
+
+/// Words that make a clause about someone other than the speaker when
+/// they follow "my" / "our": "my brother works at Google" is the
+/// brother's job. The extractor's relation vocabulary plus the rest of a
+/// household.
+const RELATION_WORDS: &[&str] = &[
+    "brother",
+    "brothers",
+    "sister",
+    "sisters",
+    "mother",
+    "mum",
+    "mom",
+    "father",
+    "dad",
+    "parents",
+    "wife",
+    "husband",
+    "partner",
+    "girlfriend",
+    "boyfriend",
+    "son",
+    "daughter",
+    "kid",
+    "kids",
+    "children",
+    "cousin",
+    "uncle",
+    "aunt",
+    "aunty",
+    "grandma",
+    "grandpa",
+    "grandmother",
+    "grandfather",
+    "nephew",
+    "niece",
+    "friend",
+    "friends",
+    "mate",
+    "colleague",
+    "coworker",
+    "boss",
+    "manager",
+    "teacher",
+    "classmate",
+    "neighbour",
+    "neighbor",
+    "roommate",
+    "flatmate",
+];
+
+/// Words that carry no fact: a sentence made only of these is agreement,
+/// a greeting or thanks, whoever says it.
+const SMALL_TALK_WORDS: &[&str] = &[
+    "yeah",
+    "yes",
+    "yep",
+    "yup",
+    "ya",
+    "no",
+    "nope",
+    "nah",
+    "ok",
+    "okay",
+    "kay",
+    "cool",
+    "nice",
+    "great",
+    "good",
+    "fine",
+    "sure",
+    "right",
+    "alright",
+    "hey",
+    "hi",
+    "hello",
+    "hiya",
+    "yo",
+    "there",
+    "thanks",
+    "thank",
+    "you",
+    "cheers",
+    "please",
+    "sorry",
+    "uh",
+    "huh",
+    "um",
+    "hmm",
+    "mm",
+    "mhm",
+    "oh",
+    "ah",
+    "wow",
+    "haha",
+    "lol",
+    "see",
+    "later",
+    "bye",
+    "goodbye",
+    "night",
+    "morning",
+    "evening",
+    "afternoon",
+    "welcome",
+    "true",
+    "totally",
+    "exactly",
+    "indeed",
+    "really",
+    "awesome",
+    "perfect",
+    "sweet",
+    "cheerio",
+    "ta",
+    "well",
+];
+
+/// Function words that say nothing about whose fact it is or what it is.
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "about", "that", "this", "from", "into", "his", "her", "their",
+    "they", "she", "him", "them", "are", "was", "were", "has", "have", "had", "not", "but", "you",
+    "your", "its", "our", "who", "also", "very", "just", "really",
+];
+
+/// The alphanumeric words of `s`, lower-cased.
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Words that carry meaning: three letters or more, not a stop word.
+fn content_words(s: &str) -> Vec<String> {
+    words(s)
+        .into_iter()
+        .filter(|w| w.chars().count() >= 3 && !STOP_WORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// "work" and "works", "teach" and "teaches": the same word when one is
+/// the other's prefix and they share at least four letters. Cheaper than
+/// a stemmer and wrong less often on names.
+fn same_word(a: &str, b: &str) -> bool {
+    a == b || (a.len().min(b.len()) >= 4 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// Whether nothing was said: empty, punctuation, or agreement, greeting
+/// and thanks only ("yeah", "ok cool", "see you later"). Never worth a
+/// model call: there is no fact in it, and a model asked anyway may make
+/// one up. Five words at most -- "yes yes yes I quit my job" is not small
+/// talk, and past five the words are doing something.
+pub fn is_small_talk(said: &str) -> bool {
+    let w = words(said);
+    w.len() <= 5 && w.iter().all(|w| SMALL_TALK_WORDS.contains(&w.as_str()))
+}
+
+/// The clauses of an utterance, and whether each is about someone else:
+/// "my brother ..." / "our neighbour ..." or a clause led by he / she /
+/// they. Split on punctuation and coordinating conjunctions.
+fn clauses(said: &str) -> Vec<(Vec<String>, bool)> {
+    let lowered = said.to_lowercase();
+    let spaced = lowered
+        .replace(" and ", " , ")
+        .replace(" but ", " , ")
+        .replace(" while ", " , ")
+        .replace(" whereas ", " , ");
+    spaced
+        .split([',', ';', '.', '!', '?', '\n'])
+        .map(words)
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let led_by_them = matches!(w[0].as_str(), "he" | "she" | "they");
+            let about_relation = w.windows(3).any(|win| {
+                matches!(win[0].as_str(), "my" | "our")
+                    && (RELATION_WORDS.contains(&win[1].as_str())
+                        || RELATION_WORDS.contains(&win[2].as_str()))
+            }) || w.windows(2).any(|win| {
+                matches!(win[0].as_str(), "my" | "our") && RELATION_WORDS.contains(&win[1].as_str())
+            });
+            (w, led_by_them || about_relation)
+        })
+        .collect()
+}
+
+/// Verbs that make a "fact" a report of manner: "Mukesh said ok",
+/// "Mukesh thinks it is cool" -- what they did in the moment, not what
+/// is true of them.
+const MANNER_VERBS: &[&str] = &[
+    "said",
+    "says",
+    "agreed",
+    "agrees",
+    "thinks",
+    "thought",
+    "feels",
+    "felt",
+    "seems",
+    "seemed",
+    "sounds",
+    "sounded",
+    "replied",
+    "responded",
+    "mentioned",
+    "acknowledged",
+    "confirmed",
+];
+
+impl Extracted {
+    /// The facts the worker can trust, given what `name` actually said.
+    /// The extractor is a small model told to write facts about the
+    /// person; three ways it goes wrong are caught here, each a rule the
+    /// prompt already states:
+    ///
+    /// * A fact not starting with the person's name is not about them
+    ///   ("His brother is an engineer.").
+    /// * A fact whose words come from a clause about someone else -- "my
+    ///   brother works at Google" -- is dropped unless the fact names that
+    ///   someone ("Mukesh's brother works at Google."). The clause the
+    ///   fact draws on is the one sharing most content words with it; a
+    ///   fact that draws on nothing said is left alone (a paraphrase, or
+    ///   from the bot's own reply, which the extractor also sees).
+    /// * A fact whose verb is one of manner -- said, thinks, feels -- is
+    ///   what they did just now, not what is true of them.
+    ///
+    /// Relations pass through; the worker filters a relation to oneself.
+    #[must_use]
+    pub fn sanitised(&self, name: &str, said: &str) -> Self {
+        let first_name = words(name).into_iter().next().unwrap_or_default();
+        let clauses = clauses(said);
+        let facts = self
+            .facts
+            .iter()
+            .filter(|fact| {
+                let fw = words(fact);
+                if fw.first() != Some(&first_name) {
+                    return false;
+                }
+                // "Mukesh's": the possessive splits into the name plus "s".
+                let possessive = fw.get(1).is_some_and(|w| w == "s");
+                if !possessive
+                    && fw
+                        .get(1)
+                        .is_some_and(|w| MANNER_VERBS.contains(&w.as_str()))
+                {
+                    return false;
+                }
+                let content: Vec<String> = content_words(fact)
+                    .into_iter()
+                    .filter(|w| w != &first_name)
+                    .collect();
+                let overlap = |clause: &[String]| {
+                    content
+                        .iter()
+                        .filter(|w| clause.iter().any(|c| same_word(c, w)))
+                        .count()
+                };
+                let best = clauses.iter().map(|(c, _)| overlap(c)).max().unwrap_or(0);
+                if best == 0 {
+                    return true;
+                }
+                let own = clauses
+                    .iter()
+                    .any(|(c, theirs)| !theirs && overlap(c) == best);
+                if own {
+                    return true;
+                }
+                // Drawn only on a clause about someone else: kept when the
+                // fact says so.
+                possessive
+                    || clauses.iter().any(|(c, theirs)| {
+                        *theirs
+                            && overlap(c) == best
+                            && c.iter()
+                                .filter(|w| RELATION_WORDS.contains(&w.as_str()))
+                                .any(|r| fw.iter().any(|w| same_word(w, r)))
+                    })
+            })
+            .cloned()
+            .collect();
+        Self {
+            facts,
+            relations: self.relations.clone(),
+        }
+    }
 }
 
 /// The user turn, in the exact shape `memory.py` sends.
@@ -163,9 +492,21 @@ pub async fn extract_all(
     said: &str,
     replied: &str,
 ) -> Result<Extracted, ExtractError> {
+    extract_with(backend, EXTRACT_PROMPT, name, said, replied).await
+}
+
+/// [`extract_all`] with the system prompt supplied, so a prompt change
+/// can be measured against the one before it (`tests/live_ollama.rs`).
+pub async fn extract_with(
+    backend: &dyn ChatBackend,
+    prompt: &str,
+    name: &str,
+    said: &str,
+    replied: &str,
+) -> Result<Extracted, ExtractError> {
     let mut stream = backend.chat(ChatRequest {
         messages: vec![
-            Message::system(EXTRACT_PROMPT),
+            Message::system(prompt),
             Message::user(user_text(name, said, replied)),
         ],
         tools: Vec::new(),
@@ -205,9 +546,19 @@ pub async fn summarise(
     name: &str,
     said: &[String],
 ) -> Result<Option<String>, ExtractError> {
+    summarise_with(backend, SUMMARY_PROMPT, name, said).await
+}
+
+/// [`summarise`] with the system prompt supplied (see [`extract_with`]).
+pub async fn summarise_with(
+    backend: &dyn ChatBackend,
+    prompt: &str,
+    name: &str,
+    said: &[String],
+) -> Result<Option<String>, ExtractError> {
     let mut stream = backend.chat(ChatRequest {
         messages: vec![
-            Message::system(SUMMARY_PROMPT),
+            Message::system(prompt),
             Message::user(summary_text(name, said)),
         ],
         tools: Vec::new(),

@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 deliberate = { path = "../deliberate", features = ["mock"] }
+# The adversarial suite replays the bench's john fixture through the worker.
+bench = { path = "../bench" }
 
 [lints]
 workspace = true

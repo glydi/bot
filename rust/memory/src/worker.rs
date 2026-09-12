@@ -28,8 +28,34 @@ use parking_lot::Mutex;
 use smol_str::SmolStr;
 
 use crate::Error;
-use crate::extract::{extract_all, summarise};
+use crate::extract::{extract_all, is_small_talk, summarise};
 use crate::store::{Store, now_secs};
+
+/// Whether `said` is the bot's own last reply coming back through the
+/// microphone. Echo cancellation slips; the speaker's output is then
+/// transcribed and attributed to whoever is in front of the camera, and a
+/// visit summary built from it reads "Ada asked what Ada is working on".
+///
+/// An echo is a run of three or more words of the reply, whole words,
+/// punctuation and case aside -- "nice what are you working on these
+/// days" for "Nice! What are you working on these days?". A short overlap
+/// is not an echo: "yes" is inside most replies, and "I teach maths" is
+/// not inside "So you teach maths, nice."
+pub fn is_echo(said: &str, last_reply: &str) -> bool {
+    let norm = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let said = norm(said);
+    let reply = norm(last_reply);
+    if reply.is_empty() || said.split(' ').count() < 3 || said.len() < 12 {
+        return false;
+    }
+    format!(" {reply} ").contains(&format!(" {said} "))
+}
 
 /// Counters for the log line at exit and for tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -136,19 +162,33 @@ impl MemoryWorker {
         match &e.kind {
             EventKind::Said(text) => {
                 if let Some(name) = name {
+                    // The bot's own line, back through the mic: not theirs.
+                    if is_echo(text, &self.last_reply.lock()) {
+                        tracing::debug!(%text, "echo of the last reply dropped");
+                        return;
+                    }
                     self.visits
                         .entry(e.entity.clone())
                         .or_insert((at, Vec::new()))
                         .1
                         .push(text.clone());
-                    self.extract(&e.entity, &name, text);
+                    // "yeah" carries no fact; asking costs a second and
+                    // risks an invented one.
+                    if !is_small_talk(text) {
+                        self.extract(&e.entity, &name, text);
+                    }
                 }
             }
             EventKind::Left => {
                 if let Some(name) = &name {
                     self.episode(&e.entity, name, at);
-                } else if let Some(t) = track_of(&e.entity) {
-                    self.store.drop_stash(t);
+                } else {
+                    // A stranger, or someone forgotten mid-visit: nothing
+                    // to write, and nothing to keep.
+                    self.visits.remove(&e.entity);
+                    if let Some(t) = track_of(&e.entity) {
+                        self.store.drop_stash(t);
+                    }
                 }
             }
             EventKind::Entered | EventKind::Returned { .. } => {
@@ -160,7 +200,9 @@ impl MemoryWorker {
                 }
             }
             EventKind::Merged { from } => {
-                if let Some(t) = track_of(from) {
+                // The absorbed side is the stranger track; whichever side
+                // is a track has no pending samples to bind any more.
+                for t in [from, &e.entity].into_iter().filter_map(track_of) {
                     self.store.drop_stash(t);
                 }
             }
@@ -176,7 +218,8 @@ impl MemoryWorker {
             .rt
             .block_on(extract_all(&*self.backend, name, said, &replied));
         let extracted = match result {
-            Ok(x) => x,
+            // What the model said, minus what it cannot have heard.
+            Ok(x) => x.sanitised(name, said),
             Err(err) => {
                 // Memory must never break talking: skipped, not raised.
                 self.stats.failed_extractions += 1;
@@ -222,7 +265,10 @@ impl MemoryWorker {
     /// and the plain list; the visit is recorded either way.
     fn episode(&mut self, entity: &common::EntityId, name: &str, ended_at: f64) {
         let (started_at, said) = self.visits.remove(entity).unwrap_or((ended_at, Vec::new()));
-        let summary = if said.is_empty() {
+        // A visit of "hey" alone is recorded but not summarised: there is
+        // nothing in it for the model to find, and a model asked anyway
+        // is a model tempted to invent.
+        let summary = if said.iter().all(|s| is_small_talk(s)) {
             None
         } else {
             let started = Instant::now();

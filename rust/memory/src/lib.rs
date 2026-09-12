@@ -30,7 +30,7 @@ pub mod worker;
 
 use common::EntityId;
 
-pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, parse};
+pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, is_small_talk, parse};
 pub use gallery::FaceGallery;
 pub use store::{
     CONTEXT_MAX_CHARS, Episode, FACE_DIM, FACE_MARGIN, FACE_THRESHOLD, Fact, Gates, Modality,
@@ -59,6 +59,11 @@ pub enum Error {
     /// An all-zero embedding, which cannot be normalised.
     #[error("zero-length embedding")]
     ZeroEmbedding,
+    /// An embedding with a NaN or infinity in it. Normalised, it is NaN
+    /// throughout and compares as nobody or everybody at random; refused
+    /// before it reaches the index or the db.
+    #[error("non-finite embedding")]
+    NonFiniteEmbedding,
     /// A person id nobody has.
     #[error("no such person: {0}")]
     UnknownPerson(EntityId),

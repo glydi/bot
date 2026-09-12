@@ -9,7 +9,7 @@
 //! open. Embeddings are little-endian `f32` blobs, which is what numpy's
 //! `tobytes()` wrote and what `bytes.go` reads.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -167,6 +167,12 @@ pub struct PersonSummary {
 /// that reads as a dossier rather than an acquaintance's memory.
 pub const RECALL_LIMIT: usize = 6;
 
+/// The most characters of fact text [`Store::recall`] hands back in
+/// total. Six short facts fit; six long ones would put a wall of text on
+/// the person's room line, and a model skims a wall. The line is the
+/// name plus a bullet per fact, so this keeps it under ~400 characters.
+pub const RECALL_MAX_CHARS: usize = 320;
+
 /// Longest text [`Store::returned_context`] puts on the room line. One
 /// clause of the note; the summariser is asked for two sentences and a
 /// runaway one must not swamp the facts under it.
@@ -179,8 +185,12 @@ pub(crate) fn now_secs() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// L2-normalise; `ZeroEmbedding` for a zero vector.
+/// L2-normalise; `ZeroEmbedding` for a zero vector, `NonFiniteEmbedding`
+/// for a NaN or infinity anywhere in it.
 fn normalise(v: &[f32]) -> Result<Vec<f32>, Error> {
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(Error::NonFiniteEmbedding);
+    }
     let norm = v
         .iter()
         .map(|x| f64::from(*x) * f64::from(*x))
@@ -282,6 +292,14 @@ pub struct Store {
     face_gates: Gates,
     voice_gates: Gates,
     stash: Mutex<HashMap<u32, Stash>>,
+    /// Ids forgotten in this process. A person deleted mid-conversation
+    /// is still in the model's context by id, and its next `remember` or
+    /// the worker's LEFT for the visit under way would quietly recreate
+    /// the row ([`Store::remember`] creates a person for a fact to hang
+    /// off). Held in memory only: after a restart no context carries the
+    /// id, and the one kind of id that can recur (the deliberate tools'
+    /// lower-cased name) may then legitimately be someone new.
+    forgotten: Mutex<HashSet<EntityId>>,
 }
 
 /// The Python `SCHEMA`, verbatim in effect (whitespace aside), plus the
@@ -402,6 +420,7 @@ impl Store {
             face_gates: Gates::FACE,
             voice_gates: Gates::VOICE,
             stash: Mutex::new(HashMap::new()),
+            forgotten: Mutex::new(HashSet::new()),
         };
         store.reload()?;
         Ok(store)
@@ -525,6 +544,11 @@ impl Store {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::Invalid("enrol requires a name".into()));
+        }
+        if let Some(id) = person_id
+            && self.is_forgotten(id)
+        {
+            return Err(Error::UnknownPerson(id.clone()));
         }
         let want = self.index(m).read().dim().unwrap_or_else(|| m.dim());
         let mut prepared = Vec::with_capacity(embeddings.len());
@@ -737,10 +761,17 @@ impl Store {
             tx.commit()?;
             n
         };
+        // The id stays dead for the rest of the run (see `forgotten`).
+        self.forgotten.lock().insert(id.clone());
         // Rebuild the indexes and the name mirror even when the row was
         // already gone: cheap, and it leaves nothing stale on a retry.
         self.reload()?;
         Ok(n > 0)
+    }
+
+    /// Whether `id` was forgotten in this process (see [`Store::forget_person`]).
+    pub fn is_forgotten(&self, id: &EntityId) -> bool {
+        self.forgotten.lock().contains(id)
     }
 
     /// [`Store::forget_person`] under the `FactSource` name.
@@ -782,6 +813,9 @@ impl Store {
         let fact = fact.trim();
         if fact.is_empty() {
             return Ok(false);
+        }
+        if self.is_forgotten(id) {
+            return Err(Error::UnknownPerson(id.clone()));
         }
         let name = self.name_of(id);
         let key = fact_key(fact, name.as_deref());
@@ -872,9 +906,22 @@ impl Store {
     /// most recently heard is *last* -- the `[room]` note renders the tail
     /// of this list, and the latest fact is the most relevant thing to pick
     /// back up on (`render_room`). [`Store::get`] still carries everything.
+    ///
+    /// Bounded twice: [`RECALL_LIMIT`] facts, and [`RECALL_MAX_CHARS`] of
+    /// text between them -- long facts mean fewer of them, never a wall.
+    /// The best-ranked fact is always handed back, however long.
     pub fn recall(&self, id: &EntityId) -> Result<Vec<Fact>, Error> {
-        let mut facts = Self::facts_of(&self.db.lock(), id)?;
-        facts.truncate(RECALL_LIMIT);
+        let ranked = Self::facts_of(&self.db.lock(), id)?;
+        let mut facts: Vec<Fact> = Vec::with_capacity(RECALL_LIMIT);
+        let mut chars = 0;
+        for f in ranked {
+            let n = f.text.chars().count();
+            if facts.len() == RECALL_LIMIT || (!facts.is_empty() && chars + n > RECALL_MAX_CHARS) {
+                break;
+            }
+            chars += n;
+            facts.push(f);
+        }
         facts.sort_by(|a, b| a.last_seen.total_cmp(&b.last_seen));
         Ok(facts)
     }
@@ -885,6 +932,9 @@ impl Store {
         let (relation, other) = (relation.trim().to_lowercase(), other.trim());
         if relation.is_empty() || other.is_empty() {
             return Ok(false);
+        }
+        if self.is_forgotten(id) {
+            return Err(Error::UnknownPerson(id.clone()));
         }
         let other_id = self.find_by_name(other)?.map(|p| p.id);
         if other_id.as_ref() == Some(id) {
@@ -945,7 +995,7 @@ impl Store {
     /// the person is waiting to hear their name said back.
     pub fn stash(&self, track: u32, m: Modality, emb: &[f32]) {
         let want = self.index(m).read().dim().unwrap_or_else(|| m.dim());
-        if emb.len() != want {
+        if emb.len() != want || emb.iter().any(|x| !x.is_finite()) {
             tracing::warn!(
                 track,
                 modality = m.as_str(),
@@ -987,8 +1037,20 @@ impl Store {
     /// ("in a one-on-one conversation the camera does not need to have
     /// resolved the speaker for this to be right"); with nothing stashed at
     /// all the person is enrolled name-only, as the Go build allows.
+    ///
+    /// The name is what the model heard, so it is cleaned first
+    /// ([`normalise_name`]): "it's Mukesh actually" is Mukesh.
+    ///
+    /// Two people can share a name. When there are samples, the
+    /// biometrics decide who this is: a stash that identifies as someone
+    /// already in the gallery is that person (more samples for them, and
+    /// the name as just given); one that identifies as nobody is a new
+    /// person with a new id, whatever they are called. Only with no
+    /// samples at all does the name alone pick an existing person -- with
+    /// nothing to tell them apart, a duplicate is worse than a merge.
     pub fn remember_name(&self, speaker: Option<&EntityId>, name: &str) -> Result<EntityId, Error> {
-        let name = name.trim();
+        let name = normalise_name(name);
+        let name = name.as_str();
         if name.is_empty() {
             return Err(Error::Invalid("name is required".into()));
         }
@@ -1010,8 +1072,18 @@ impl Store {
             return self.enrol_name_only(name);
         };
         let faces: Vec<&[f32]> = s.face.iter().map(Vec::as_slice).collect();
-        let id = self.enrol(name, None, Modality::Face, &faces)?;
         let voices: Vec<&[f32]> = s.voice.iter().map(Vec::as_slice).collect();
+        // Who the samples say this is, if anyone: the same gates the
+        // senses use, so a match here is one the gallery would have made
+        // live had the person stood still.
+        let known = faces
+            .iter()
+            .map(|e| (*e, Modality::Face))
+            .chain(voices.iter().map(|e| (*e, Modality::Voice)))
+            .find_map(|(e, m)| self.identify(e, m).ok().flatten())
+            .map(|(id, _)| id);
+        let id = known.unwrap_or_else(|| self.new_id(name));
+        self.enrol(name, Some(&id), Modality::Face, &faces)?;
         if !voices.is_empty() {
             self.enrol(name, Some(&id), Modality::Voice, &voices)?;
         }
@@ -1048,6 +1120,11 @@ impl Store {
         kind: &str,
         detail: Option<&str>,
     ) -> Result<(), Error> {
+        // "Forget me" cleared their words; the tail of the same visit
+        // must not write more of them.
+        if self.is_forgotten(entity) {
+            return Ok(());
+        }
         self.db.lock().execute(
             "INSERT INTO events (session_id, at, entity, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![session_id, at, entity.as_str(), kind, detail],
@@ -1185,6 +1262,89 @@ impl Store {
             }
         })
     }
+}
+
+/// A name as the model heard it, reduced to the name: "it's Mukesh
+/// actually" is "Mukesh". The `remember_name` tool is called with
+/// whatever was said, and stored verbatim that becomes "- it's Mukesh
+/// actually" on every room line after, and the bot says it back.
+///
+/// Leading "it's" / "I'm" / "my name is" / "this is" / "call me" go,
+/// trailing "actually" / "here" / "though" go, quotes and punctuation
+/// round each word go, and each word is capitalised (first letter only:
+/// "`McDonald`" stays, "MUKESH" becomes "Mukesh"). Empty when nothing is
+/// left, which the caller refuses.
+pub fn normalise_name(heard: &str) -> String {
+    const LEAD: &[&[&str]] = &[
+        &["my", "name", "is"],
+        &["my", "name's"],
+        &["my", "names"],
+        &["the", "name's"],
+        &["the", "name", "is"],
+        &["name's"],
+        &["name", "is"],
+        &["it's"],
+        &["it", "is"],
+        &["its"],
+        &["i'm"],
+        &["i", "am"],
+        &["im"],
+        &["this", "is"],
+        &["call", "me"],
+        &["i", "go", "by"],
+        &["they", "call", "me"],
+        &["everyone", "calls", "me"],
+    ];
+    const TRAIL: &[&str] = &["actually", "here", "though", "btw"];
+    let trim = |w: &str| {
+        w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+            .to_owned()
+    };
+    let mut words: Vec<String> = heard
+        .replace(['\u{2019}', '`'], "'")
+        .split_whitespace()
+        .map(trim)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut stripped = true;
+    while stripped {
+        stripped = false;
+        for lead in LEAD {
+            if words.len() > lead.len()
+                && words
+                    .iter()
+                    .zip(*lead)
+                    .all(|(w, l)| w.eq_ignore_ascii_case(l))
+            {
+                words.drain(..lead.len());
+                stripped = true;
+            }
+        }
+        while words
+            .last()
+            .is_some_and(|w| TRAIL.iter().any(|t| w.eq_ignore_ascii_case(t)))
+        {
+            words.pop();
+            stripped = true;
+        }
+    }
+    words
+        .iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let rest: String = chars.collect();
+            let rest = if rest.chars().all(|c| !c.is_lowercase()) {
+                rest.to_lowercase()
+            } else {
+                rest
+            };
+            first.to_uppercase().chain(rest.chars()).collect()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A SQLite `COUNT(*)` as a `usize`.
