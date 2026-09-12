@@ -323,3 +323,32 @@ pub fn john_fixture() -> Vec<Recorded> {
     obs.push(says(902.0, "hey"));
     obs.iter().map(|o| Recorded::new(o, epoch)).collect()
 }
+
+/// Noise, built in memory: john is in shot and silent while three bell-like
+/// blips raise `voice_activity` for 150 ms each, attributed to nobody (a
+/// bell has no track). Nothing was said, so nothing may become a SAID and
+/// nothing may reach the speaker. The blip length is the measured shape of
+/// the false positives that cancelled replies on a live run -- "(bell
+/// dings)", "(whistling)" -- all under 300 ms; barge-in needs 400 ms.
+pub fn noise_fixture() -> Vec<Recorded> {
+    use common::{EntityHint, EntityId, Payload};
+    let epoch = Instant::now();
+    let at = |s: f64| epoch + Duration::from_secs_f64(s);
+    let face = |s: f64| {
+        Observation::new("cam0", "face", at(s))
+            .with_confidence(0.9)
+            .with_entity(EntityHint::KnownOnTrack(EntityId::new("john"), 1))
+            .with_payload(Payload::Direction { azimuth_deg: 0.0 })
+    };
+    let voice = |s: f64, on: bool| {
+        Observation::new("mic0", "voice_activity", at(s)).with_payload(Payload::Bool(on))
+    };
+    let mut obs: Vec<Observation> = (0..=4).map(|s| face(f64::from(s))).collect();
+    for start in [1.0, 2.0, 3.0] {
+        obs.push(voice(start, true));
+        obs.push(voice(start + 0.15, false));
+    }
+    // A recording is time-ordered; the generators above are not.
+    obs.sort_by_key(|o| o.at);
+    obs.iter().map(|o| Recorded::new(o, epoch)).collect()
+}

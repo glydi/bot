@@ -1,0 +1,11 @@
+{"at":0.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":1.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":1.0,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":true}}
+{"at":1.15,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":false}}
+{"at":2.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":2.0,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":true}}
+{"at":2.15,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":false}}
+{"at":3.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":3.0,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":true}}
+{"at":3.15,"source":"mic0","modality":"voice_activity","confidence":1.0,"payload":{"bool":false}}
+{"at":4.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}

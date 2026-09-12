@@ -38,6 +38,11 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
     vec![
         file("whisper model", &config.whisper_model, true),
         file("turn model", &config.turn_model, false),
+        file(
+            "vad model",
+            &config.models_dir.join("vad/silero_vad.onnx"),
+            false,
+        ),
         file("voice-id model", &config.voice_model, false),
         file("face detector", &config.face_models_dir.join(det), false),
         file("face recogniser", &config.face_models_dir.join(rec), false),

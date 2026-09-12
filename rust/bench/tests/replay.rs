@@ -8,7 +8,13 @@ use std::path::PathBuf;
 use common::{FakeClock, ObservationRing};
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/john.jsonl")
+    fixture_named("john.jsonl")
+}
+
+fn fixture_named(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
 }
 
 /// The tags of every event, in order.
@@ -28,6 +34,38 @@ fn fixture_on_disk_matches_the_generator() {
     // changes, regenerate rather than let the two drift.
     let on_disk = bench::load(fixture()).unwrap();
     assert_eq!(on_disk, bench::john_fixture());
+    let noise = bench::load(fixture_named("noise.jsonl")).unwrap();
+    assert_eq!(noise, bench::noise_fixture());
+}
+
+#[test]
+fn noise_produces_no_said_and_nothing_for_the_speaker() {
+    let r = bench::replay(fixture_named("noise.jsonl"), 0.0).unwrap();
+    bench::print_summary(&r);
+
+    // Every blip was folded (this is filtering, not a dropped record).
+    assert_eq!(r.stats.observations as usize, r.records);
+    let t = tags(&r);
+    assert!(!t.contains(&"SAID"), "a blip became speech: {t:?}");
+    // John neither flickered nor spoke: his arrival is the only transition.
+    assert_eq!(t, ["ENTERED"], "{t:?}");
+
+    let speaker: Vec<String> = r
+        .commands
+        .iter()
+        .filter(|c| c.target == "speaker")
+        .map(|c| format!("{}:{}", c.kind, c.payload.as_text().unwrap_or("")))
+        .collect();
+    assert!(speaker.is_empty(), "noise reached the speaker: {speaker:?}");
+    // The planner may still greet john through the deliberate path; that
+    // is his arrival, not the bell. Nothing about the bell is an intent.
+    assert!(
+        r.commands
+            .iter()
+            .all(|c| c.target == "deliberate" || c.target == "ui"),
+        "{:?}",
+        r.commands
+    );
 }
 
 #[test]

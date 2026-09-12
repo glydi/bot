@@ -1,4 +1,4 @@
-//! Regenerate `fixtures/john.jsonl` from [`bench::john_fixture`], so the
+//! Regenerate `fixtures/*.jsonl` from the generators in `bench`, so each
 //! file is always in the exact shape `common::Recorded` serialises.
 //!
 //! ```text
@@ -8,12 +8,19 @@
 use std::path::PathBuf;
 
 fn main() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/john.jsonl");
-    match bench::write_records(&path, &bench::john_fixture()) {
-        Ok(()) => println!("wrote {}", path.display()),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let fixtures = [
+        ("john.jsonl", bench::john_fixture()),
+        ("noise.jsonl", bench::noise_fixture()),
+    ];
+    for (name, records) in &fixtures {
+        let path = dir.join(name);
+        match bench::write_records(&path, records) {
+            Ok(()) => println!("wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
         }
     }
 }

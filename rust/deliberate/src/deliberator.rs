@@ -166,7 +166,7 @@ pub struct Session {
     /// note so the note is built without touching the store mid-turn.
     prefetched: HashMap<EntityId, Vec<String>>,
     /// When we last spoke an intent, per entity (`None` = no entity).
-    last_intent_say: HashMap<Option<EntityId>, Instant>,
+    last_intent_say: HashMap<(Option<EntityId>, &'static str), Instant>,
     /// Who we asked for a name, and when; the next utterance within
     /// [`NAME_ANSWER_WINDOW`] is the answer.
     pending_name: Option<(Option<EntityId>, Instant)>,
@@ -244,19 +244,12 @@ impl Session {
                     tracing::warn!(decision = intent.decision, "intent without text");
                     return;
                 };
-                let now = self.clock.now();
-                let recently = self
-                    .last_intent_say
-                    .get(&entity)
-                    .is_some_and(|t| now.saturating_duration_since(*t) < INTENT_SAY_GAP);
-                if recently {
-                    tracing::debug!(?entity, "intent suppressed: spoke to them recently");
-                    return;
-                }
-                self.last_intent_say.insert(entity, now);
-                tracing::info!(decision = intent.decision, goal = ?intent.goal, line, "intent");
-                self.conversation.push(Message::assistant(&line));
-                self.say(line);
+                let kind = if intent.decision == "ask" {
+                    "ask"
+                } else {
+                    "say"
+                };
+                self.proactive(entity, kind, line);
             }
             "recall" => {
                 let Some(id) = entity else {
@@ -270,7 +263,7 @@ impl Session {
                 // walked in and the world has no name for them yet. Say
                 // hello now rather than after they speak first.
                 if intent.goal.as_deref() == Some("greet") {
-                    self.proactive(Some(id), "Hi there.".to_owned());
+                    self.proactive(Some(id), "greet", "Hi there.".to_owned());
                 }
             }
             "greet" => {
@@ -295,10 +288,10 @@ impl Session {
                     }
                     _ => line,
                 };
-                self.proactive(entity, line);
+                self.proactive(entity, "greet", line);
             }
             "ask_name" => {
-                if self.proactive(entity.clone(), ASK_NAME_LINE.to_owned()) {
+                if self.proactive(entity.clone(), "ask_name", ASK_NAME_LINE.to_owned()) {
                     self.pending_name = Some((entity, self.clock.now()));
                 }
             }
@@ -310,17 +303,21 @@ impl Session {
     /// One line per entity per [`INTENT_SAY_GAP`] and never over the bot's
     /// own voice; returns whether it was said. Pushed into history as an
     /// assistant turn so the model knows it already greeted.
-    fn proactive(&mut self, entity: Option<EntityId>, line: String) -> bool {
+    /// The gap is per (entity, kind): a greeting and then a question to the
+    /// same person seconds later is a conversation; the same greeting twice
+    /// is a stutter.
+    fn proactive(&mut self, entity: Option<EntityId>, kind: &'static str, line: String) -> bool {
         let now = self.clock.now();
+        let key = (entity, kind);
         let recently = self
             .last_intent_say
-            .get(&entity)
+            .get(&key)
             .is_some_and(|t| now.saturating_duration_since(*t) < INTENT_SAY_GAP);
         if recently {
-            tracing::debug!(?entity, "intent suppressed: spoke to them recently");
+            tracing::debug!(entity = ?key.0, kind, "intent suppressed: said that to them recently");
             return false;
         }
-        self.last_intent_say.insert(entity, now);
+        self.last_intent_say.insert(key, now);
         tracing::info!(line, "proactive");
         self.conversation.push(Message::assistant(&line));
         self.say(line);

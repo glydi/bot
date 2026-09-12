@@ -119,6 +119,7 @@ pub struct App {
     router: Option<RouterHandle>,
     deliberator: Option<DeliberatorHandle>,
     tee: Option<TeeHandle>,
+    stash: Option<JoinHandle<()>>,
     reflex: Option<Arc<ReflexHandle>>,
     memory: Option<WorkerHandle>,
 }
@@ -153,19 +154,19 @@ impl App {
             }
             None => None,
         };
-        let (obs_tx, ui_obs_rx, tee) = if want_ui_obs || recorder.is_some() {
-            let (front_tx, front_rx) = ObservationRing::bounded(RING_CAPACITY);
-            let mut outs = vec![reflex_tx];
-            let ui_rx = want_ui_obs.then(|| {
-                let (tx, rx) = ObservationRing::bounded(RING_CAPACITY);
-                outs.push(tx);
-                rx
-            });
-            let tee = tee::spawn(front_rx, outs, recorder).context("spawning tee")?;
-            (front_tx, ui_rx, Some(tee))
-        } else {
-            (reflex_tx, None, None)
-        };
+        // Always through the tee: besides the window and the recorder, the
+        // store watches the stream for strangers' embeddings (below), so a
+        // name given later can be bound to the face and voice that gave it.
+        let (front_tx, front_rx) = ObservationRing::bounded(RING_CAPACITY);
+        let (stash_tx, stash_rx) = ObservationRing::bounded(RING_CAPACITY);
+        let mut outs = vec![reflex_tx, stash_tx];
+        let ui_obs_rx = want_ui_obs.then(|| {
+            let (tx, rx) = ObservationRing::bounded(RING_CAPACITY);
+            outs.push(tx);
+            rx
+        });
+        let tee = Some(tee::spawn(front_rx, outs, recorder).context("spawning tee")?);
+        let obs_tx = front_tx;
         let queue = CommandQueue::new();
 
         // -- memory -----------------------------------------------------
@@ -208,6 +209,22 @@ impl App {
             .spawn(Arc::clone(&clock), reflex_rx, queue.clone(), Some(delib_tx))
             .context("spawning reflex")?;
         let reflex = Arc::new(reflex);
+        // Everyone the gallery knows is named before they walk in, so the
+        // first ENTERED already carries the name and the greeting says it.
+        // Sent as observations: the mind stays modality-blind.
+        match store.people() {
+            Ok(people) => {
+                for p in people.iter().filter(|p| !p.name.trim().is_empty()) {
+                    obs_tx.send(
+                        Observation::new("store", "name_binding", clock.now())
+                            .with_entity(EntityHint::Known(p.id.clone()))
+                            .with_payload(Payload::Text(p.name.clone())),
+                    );
+                }
+                tracing::info!(n = people.len(), "names seeded from the gallery");
+            }
+            Err(e) => tracing::warn!(error = %e, "could not list people"),
+        }
 
         // -- deliberate -------------------------------------------------
         let deliberator = match chat {
@@ -249,6 +266,13 @@ impl App {
         let mind_rx = router.route("mind");
         let router = router.spawn().context("spawning router")?;
 
+        // Not a bridge: it reads the tee's ring, so it can only exit after
+        // the tee does, and is joined there (see `stop`).
+        let stash = Some(spawn_named("glydi-stash", {
+            let store = Arc::clone(&store);
+            let view = reflex.view();
+            move || stash_strangers(&stash_rx, &store, &view)
+        })?);
         let mut bridges = Vec::new();
         let (speaker_cmd_tx, speaker_cmd_rx) = crossbeam_channel::unbounded();
         bridges.push(spawn_named("glydi-speaker-bridge", move || {
@@ -343,6 +367,7 @@ impl App {
             router: Some(router),
             deliberator,
             tee,
+            stash,
             reflex: Some(reflex),
             memory: Some(memory),
         })
@@ -455,6 +480,9 @@ impl App {
         if let Some(mut t) = self.tee.take() {
             join_timeout("tee", move || t.stop(), JOIN_TIMEOUT);
         }
+        if let Some(h) = self.stash.take() {
+            join_timeout("stash", move || h.join().ok(), JOIN_TIMEOUT);
+        }
         if let Some(r) = self.reflex.take() {
             match Arc::try_unwrap(r) {
                 Ok(h) => {
@@ -537,6 +565,39 @@ fn speaker_bridge(
         }
         if to.send(c).is_err() {
             break;
+        }
+    }
+}
+
+/// Keep strangers' embeddings until they give a name. A `face_embedding`
+/// arrives with the track it belongs to; an unknown voice arrives with no
+/// entity at all (the audio sense cannot see faces), so it is stashed only
+/// when exactly one stranger is in view -- the person most likely talking.
+/// `Store::remember_name` takes the stash when the model learns the name;
+/// the memory worker drops it when the track leaves.
+fn stash_strangers(from: &RingReceiver, store: &Store, view: &ArcSwap<WorldView>) {
+    while let Some(o) = from.recv() {
+        let Payload::Embedding(emb) = &o.payload else {
+            continue;
+        };
+        match (o.modality.as_str(), &o.entity) {
+            ("face_embedding", Some(EntityHint::Track(t))) => {
+                store.stash(*t, memory::Modality::Face, emb);
+            }
+            ("voice_identity", None) => {
+                let v = view.load();
+                let mut strangers = v.people.iter().filter(|p| p.id.is_track());
+                if let (Some(only), None) = (strangers.next(), strangers.next())
+                    && let Some(t) = only
+                        .id
+                        .as_str()
+                        .strip_prefix("track:")
+                        .and_then(|n| n.parse::<u32>().ok())
+                {
+                    store.stash(t, memory::Modality::Voice, emb);
+                }
+            }
+            _ => {}
         }
     }
 }
