@@ -53,6 +53,33 @@ is the common case and is fine.";
 /// itself.
 pub const MAX_TOKENS: u32 = 200;
 
+/// The visit summariser's system prompt. Same guardrails as
+/// [`EXTRACT_PROMPT`], same voice -- the two outputs sit next to each
+/// other on the room line, and a summary that invents or editorialises
+/// while the facts under it are strictly heard would read as two authors.
+/// The difference is the horizon: a fact must hold for a month, a summary
+/// only has to be true of *this* visit, so what they were doing and what
+/// they said they are about to do belong here and nowhere else.
+pub const SUMMARY_PROMPT: &str =
+    "You summarise one visit by a person, for a companion that will see them \
+again and wants to pick up where they left off.
+
+Write one or two short sentences in the third person, starting with their \
+name: what they talked about, and anything they said they are going to do \
+(\"is preparing for an interview on Friday\").
+
+Keep only what was actually said. Discard: anything you inferred rather than \
+heard, pleasantries and small talk, their mood, and anything sensitive they \
+did not clearly volunteer -- health, beliefs, money.
+
+Return the sentences as plain text with nothing before or after them. Return \
+nothing at all if there was nothing worth picking up next time -- that is \
+common and is fine.";
+
+/// `max_tokens` for the summariser: two sentences. A ceiling this low is
+/// also what keeps a runaway model from writing the transcript back out.
+pub const SUMMARY_MAX_TOKENS: u32 = 120;
+
 /// What the extractor found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Extracted {
@@ -157,6 +184,61 @@ pub async fn extract_all(
     Ok(parse(&text)?)
 }
 
+/// The summariser's user turn: the name, then what they said, one line
+/// each, in order. Only their side -- the bot's replies are not what the
+/// bot needs reminding of.
+pub fn summary_text(name: &str, said: &[String]) -> String {
+    let mut s = format!("The person is called {name}.\n\n{name} said:");
+    for line in said {
+        s.push_str("\n- ");
+        s.push_str(line.trim());
+    }
+    s
+}
+
+/// One or two sentences about the visit, or `None` when the model said
+/// there was nothing to keep. Plain text mode: asking for JSON here would
+/// only add a field to parse. Fences and quotes a model wraps prose in
+/// are stripped; the caller decides what to store when this errs.
+pub async fn summarise(
+    backend: &dyn ChatBackend,
+    name: &str,
+    said: &[String],
+) -> Result<Option<String>, ExtractError> {
+    let mut stream = backend.chat(ChatRequest {
+        messages: vec![
+            Message::system(SUMMARY_PROMPT),
+            Message::user(summary_text(name, said)),
+        ],
+        tools: Vec::new(),
+        max_tokens: SUMMARY_MAX_TOKENS,
+        temperature: 0.0,
+        json_object: false,
+    });
+    let mut text = String::new();
+    while let Some(ev) = stream.next().await {
+        match ev? {
+            ChatEvent::Text(t) => text.push_str(&t),
+            ChatEvent::Call(_) => {}
+        }
+    }
+    Ok(clean_prose(&text))
+}
+
+/// A model's prose reply as one line: fences and wrapping quotes off,
+/// whitespace collapsed, `None` when nothing is left.
+pub fn clean_prose(text: &str) -> Option<String> {
+    let mut t = text.trim();
+    if t.starts_with("```") {
+        let inner = t.trim_matches('`');
+        t = inner.split_once('\n').map_or(inner, |(_, rest)| rest);
+        t = t.rsplit_once("```").map_or(t, |(head, _)| head);
+    }
+    let t = t.trim().trim_matches('"').trim();
+    let joined = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
 /// Why an extraction produced nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
@@ -215,6 +297,19 @@ mod tests {
         // Empty is nothing, not an error; junk is an error.
         assert_eq!(parse("  \n").unwrap(), Extracted::default());
         assert!(parse("I could not find any facts.").is_err());
+    }
+
+    #[test]
+    fn summary_text_and_prose_cleaning() {
+        assert_eq!(
+            summary_text("Ada", &["hi ".into(), "I teach maths".into()]),
+            "The person is called Ada.\n\nAda said:\n- hi\n- I teach maths"
+        );
+        assert_eq!(
+            clean_prose("```text\n\"Ada talked about maths.\n She teaches.\"\n```"),
+            Some("Ada talked about maths. She teaches.".to_owned())
+        );
+        assert_eq!(clean_prose("  \n\"\" "), None);
     }
 
     #[test]

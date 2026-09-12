@@ -134,9 +134,43 @@ pub struct Episode {
     pub ended_at: f64,
     /// Their utterances, in order.
     pub said: Vec<String>,
-    /// One-paragraph plain summary.
+    /// How many times they spoke this visit (`said.len()` at write time,
+    /// kept as its own column so a listing never has to split the text).
+    pub turns: usize,
+    /// One or two sentences from the summariser, or the plain list of what
+    /// they said when the model was unavailable (see
+    /// [`Store::write_episode`]). Empty when they said nothing.
     pub summary: String,
 }
+
+/// Someone in the gallery, as a listing row: counts, not contents. What a
+/// debug panel or a `--list-people` needs, without loading every fact and
+/// blob (`Store::everyone` does that, and is the wrong tool for a table).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersonSummary {
+    /// The stable id.
+    pub id: EntityId,
+    /// Display name.
+    pub name: String,
+    /// Facts held.
+    pub facts: usize,
+    /// Face embeddings held.
+    pub faces: usize,
+    /// Voice embeddings held.
+    pub voices: usize,
+    /// Unix seconds when last touched, if ever.
+    pub last_seen: Option<f64>,
+}
+
+/// How many facts [`Store::recall`] hands back. The `[room]` note renders
+/// the last six (`mind::view::render_room`), and a tool answer longer than
+/// that reads as a dossier rather than an acquaintance's memory.
+pub const RECALL_LIMIT: usize = 6;
+
+/// Longest text [`Store::returned_context`] puts on the room line. One
+/// clause of the note; the summariser is asked for two sentences and a
+/// runaway one must not swamp the facts under it.
+pub const CONTEXT_MAX_CHARS: usize = 140;
 
 /// Unix seconds, as `time.time()` writes them.
 pub(crate) fn now_secs() -> f64 {
@@ -313,7 +347,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     started_at  REAL NOT NULL,
     ended_at    REAL NOT NULL,
     said        TEXT NOT NULL,
-    summary     TEXT NOT NULL
+    summary     TEXT NOT NULL,
+    turns       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_person ON episodes(person_id, ended_at);
 ";
@@ -327,6 +362,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Decay bookkeeping (see `Store::remember`, `Store::prune`).
     ("facts", "reinforced", "INTEGER NOT NULL DEFAULT 1"),
     ("facts", "last_seen", "REAL"),
+    // Episodes from before the summariser: the count is recoverable from
+    // `said` (one line per utterance), which `migrate` does once.
+    ("episodes", "turns", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 impl Store {
@@ -392,6 +430,14 @@ impl Store {
         // Rows from before the decay columns existed: last_seen = created_at.
         conn.execute(
             "UPDATE facts SET last_seen = created_at WHERE last_seen IS NULL",
+            [],
+        )?;
+        // Episodes written before `turns` existed: count the lines of `said`
+        // (newline-joined, one per utterance; an empty `said` is 0 turns).
+        conn.execute(
+            "UPDATE episodes SET turns = CASE WHEN said = '' THEN 0
+                ELSE length(said) - length(replace(said, char(10), '')) + 1 END
+             WHERE turns = 0 AND said != ''",
             [],
         )?;
         Ok(())
@@ -633,6 +679,34 @@ impl Store {
         Ok(out)
     }
 
+    /// Everyone as a listing row, sorted by name. One query, no blobs: the
+    /// counts come from correlated sub-selects over the indexed columns.
+    pub fn people(&self) -> Result<Vec<PersonSummary>, Error> {
+        Ok(self
+            .db
+            .lock()
+            .prepare(
+                "SELECT p.person_id, p.name, p.last_seen_at,
+                        (SELECT COUNT(*) FROM facts f WHERE f.person_id = p.person_id),
+                        (SELECT COUNT(*) FROM embeddings e
+                          WHERE e.person_id = p.person_id AND e.modality = 'face'),
+                        (SELECT COUNT(*) FROM embeddings e
+                          WHERE e.person_id = p.person_id AND e.modality = 'voice')
+                 FROM persons p ORDER BY p.name",
+            )?
+            .query_map([], |r| {
+                Ok(PersonSummary {
+                    id: EntityId::new(r.get::<_, String>(0)?),
+                    name: r.get(1)?,
+                    last_seen: r.get(2)?,
+                    facts: count(r.get(3)?),
+                    faces: count(r.get(4)?),
+                    voices: count(r.get(5)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Mark `id` as seen now.
     pub fn touch(&self, id: &EntityId) -> Result<(), Error> {
         self.db.lock().execute(
@@ -642,20 +716,36 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a person and every biometric trace of them. `false` if they
-    /// were not in the gallery.
+    /// Delete a person and every trace of them. `false` if they were not
+    /// in the gallery.
     ///
     /// This is not a nicety. Face and voice embeddings are biometric data
     /// under GDPR Art. 9, Illinois BIPA and Texas CUBI, and a working delete
-    /// path is part of collecting them lawfully. Facts, relations and
-    /// episodes cascade with the person row.
-    pub fn forget(&self, id: &EntityId) -> Result<bool, Error> {
-        let n = self
-            .db
-            .lock()
-            .execute("DELETE FROM persons WHERE person_id = ?", [id.as_str()])?;
+    /// path is part of collecting them lawfully. Embeddings, facts,
+    /// relations and episodes cascade with the person row through the
+    /// foreign keys; the `events` log has no key (it holds stranger tracks
+    /// too) and carries their words verbatim, so it is cleared by hand --
+    /// "forget me" that leaves a transcript behind is not forgetting.
+    /// Relations *to* them from other people keep the name and lose the
+    /// link (`ON DELETE SET NULL`), as the reference did.
+    pub fn forget_person(&self, id: &EntityId) -> Result<bool, Error> {
+        let n = {
+            let mut conn = self.db.lock();
+            let tx = conn.transaction()?;
+            let n = tx.execute("DELETE FROM persons WHERE person_id = ?", [id.as_str()])?;
+            tx.execute("DELETE FROM events WHERE entity = ?", [id.as_str()])?;
+            tx.commit()?;
+            n
+        };
+        // Rebuild the indexes and the name mirror even when the row was
+        // already gone: cheap, and it leaves nothing stale on a retry.
         self.reload()?;
         Ok(n > 0)
+    }
+
+    /// [`Store::forget_person`] under the `FactSource` name.
+    pub fn forget(&self, id: &EntityId) -> Result<bool, Error> {
+        self.forget_person(id)
     }
 
     // ---------------------------------------------------------------- facts
@@ -673,41 +763,79 @@ impl Store {
         Ok(())
     }
 
-    /// Store a fact. Returns `true` if it was new. A fact already held
-    /// (case-insensitive) is *reinforced* instead: count + 1, `last_seen`
-    /// now. This is the cheap dedupe from `memory.py` -- without it the same
-    /// fact accumulates every time the subject comes up and the recall
-    /// answer turns into a list of near-identical sentences -- and it is
-    /// what keeps a fact alive through [`Store::prune`].
+    /// Store a fact. Returns `true` if it was new. A fact already held is
+    /// *reinforced* instead: count + 1, `last_seen` now. This is the dedupe
+    /// from `memory.py` -- without it the same fact accumulates every time
+    /// the subject comes up and the recall answer turns into a list of
+    /// near-identical sentences -- and it is what keeps a fact alive
+    /// through [`Store::prune`].
+    ///
+    /// "Already held" is judged on a normalised form (see [`fact_key`]):
+    /// case, punctuation and spacing are ignored, and so is a leading
+    /// subject -- "likes coffee", "He likes coffee." and "Ada likes coffee"
+    /// are one fact, because the extractor writes the name and the model's
+    /// `remember` tool writes whichever the sentence came out with. One
+    /// key wholly containing the other, at a word boundary, also merges:
+    /// "Ada teaches" and "Ada teaches maths" are one fact, and the fuller
+    /// wording is the one kept, whichever arrived first.
     pub fn remember(&self, id: &EntityId, fact: &str) -> Result<bool, Error> {
         let fact = fact.trim();
         if fact.is_empty() {
             return Ok(false);
         }
+        let name = self.name_of(id);
+        let key = fact_key(fact, name.as_deref());
         let now = now_secs();
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
         if !id.is_track() {
             Self::ensure_person(&tx, id)?;
         }
-        let reinforced = tx.execute(
-            "UPDATE facts SET reinforced = reinforced + 1, last_seen = ?1
-             WHERE person_id = ?2 AND lower(fact) = lower(?3)",
-            params![now, id.as_str(), fact],
-        )?;
-        if reinforced == 0 {
-            tx.execute(
-                "INSERT INTO facts (person_id, fact, created_at, reinforced, last_seen)
-                 VALUES (?1, ?2, ?3, 1, ?3)",
-                params![id.as_str(), fact, now],
-            )?;
+        // Tens of facts per person at most, so the comparison runs here
+        // rather than in SQL, where "same sentence modulo punctuation" has
+        // no cheap expression.
+        let held: Vec<(i64, String)> = tx
+            .prepare("SELECT id, fact FROM facts WHERE person_id = ? ORDER BY reinforced DESC, id")?
+            .query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let merged = held.iter().find_map(|(row, text)| {
+            let theirs = fact_key(text, name.as_deref());
+            match same_fact(&key, &theirs) {
+                Some(Fuller::Theirs) => Some((*row, None)),
+                // Same fact modulo subject and punctuation: keep whichever
+                // wording is fuller ("He likes coffee." over "likes coffee").
+                Some(Fuller::Same) => Some((
+                    *row,
+                    (fact.split_whitespace().count() > text.split_whitespace().count())
+                        .then_some(fact),
+                )),
+                Some(Fuller::Ours) => Some((*row, Some(fact))),
+                None => None,
+            }
+        });
+        match merged {
+            Some((row, better)) => {
+                tx.execute(
+                    "UPDATE facts SET reinforced = reinforced + 1, last_seen = ?1,
+                                      fact = COALESCE(?2, fact)
+                     WHERE id = ?3",
+                    params![now, better, row],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO facts (person_id, fact, created_at, reinforced, last_seen)
+                     VALUES (?1, ?2, ?3, 1, ?3)",
+                    params![id.as_str(), fact, now],
+                )?;
+            }
         }
         tx.commit()?;
         drop(conn);
-        if reinforced == 0 {
+        if merged.is_none() {
             self.reload_names_if_new(id);
         }
-        Ok(reinforced == 0)
+        Ok(merged.is_none())
     }
 
     fn reload_names_if_new(&self, id: &EntityId) {
@@ -739,10 +867,16 @@ impl Store {
             .collect::<Result<_, _>>()?)
     }
 
-    /// Everything remembered about `id`, most reinforced and most recent
-    /// first.
+    /// What to bring up about `id`: at most [`RECALL_LIMIT`] facts, chosen
+    /// by reinforcement then recency, and handed back oldest first so the
+    /// most recently heard is *last* -- the `[room]` note renders the tail
+    /// of this list, and the latest fact is the most relevant thing to pick
+    /// back up on (`render_room`). [`Store::get`] still carries everything.
     pub fn recall(&self, id: &EntityId) -> Result<Vec<Fact>, Error> {
-        Self::facts_of(&self.db.lock(), id)
+        let mut facts = Self::facts_of(&self.db.lock(), id)?;
+        facts.truncate(RECALL_LIMIT);
+        facts.sort_by(|a, b| a.last_seen.total_cmp(&b.last_seen));
+        Ok(facts)
     }
 
     /// Record `{person}'s {relation} is {other}`. Idempotent; `true` if new.
@@ -784,10 +918,43 @@ impl Store {
 
     // ------------------------------------------------------ pending samples
 
-    /// Keep an embedding seen on stranger track `track` so a later
-    /// `remember_name` can bind it. Bounded per track (newest kept), so a
-    /// stranger who never gives a name costs a few kilobytes at most.
+    /// Keep an embedding seen on stranger track `track`, so that when the
+    /// person gives their name the samples already taken can be enrolled
+    /// under it. This is the only way a stranger becomes recognisable next
+    /// time, so the wiring must feed it:
+    ///
+    /// * **When:** on every face or voice embedding the senses produce for
+    ///   an entity that is still a `Track(n)` -- that is, every time the
+    ///   gallery's `best_match` returned `None` for that embedding. Do not
+    ///   stash for a `Known` entity (the gallery already has them; a rename
+    ///   goes through [`Store::remember_name`] with the known id).
+    /// * **What:** the raw embedding straight from the model, 512-d
+    ///   `ArcFace` for [`Modality::Face`], 192-d ECAPA for
+    ///   [`Modality::Voice`]. Not normalised, not filtered; the same
+    ///   quality gates the sense applied before matching are enough.
+    /// * **Then:** nothing. When the model calls `remember_name` while
+    ///   `track:n` is the speaker, [`Store::remember_name`] takes the stash
+    ///   and enrols it; when the track LEFT or was MERGED into a known
+    ///   person, the memory worker calls [`Store::drop_stash`]. The wiring
+    ///   never has to clear it.
+    ///
+    /// Bounded per track ([`STASH_FACE_SAMPLES`] faces, [`STASH_VOICE_SAMPLES`]
+    /// voices, newest kept), so a stranger who never gives a name costs a
+    /// few kilobytes at most. An embedding of the wrong width is logged and
+    /// dropped here rather than failing `remember_name` minutes later, when
+    /// the person is waiting to hear their name said back.
     pub fn stash(&self, track: u32, m: Modality, emb: &[f32]) {
+        let want = self.index(m).read().dim().unwrap_or_else(|| m.dim());
+        if emb.len() != want {
+            tracing::warn!(
+                track,
+                modality = m.as_str(),
+                got = emb.len(),
+                want,
+                "stash refused"
+            );
+            return;
+        }
         let mut stash = self.stash.lock();
         let s = stash.entry(track).or_default();
         let (q, cap) = match m {
@@ -798,6 +965,14 @@ impl Store {
             q.pop_front();
         }
         q.push_back(emb.to_vec());
+    }
+
+    /// How many samples are stashed for `track`, as `(faces, voices)`.
+    pub fn stashed(&self, track: u32) -> (usize, usize) {
+        self.stash
+            .lock()
+            .get(&track)
+            .map_or((0, 0), |s| (s.face.len(), s.voice.len()))
     }
 
     /// Drop what was stashed for `track` (it left, or was merged).
@@ -908,8 +1083,10 @@ impl Store {
         )?)
     }
 
-    /// Write the summary of one visit. `said` is what they said, in order;
-    /// the summary is rendered here so every writer words it the same way.
+    /// Write one visit. `said` is what they said, in order; `summary` is
+    /// the summariser's one or two sentences, or `None` when the model was
+    /// unavailable, in which case the plain list of what they said is
+    /// stored instead ([`plain_summary`]) so the visit is never lost.
     /// Strangers (track ids) have no person row and get no episode.
     pub fn write_episode(
         &self,
@@ -918,35 +1095,26 @@ impl Store {
         started_at: f64,
         ended_at: f64,
         said: &[String],
+        summary: Option<&str>,
     ) -> Result<Option<Episode>, Error> {
-        if person.is_track() {
+        if person.is_track() || self.name_of(person).is_none() {
             return Ok(None);
         }
-        let Some(p) = self.get(person)? else {
-            return Ok(None);
-        };
-        let mins = ((ended_at - started_at).max(0.0) / 60.0).round() as u64;
-        let mut summary = format!("{} was here for {mins} min.", p.name);
-        if !said.is_empty() {
-            summary.push_str(" Said: ");
-            summary.push_str(&said.join(" / "));
-            summary.push('.');
-        }
-        if !p.facts.is_empty() {
-            summary.push_str(" Known: ");
-            let known: Vec<&str> = p.facts.iter().take(5).map(|f| f.text.as_str()).collect();
-            summary.push_str(&known.join("; "));
-        }
+        let summary = summary
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| plain_summary(said), str::to_owned);
         self.db.lock().execute(
-            "INSERT INTO episodes (session_id, person_id, started_at, ended_at, said, summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO episodes (session_id, person_id, started_at, ended_at, said, summary, turns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 person.as_str(),
                 started_at,
                 ended_at,
                 said.join("\n"),
-                summary
+                summary,
+                i64::try_from(said.len()).unwrap_or(i64::MAX)
             ],
         )?;
         Ok(Some(Episode {
@@ -954,6 +1122,7 @@ impl Store {
             started_at,
             ended_at,
             said: said.to_vec(),
+            turns: said.len(),
             summary,
         }))
     }
@@ -964,8 +1133,8 @@ impl Store {
             .db
             .lock()
             .prepare(
-                "SELECT session_id, started_at, ended_at, said, summary FROM episodes
-                 WHERE person_id = ? ORDER BY ended_at DESC, id DESC",
+                "SELECT session_id, started_at, ended_at, said, summary, turns FROM episodes
+                 WHERE person_id = ? ORDER BY started_at DESC, id DESC",
             )?
             .query_map([person.as_str()], |r| {
                 let said: String = r.get(3)?;
@@ -975,26 +1144,159 @@ impl Store {
                     ended_at: r.get(2)?,
                     said: said.lines().map(str::to_owned).collect(),
                     summary: r.get(4)?,
+                    turns: count(r.get(5)?),
                 })
             })?
             .collect::<Result<_, _>>()?)
     }
 
-    /// The extra for a RETURNED person's line in the `[room]` note: "last
-    /// talked about ..." with the last thing they said on their previous
-    /// visit, clipped to a few words. `None` when they never said anything
-    /// we kept, so the note stays terse.
+    /// The extra for a returning person's line in the `[room]` note -- what
+    /// to pick back up on, and how long ago it was:
+    ///
+    /// ```text
+    /// last visit 2 days ago: Talked about his Rust project; he is preparing for an interview on Friday.
+    /// last visit an hour ago, talked about "I like my new bike a lot"
+    /// ```
+    ///
+    /// The most recent visit with anything in it: its summary when there is
+    /// one, else the last thing they said. Clipped to [`CONTEXT_MAX_CHARS`]
+    /// at a word boundary. `None` when every visit was silent, so the note
+    /// stays terse. The elapsed time is in words, never a number of
+    /// seconds: the model repeats what it is given, and "2 days ago" is
+    /// something a person would say.
     pub fn returned_context(&self, person: &EntityId) -> Option<String> {
+        self.returned_context_at(person, now_secs())
+    }
+
+    /// [`Store::returned_context`] with the clock supplied, for tests.
+    pub fn returned_context_at(&self, person: &EntityId, now: f64) -> Option<String> {
         let episodes = self.episodes(person).ok()?;
-        let last = episodes.iter().find_map(|e| e.said.last().cloned())?;
-        Some(format!("last talked about \"{}\"", clip_words(&last, 60)))
+        episodes.iter().find_map(|e| {
+            let ago = ago_words(now - e.ended_at);
+            if e.summary.is_empty() {
+                // Quoted speech: STT's closing full stop inside the quotes
+                // reads as a typo, so it goes; a summary keeps its own.
+                let last = e.said.last()?.trim_end_matches(['.', '!', '?']);
+                let text = clip_words(last, CONTEXT_MAX_CHARS);
+                Some(format!("last visit {ago}, talked about \"{text}\""))
+            } else {
+                let text = clip_words(&e.summary, CONTEXT_MAX_CHARS);
+                Some(format!("last visit {ago}: {text}"))
+            }
+        })
     }
 }
 
+/// A SQLite `COUNT(*)` as a `usize`.
+fn count(n: i64) -> usize {
+    usize::try_from(n).unwrap_or(0)
+}
+
+/// The fallback episode text when the summariser is unavailable: what
+/// they said, in order, joined -- one line, so a listing is one line per
+/// visit. Empty when they said nothing.
+pub fn plain_summary(said: &[String]) -> String {
+    said.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Elapsed seconds in words: "just now", "an hour ago", "2 days ago".
+/// Coarse on purpose -- a returning person is told how long they were
+/// away, and "3 hours ago" is right in a way "2 hours 47 minutes ago" only
+/// pretends to be. Anything in the future (a skewed clock) is "just now".
+pub fn ago_words(secs: f64) -> String {
+    const MINUTE: f64 = 60.0;
+    const HOUR: f64 = 60.0 * MINUTE;
+    const DAY: f64 = 24.0 * HOUR;
+    const WEEK: f64 = 7.0 * DAY;
+    const MONTH: f64 = 30.0 * DAY;
+    const YEAR: f64 = 365.0 * DAY;
+    // Each unit takes over at 1.5 of itself, so "an hour ago" spans 45-90
+    // minutes and the count is the rounded value from then on.
+    let steps: [(f64, &str, &str); 6] = [
+        (YEAR, "a year", "years"),
+        (MONTH, "a month", "months"),
+        (WEEK, "a week", "weeks"),
+        (DAY, "a day", "days"),
+        (HOUR, "an hour", "hours"),
+        (MINUTE, "a minute", "minutes"),
+    ];
+    for (unit, one, many) in steps {
+        if secs >= 1.5 * unit {
+            return format!("{} {many} ago", (secs / unit).round() as u64);
+        }
+        if secs >= 0.75 * unit {
+            return format!("{one} ago");
+        }
+    }
+    "just now".to_owned()
+}
+
+/// Which of two fact keys says more (see [`same_fact`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fuller {
+    /// The candidate is the held one, plus something.
+    Ours,
+    /// The held one is the candidate, plus something.
+    Theirs,
+    /// Identical after normalisation.
+    Same,
+}
+
+/// Shortest key that may swallow another by containment. Below this, one
+/// key is a word or two -- "is 25" is inside "Karyan is 25 years old" and
+/// also inside "Karyan is 25 minutes away", and merging those is worse
+/// than holding both.
+const CONTAIN_MIN_CHARS: usize = 6;
+
+/// The normalised comparison form of a fact: lower-case, letters, digits
+/// and single spaces only, with a leading subject dropped -- the person's
+/// name (any word of it) or a third-person pronoun -- so "Ada likes
+/// coffee", "She likes coffee." and "likes coffee" share a key.
+pub fn fact_key(fact: &str, name: Option<&str>) -> String {
+    let mut words: Vec<String> = fact
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if words.len() > 1 {
+        let first = words[0].as_str();
+        let is_name =
+            name.is_some_and(|n| n.split_whitespace().any(|w| w.eq_ignore_ascii_case(first)));
+        if is_name || matches!(first, "he" | "she" | "they") {
+            words.remove(0);
+        }
+    }
+    words.join(" ")
+}
+
+/// Whether two keys are the same fact, and if so which is the fuller
+/// wording. Equal keys are the same; otherwise one must contain the other
+/// as whole words and the shorter must be substantial ([`CONTAIN_MIN_CHARS`]).
+fn same_fact(ours: &str, theirs: &str) -> Option<Fuller> {
+    if ours == theirs {
+        return Some(Fuller::Same);
+    }
+    let (short, long, fuller) = if ours.len() < theirs.len() {
+        (ours, theirs, Fuller::Theirs)
+    } else {
+        (theirs, ours, Fuller::Ours)
+    };
+    if short.len() < CONTAIN_MIN_CHARS {
+        return None;
+    }
+    // Pad both so a match is a run of whole words, not "art" in "cart".
+    let padded = format!(" {long} ");
+    padded.contains(&format!(" {short} ")).then_some(fuller)
+}
+
 /// The first `max` characters of `s`, cut at a word boundary, with an
-/// ellipsis when anything was dropped.
+/// ellipsis when anything was dropped. Untouched when it fits.
 fn clip_words(s: &str, max: usize) -> String {
-    let s = s.trim().trim_end_matches(['.', '!', '?']);
+    let s = s.trim();
     if s.chars().count() <= max {
         return s.to_owned();
     }
@@ -1004,7 +1306,7 @@ fn clip_words(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 mod tests {
     use super::*;
 
@@ -1349,31 +1651,377 @@ mod tests {
         assert_eq!(s.event_count("s1").expect("count"), 2);
         assert!(s.returned_context(&id).is_none());
 
+        // No summariser: the plain list stands in, and the room line
+        // carries it with the elapsed time in words.
+        let said = [
+            "hello there".to_owned(),
+            "I like my new bike a lot".to_owned(),
+        ];
         let ep = s
-            .write_episode(
-                "s1",
-                &id,
-                10.0,
-                130.0,
-                &["hello there".into(), "I like my new bike a lot".into()],
-            )
+            .write_episode("s1", &id, 10.0, 130.0, &said, None)
             .expect("episode")
             .expect("some");
-        assert_eq!(
-            ep.summary,
-            "Ada was here for 2 min. Said: hello there / I like my new bike a lot."
-        );
+        assert_eq!(ep.summary, "hello there / I like my new bike a lot");
+        assert_eq!(ep.turns, 2);
         assert_eq!(s.episodes(&id).expect("episodes"), vec![ep]);
         assert_eq!(
-            s.returned_context(&id).as_deref(),
-            Some("last talked about \"I like my new bike a lot\"")
+            s.returned_context_at(&id, 130.0 + 2.0 * 86_400.0)
+                .as_deref(),
+            Some("last visit 2 days ago: hello there / I like my new bike a lot")
         );
-        // Strangers get none.
+
+        // A summary wins over the list; a blank one does not.
+        let long = "Ada talked about her new bike and the ride she is planning along the canal \
+                    on Saturday; she is preparing for a job interview on Friday and wants advice on it."
+            .to_owned();
+        s.write_episode("s1", &id, 200.0, 500.0, &said, Some(&long))
+            .expect("episode");
+        let ctx = s.returned_context_at(&id, 500.0 + 3600.0).expect("ctx");
+        assert!(ctx.starts_with("last visit an hour ago: Ada talked about her new bike"));
+        assert!(ctx.ends_with("..."), "{ctx}");
+        // The clip counts the text, not the prefix.
+        let text = ctx.trim_start_matches("last visit an hour ago: ");
+        assert!(text.chars().count() <= CONTEXT_MAX_CHARS + 3, "{text}");
+        assert!(text.chars().count() > 100);
+
+        // A silent visit is skipped for the last one with something in it;
+        // a visit with words but no summary falls back to the last thing said.
+        s.write_episode("s1", &id, 600.0, 700.0, &[], Some("   "))
+            .expect("episode");
+        assert_eq!(
+            s.episodes(&id).expect("episodes")[0],
+            Episode {
+                session_id: "s1".into(),
+                started_at: 600.0,
+                ended_at: 700.0,
+                said: vec![],
+                turns: 0,
+                summary: String::new(),
+            }
+        );
         assert!(
-            s.write_episode("s1", &EntityId::for_track(1), 0.0, 1.0, &[])
+            s.returned_context_at(&id, 800.0)
+                .expect("ctx")
+                .starts_with("last visit 5 minutes ago: Ada talked about")
+        );
+        s.db.lock()
+            .execute(
+                "INSERT INTO episodes (session_id, person_id, started_at, ended_at, said, summary, turns)
+                 VALUES ('s1', ?1, 900.0, 1000.0, 'one\ntwo', '', 2)",
+                [id.as_str()],
+            )
+            .expect("bare row");
+        assert_eq!(
+            s.returned_context_at(&id, 1000.0).as_deref(),
+            Some("last visit just now, talked about \"two\"")
+        );
+
+        // Strangers and unknown ids get none.
+        assert!(
+            s.write_episode("s1", &EntityId::for_track(1), 0.0, 1.0, &[], None)
                 .expect("track")
                 .is_none()
         );
+        assert!(
+            s.write_episode("s1", &EntityId::new("nobody"), 0.0, 1.0, &[], None)
+                .expect("unknown")
+                .is_none()
+        );
         assert_eq!(clip_words("one two three four five six", 12), "one two...");
+    }
+
+    #[test]
+    fn elapsed_time_in_words() {
+        let cases = [
+            (-5.0, "just now"),
+            (0.0, "just now"),
+            (44.0, "just now"),
+            (45.0, "a minute ago"),
+            (89.0, "a minute ago"),
+            (90.0, "2 minutes ago"),
+            (1700.0, "28 minutes ago"),
+            (2700.0, "an hour ago"),
+            (5400.0, "2 hours ago"),
+            (10.0 * 3600.0, "10 hours ago"),
+            (18.0 * 3600.0, "a day ago"),
+            (36.0 * 3600.0, "2 days ago"),
+            (6.0 * 86_400.0, "a week ago"),
+            (20.0 * 86_400.0, "3 weeks ago"),
+            (23.0 * 86_400.0, "a month ago"),
+            (100.0 * 86_400.0, "3 months ago"),
+            (300.0 * 86_400.0, "a year ago"),
+            (800.0 * 86_400.0, "2 years ago"),
+        ];
+        for (secs, want) in cases {
+            assert_eq!(ago_words(secs), want, "{secs}");
+        }
+    }
+
+    #[test]
+    fn near_duplicate_facts_merge_and_recall_is_capped() {
+        let s = store();
+        let id = s.enrol_name_only("Ada Lovelace").expect("enrol");
+
+        // Subject and punctuation are not what makes a fact different.
+        assert!(s.remember(&id, "likes coffee").expect("first"));
+        assert!(!s.remember(&id, "He likes coffee.").expect("pronoun"));
+        assert!(!s.remember(&id, "Ada likes coffee!").expect("name"));
+        assert!(!s.remember(&id, "  ada   LIKES, coffee ").expect("spacing"));
+        let facts = s.recall(&id).expect("recall");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].reinforced, 4);
+        // The fuller wording replaced the fragment.
+        assert_eq!(facts[0].text, "He likes coffee.");
+
+        // Containment at a word boundary merges and keeps the fuller one,
+        // whichever order they arrive in.
+        assert!(s.remember(&id, "Ada teaches maths").expect("new"));
+        assert!(!s.remember(&id, "She teaches").expect("shorter later"));
+        assert!(
+            !s.remember(&id, "Ada teaches maths at a college.")
+                .expect("longer later")
+        );
+        let texts: Vec<String> = s
+            .recall(&id)
+            .expect("recall")
+            .into_iter()
+            .map(|f| f.text)
+            .collect();
+        assert!(
+            texts.contains(&"Ada teaches maths at a college.".to_owned()),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t == "Ada teaches maths"), "{texts:?}");
+        // Not a substring match: "art" is not in "cart", and a two-word
+        // fragment is too little to swallow a sentence.
+        assert!(s.remember(&id, "Ada paints art").expect("art"));
+        assert!(
+            s.remember(&id, "Ada pushes a cart to art class")
+                .expect("cart")
+        );
+        assert!(s.remember(&id, "Ada is 25 years old").expect("age"));
+        assert!(s.remember(&id, "is 25").expect("fragment"));
+        assert_eq!(s.get(&id).expect("get").expect("some").facts.len(), 6);
+
+        assert_eq!(
+            fact_key("Ada Lovelace likes tea.", Some("Ada Lovelace")),
+            "lovelace likes tea"
+        );
+        assert_eq!(
+            fact_key("Lovelace likes tea.", Some("Ada Lovelace")),
+            "likes tea"
+        );
+        assert_eq!(fact_key("They", Some("Ada")), "they");
+        assert_eq!(same_fact("likes tea", "likes tea"), Some(Fuller::Same));
+        assert_eq!(
+            same_fact("likes tea a lot", "likes tea"),
+            Some(Fuller::Ours)
+        );
+        assert_eq!(
+            same_fact("likes tea", "likes tea a lot"),
+            Some(Fuller::Theirs)
+        );
+        assert_eq!(same_fact("is 25", "is 25 years old"), None);
+
+        // Recall: six at most, chosen by reinforcement then recency, and
+        // the most recently heard comes last.
+        for i in 0..10 {
+            assert!(s.remember(&id, &format!("Ada owns {i} hats")).expect("hat"));
+        }
+        assert_eq!(s.get(&id).expect("get").expect("some").facts.len(), 16);
+        let r = s.recall(&id).expect("recall");
+        assert_eq!(r.len(), RECALL_LIMIT);
+        assert_eq!(r[0].text, "He likes coffee.");
+        assert_eq!(r[1].text, "Ada teaches maths at a college.");
+        assert_eq!(r.last().map(|f| f.text.as_str()), Some("Ada owns 9 hats"));
+        assert!(r.windows(2).all(|w| w[0].last_seen <= w[1].last_seen));
+    }
+
+    #[test]
+    fn people_lists_counts_and_forget_person_cascades() {
+        let s = store();
+        let ada = s
+            .enrol(
+                "Ada",
+                None,
+                Modality::Face,
+                &[&onehot(FACE_DIM, 0), &onehot(FACE_DIM, 1)],
+            )
+            .expect("ada");
+        s.enrol("Ada", Some(&ada), Modality::Voice, &[&onehot(VOICE_DIM, 0)])
+            .expect("ada voice");
+        let bob = s.enrol_name_only("Bob").expect("bob");
+        s.remember(&ada, "Ada teaches maths.").expect("fact");
+        s.remember(&bob, "Bob paints.").expect("fact");
+        s.relate(&bob, "friend", "Ada").expect("relation");
+        s.begin_session("s1").expect("session");
+        s.record_event("s1", 1.0, &ada, "SAID", Some("secret"))
+            .expect("event");
+        s.record_event("s1", 2.0, &bob, "SAID", Some("hello"))
+            .expect("event");
+        s.write_episode("s1", &ada, 0.0, 5.0, &["secret".into()], None)
+            .expect("episode");
+        s.touch(&ada).expect("touch");
+
+        let people = s.people().expect("people");
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].name, "Ada");
+        assert_eq!(
+            (people[0].facts, people[0].faces, people[0].voices),
+            (1, 2, 1)
+        );
+        assert!(people[0].last_seen.is_some());
+        assert_eq!(people[1].name, "Bob");
+        assert_eq!(
+            (people[1].facts, people[1].faces, people[1].voices),
+            (1, 0, 0)
+        );
+
+        assert!(s.forget_person(&ada).expect("forget"));
+        assert!(!s.forget_person(&ada).expect("twice"));
+        let people = s.people().expect("people");
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].name, "Bob");
+        assert_eq!(s.embedding_count(Modality::Face), 0);
+        assert_eq!(s.embedding_count(Modality::Voice), 0);
+        assert!(s.name_of(&ada).is_none());
+        assert!(s.recall(&ada).expect("recall").is_empty());
+        assert!(s.episodes(&ada).expect("episodes").is_empty());
+        // Their words went with them; Bob's stayed; Bob's relation keeps
+        // the name and drops the link.
+        assert_eq!(s.event_count("s1").expect("count"), 1);
+        let other: Option<String> =
+            s.db.lock()
+                .query_row(
+                    "SELECT other_id FROM relations WHERE person_id = ?",
+                    [bob.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("row");
+        assert_eq!(other, None);
+        assert_eq!(
+            s.get(&bob).expect("get").map(|p| p.relations),
+            Some(vec![("friend".to_owned(), "Ada".to_owned())])
+        );
+    }
+
+    /// The user's real gallery, built by the Python reference: 24 faces and
+    /// 13 voices at the time of writing. Skipped when it is not on this
+    /// machine; runs on a copy so nothing here can touch it.
+    #[test]
+    fn migrates_a_copy_of_the_real_people_db() {
+        let real = Path::new("/Users/mukesh/bot/data/people.db");
+        if !real.is_file() {
+            eprintln!("skipping: {} not present", real.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("glydi-memory-real-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("people.db");
+        std::fs::copy(real, &path).expect("copy db");
+        // A WAL from a run that did not checkpoint holds committed rows the
+        // main file does not have yet.
+        for ext in ["-wal", "-shm"] {
+            let side = real.with_file_name(format!("people.db{ext}"));
+            if side.is_file() {
+                std::fs::copy(&side, dir.join(format!("people.db{ext}"))).expect("copy side");
+            }
+        }
+
+        let s = Store::open(&path).expect("open real db");
+        let people = s.people().expect("people");
+        let faces: usize = people.iter().map(|p| p.faces).sum();
+        let voices: usize = people.iter().map(|p| p.voices).sum();
+        let facts: usize = people.iter().map(|p| p.facts).sum();
+        eprintln!(
+            "real people.db: {} people, {faces} faces, {voices} voices, {facts} facts",
+            people.len()
+        );
+        for p in &people {
+            eprintln!(
+                "  {} {:<12} faces={} voices={} facts={}",
+                p.id, p.name, p.faces, p.voices, p.facts
+            );
+        }
+        assert!(!people.is_empty());
+        assert!(people.iter().all(|p| !p.name.trim().is_empty()));
+        assert_eq!(faces, 24);
+        assert_eq!(voices, 13);
+        assert_eq!(s.embedding_count(Modality::Face), faces);
+        assert_eq!(s.embedding_count(Modality::Voice), voices);
+        assert_eq!(people.len(), s.everyone().expect("everyone").len());
+
+        // The migration is additive: every reference column still there,
+        // and the new ones present.
+        let cols = |t: &str| -> Vec<String> {
+            s.db.lock()
+                .prepare(&format!("PRAGMA table_info({t})"))
+                .expect("pragma")
+                .query_map([], |r| r.get(1))
+                .expect("query")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(cols("facts").contains(&"reinforced".to_owned()));
+        assert!(cols("episodes").contains(&"turns".to_owned()));
+        assert!(cols("persons").contains(&"meta".to_owned()));
+
+        // Round trip: a stored blob, pulled back out, matches its owner at
+        // cosine 1.0 -- the bytes numpy wrote are the bytes we read.
+        let blobs: Vec<(String, String, Vec<u8>)> =
+            s.db.lock()
+                .prepare(
+                    "SELECT person_id, modality, vec FROM embeddings
+                 GROUP BY person_id, modality ORDER BY person_id",
+                )
+                .expect("prepare")
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows");
+        assert!(!blobs.is_empty());
+        for (owner, modality, blob) in &blobs {
+            let m = if modality == "face" {
+                Modality::Face
+            } else {
+                Modality::Voice
+            };
+            let emb = from_blob(blob);
+            assert_eq!(emb.len(), m.dim());
+            let hit = s.identify(&emb, m).expect("identify");
+            eprintln!("  {modality} of {owner} -> {hit:?}");
+            let (id, score) = hit.expect("a stored sample identifies its owner");
+            assert_eq!(id.as_str(), owner);
+            assert!((score - 1.0).abs() < 1e-4, "{score}");
+        }
+
+        // The episodic side works on it: a visit, and the room-line extra.
+        let (who, _, _) = &blobs[0];
+        let who = EntityId::new(who.as_str());
+        s.begin_session("test").expect("session");
+        s.write_episode(
+            "test",
+            &who,
+            1.0,
+            61.0,
+            &["hi".into()],
+            Some("Talked about the weather."),
+        )
+        .expect("episode");
+        assert!(
+            s.returned_context(&who)
+                .expect("ctx")
+                .ends_with("ago: Talked about the weather.")
+        );
+        // And forgetting cascades on a db the reference created.
+        let before = s.people().expect("people");
+        let gone = before.iter().find(|p| p.id == who).expect("listed");
+        assert!(s.forget_person(&who).expect("forget"));
+        assert_eq!(s.embedding_count(Modality::Face), faces - gone.faces);
+        assert_eq!(s.embedding_count(Modality::Voice), voices - gone.voices);
+        assert_eq!(s.people().expect("people").len(), before.len() - 1);
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

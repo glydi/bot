@@ -30,11 +30,12 @@ pub mod worker;
 
 use common::EntityId;
 
-pub use extract::{EXTRACT_PROMPT, Extracted, parse};
+pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, parse};
 pub use gallery::FaceGallery;
 pub use store::{
-    Episode, FACE_DIM, FACE_MARGIN, FACE_THRESHOLD, Fact, Gates, Modality, Person, Store,
-    VOICE_DIM, VOICE_MARGIN, VOICE_THRESHOLD,
+    CONTEXT_MAX_CHARS, Episode, FACE_DIM, FACE_MARGIN, FACE_THRESHOLD, Fact, Gates, Modality,
+    Person, PersonSummary, RECALL_LIMIT, Store, VOICE_DIM, VOICE_MARGIN, VOICE_THRESHOLD,
+    ago_words,
 };
 pub use worker::{MemoryWorker, Stats, WorkerHandle};
 
