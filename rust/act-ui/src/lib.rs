@@ -17,6 +17,14 @@
 //! generic talking animation -- lip movement that disagrees with the sound
 //! is worse than no lip movement at all (`go/internal/ui/face.go`).
 //!
+//! # The face
+//!
+//! The window is the design's face (`assets/Glydi_One_Face_All_Expressions.html`):
+//! the shell render with the eye whites, pupils and smile composited on
+//! it, see [`face`]. `act-ui/docs/face.png` is a screenshot of
+//! `cargo run -p act-ui --example face`, for comparison when touching
+//! the drawing code.
+//!
 //! # Threading
 //!
 //! [`run_ui`] MUST be called from the main thread and blocks until the
@@ -54,13 +62,18 @@ pub use state::{Attend, UiState};
 /// How long the consumer loops block before re-checking for shutdown.
 const POLL: Duration = Duration::from_millis(50);
 
+/// Height of the bottom bar with the debug toggle, in logical pixels.
+const TOGGLE_BAR: f32 = 28.0;
+
 /// Window configuration.
 #[derive(Clone, Debug)]
 pub struct UiConfig {
     /// Window title.
     pub title: String,
-    /// Initial window size, in logical pixels. The face keeps its own
-    /// aspect ratio inside whatever it is given.
+    /// Initial window size, in logical pixels: the design's 520 px stage
+    /// at its 1.0529 aspect, plus the toggle bar. The face keeps its own
+    /// aspect ratio inside whatever it is given, letterboxed on the page
+    /// colour, so resizing never distorts it.
     pub size: (f32, f32),
     /// Whether the debug panel starts open.
     pub debug: bool,
@@ -78,7 +91,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             title: "Glydi".to_owned(),
-            size: (420.0, 520.0),
+            size: (520.0, 494.0 + TOGGLE_BAR),
             debug: false,
             front_on_launch: true,
             quit: None,
@@ -116,7 +129,7 @@ pub fn run_ui(
         viewport: egui::ViewportBuilder::default()
             .with_title(&config.title)
             .with_inner_size([config.size.0, config.size.1])
-            .with_min_inner_size([260.0, 300.0]),
+            .with_min_inner_size([260.0, 260.0 / face::ASPECT + TOGGLE_BAR]),
         // wgpu: the glow backend is not compiled in (see Cargo.toml).
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()

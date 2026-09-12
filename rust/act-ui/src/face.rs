@@ -5,26 +5,38 @@
 //! The same applies here for a different reason -- the textures are
 //! uploaded once and every expression is a transform of the same widget.
 //!
+//! # Composition
+//!
+//! Exactly the design HTML's layer order, bottom to top
+//! (`assets/Glydi_One_Face_All_Expressions.html`):
+//!
+//! ```text
+//!   page              #f4f5f7, letterboxing whatever the window is
+//!   shell             glydi_shell_cutout.png, covering the whole stage
+//!   eye whites        glydi_eye_white.png in each .ew box
+//!   pupils            glydi_pupil.png in the same box, offset by the gaze
+//!   smile             the design's smile PNG (or a drawn mouth)
+//!   overlays          closed lids, X eyes, the sleeping z's
+//! ```
+//!
+//! The shell PNG is opaque across the face (no eye holes -- the design
+//! draws the eyes *on* it), so the eyes go over it. All four images are
+//! embedded with `include_bytes!` so a built binary needs no asset
+//! directory.
+//!
 //! The geometry is the HTML's, as fractions of the stage, so the
 //! proportions survive the port:
 //!
 //! ```text
-//!   stage aspect      1.0529 : 1
+//!   stage aspect      1.0529 : 1   (the shell image's own 995 x 945)
 //!   left eye          left 15.1%  top 29.6%  w 26.65%  h 34.95%
 //!   right eye         left 57.8%  top 27.0%  w 26.65%  h 37.6%
-//!   mouth (drawn)     centred, top 63-69%, width 6-17%
+//!   smile             left 37.2%  top 62.45% w 25.65%  h 12.75%
+//!   body pivot        50% 60%
 //! ```
 //!
-//! The eye white and pupil PNGs are the shipped art, embedded with
-//! `include_bytes!` so a built binary needs no asset directory. The shell
-//! is drawn rather than blitted: the shipped cutout is a 995x945 photo of
-//! a physical shell whose lighting fights a flat window background, and at
-//! 260 px it reads as a grey blob. A rounded dark tile is the Go/Tk face's
-//! treatment (`face.go`: "a black rounded square on a light page, white
-//! features, no shading") and stays crisp at any size.
-//!
 //! Two rules from the Go face, kept because they are what make a face read
-//! as alive rather than as a diagram:
+//! as alive rather than as a diagram (`go/internal/ui/face.go`):
 //!
 //! * It is never perfectly still: it blinks on a random interval, its gaze
 //!   flicks, it breathes. A static face reads as crashed, and a crashed bot
@@ -32,49 +44,64 @@
 //! * Eyes snap toward a target far faster than they drift. That asymmetry
 //!   is what makes it read as a flick rather than a slide.
 
+use std::f32::consts::{PI, TAU};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, TextureHandle, Vec2, pos2, vec2};
+use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, TextureHandle, Vec2, pos2, vec2};
 
 use crate::expression::Expression;
 
-/// The stage's aspect ratio, from the design HTML.
+/// The stage's aspect ratio, from the design HTML (and the shell image).
 pub const ASPECT: f32 = 1.0529;
 
-/// Palette. Cream features on a near-black shell, as in the design's CSS
-/// custom properties (`--cream`, `--dark`).
+/// Palette, from the design's CSS custom properties.
 const CREAM: Color32 = Color32::from_rgb(0xff, 0xf2, 0xd9);
-const DARK: Color32 = Color32::from_rgb(0x17, 0x18, 0x1f);
-const MUTED: Color32 = Color32::from_rgb(0x85, 0x89, 0x9c);
+/// Inside an open mouth (`.openMouth` background).
+const MOUTH_DARK: Color32 = Color32::from_rgb(0x12, 0x13, 0x19);
+/// The sleeping z's (`.zzz`).
+const MUTED: Color32 = Color32::from_rgb(0xa1, 0xa6, 0xbb);
 
-/// The shipped art, embedded so the binary carries its own face.
+/// The shell: a 995 x 945 render of the physical shell, with a soft glow
+/// fading to transparent at the edges.
+pub const SHELL_PNG: &[u8] = include_bytes!("../../../assets/glydi_shell_cutout.png");
+/// The eye white.
 pub const EYE_WHITE_PNG: &[u8] = include_bytes!("../../../assets/glydi_eye_white.png");
-/// The pupil, drawn inside the eye white and offset by the gaze.
+/// The pupil, on the same 265 x 330 canvas as the white so the two align
+/// when drawn into one box.
 pub const PUPIL_PNG: &[u8] = include_bytes!("../../../assets/glydi_pupil.png");
+/// The smile, lifted out of the design HTML (it ships only as a data URL
+/// there).
+pub const SMILE_PNG: &[u8] = include_bytes!("../assets/glydi_smile.png");
 
 /// How far a pupil travels inside its eye, as a fraction of the eye box.
-/// Enough to read as "looking at you" from across a room, small enough that
-/// the pupil never leaves the white.
-const GAZE_TRAVEL: f32 = 0.18;
+/// The pupil oval is ~35% of the box wide and the white's opaque region
+/// spans 11%..89%, so this keeps it on the white at full deflection.
+const GAZE_TRAVEL: Vec2 = vec2(0.16, 0.10);
 
 /// A glance with no direction to aim at decays over this long, then the
 /// eyes go back to their idle wandering.
 pub const GLANCE_TTL: Duration = Duration::from_millis(1200);
 
-/// The two textures, uploaded once.
+/// The four textures, uploaded once.
 pub struct FaceTextures {
+    /// The shell.
+    pub shell: TextureHandle,
     /// The eye white.
     pub eye: TextureHandle,
     /// The pupil.
     pub pupil: TextureHandle,
+    /// The smile.
+    pub smile: TextureHandle,
 }
 
 impl FaceTextures {
     /// Decode and upload the embedded PNGs. Called once, on the first frame.
     pub fn load(ctx: &egui::Context) -> Result<Self, image::ImageError> {
         Ok(Self {
+            shell: upload(ctx, "glydi_shell", SHELL_PNG)?,
             eye: upload(ctx, "glydi_eye_white", EYE_WHITE_PNG)?,
             pupil: upload(ctx, "glydi_pupil", PUPIL_PNG)?,
+            smile: upload(ctx, "glydi_smile", SMILE_PNG)?,
         })
     }
 }
@@ -83,7 +110,15 @@ fn upload(ctx: &egui::Context, name: &str, png: &[u8]) -> Result<TextureHandle, 
     let img = image::load_from_memory(png)?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     let image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-    Ok(ctx.load_texture(name, image, egui::TextureOptions::LINEAR))
+    // Mipmaps: the shell is 995 px drawn at a few hundred, and plain
+    // linear minification shimmers on its glow edge as it breathes.
+    let options = egui::TextureOptions {
+        magnification: egui::TextureFilter::Linear,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+    };
+    Ok(ctx.load_texture(name, image, options))
 }
 
 /// Involuntary movement: blinks, saccades, breathing. Owned by the render
@@ -92,6 +127,7 @@ pub struct Motion {
     t0: Instant,
     rng: u64,
     blink_at: Instant,
+    blink_start: Instant,
     blink_until: Instant,
     blink_again: bool,
     gaze: Vec2,
@@ -110,6 +146,7 @@ impl Motion {
             // blink in unison, which reads as a video loop.
             rng: 0x2545_F491_4F6C_DD1D ^ (now.elapsed().as_nanos() as u64 | 1),
             blink_at: now,
+            blink_start: now,
             blink_until: now,
             blink_again: false,
             gaze: Vec2::ZERO,
@@ -152,8 +189,10 @@ impl Motion {
     /// Advance one frame.
     pub fn tick(&mut self, now: Instant, expression: Expression) {
         // Blinks, sometimes doubled. A metronomic blink is its own kind of
-        // uncanny, so both the interval and the pattern vary.
+        // uncanny, so both the interval and the pattern vary (the Go
+        // face's timings: 90-140 ms shut, 2.2-6.5 s apart, 25% doubled).
         if now >= self.blink_at {
+            self.blink_start = now;
             self.blink_until = now + secs(self.rand() * 0.05 + 0.09);
             if self.blink_again {
                 self.blink_again = false;
@@ -197,6 +236,7 @@ impl Motion {
             }
         }
 
+        // Snap, don't slide: 0.35 of the remaining distance per frame.
         self.gaze += (self.gaze_target - self.gaze) * 0.35;
     }
 
@@ -208,6 +248,25 @@ impl Motion {
     /// Whether the eyes are shut this frame.
     pub fn blinking(&self, now: Instant) -> bool {
         now < self.blink_until
+    }
+
+    /// How open the lids are, 0..1. The lid sweeps down and back up over
+    /// the blink rather than cutting: a half sine, fully shut at the
+    /// middle (the design's `blink` keyframes squash the eye to 6%).
+    pub fn lid_open(&self, now: Instant) -> f32 {
+        if !self.blinking(now) {
+            return 1.0;
+        }
+        let total = self
+            .blink_until
+            .saturating_duration_since(self.blink_start)
+            .as_secs_f32()
+            .max(0.001);
+        let p = now
+            .saturating_duration_since(self.blink_start)
+            .as_secs_f32()
+            / total;
+        1.0 - 0.94 * (p.clamp(0.0, 1.0) * PI).sin()
     }
 
     /// Where the eyes are pointing, -1..1 in each axis.
@@ -225,6 +284,284 @@ fn secs(x: f32) -> Duration {
     Duration::from_secs_f32(x.max(0.0))
 }
 
+// ------------------------------------------------------------------ canvas
+
+/// The stage, with the body transform applied: stage fractions in, window
+/// pixels out. Everything is drawn through this so the design's whole-face
+/// tilts and bounces (`transform-origin: 50% 60%`) move every layer alike.
+struct Canvas<'a> {
+    painter: &'a egui::Painter,
+    rect: Rect,
+    /// Pivot, in stage fractions.
+    pivot: Vec2,
+    /// Offset, in stage fractions.
+    offset: Vec2,
+    /// Rotation, radians, clockwise on a y-down screen.
+    rot: f32,
+    scale: Vec2,
+}
+
+impl Canvas<'_> {
+    /// Stage width, in pixels: the unit for stroke widths.
+    fn w(&self) -> f32 {
+        self.rect.width()
+    }
+
+    /// Map a stage-fraction point to the window.
+    fn at(&self, f: Vec2) -> Pos2 {
+        let delta = (f - self.pivot) * self.scale;
+        let (sin_r, cos_r) = self.rot.sin_cos();
+        // Rotation in stage units must respect the stage'sin_r aspect, or a
+        // tilt shears the face; do it in pixels.
+        let px = vec2(delta.x * self.rect.width(), delta.y * self.rect.height());
+        let rotated = vec2(px.x * cos_r - px.y * sin_r, px.x * sin_r + px.y * cos_r);
+        let origin = self.pivot + self.offset;
+        pos2(
+            self.rect.min.x + origin.x * self.rect.width() + rotated.x,
+            self.rect.min.y + origin.y * self.rect.height() + rotated.y,
+        )
+    }
+
+    /// Draw a texture into a stage-fraction box, optionally rotated about
+    /// `origin` (fractions of the box) by `rot` radians, and squashed
+    /// vertically to `open` about that same origin (the blink).
+    fn image(
+        &self,
+        tex: &TextureHandle,
+        bx: Rect,
+        origin: Vec2,
+        rot: f32,
+        open: f32,
+        tint: Color32,
+    ) {
+        let origin_px = bx.min + bx.size() * origin;
+        let (sin_r, cos_r) = rot.sin_cos();
+        let corner = |x: f32, y: f32| {
+            let delta = vec2(x - origin_px.x, (y - origin_px.y) * open);
+            let rotated = vec2(
+                delta.x * cos_r - delta.y * sin_r * ASPECT.recip(),
+                delta.x * sin_r * ASPECT + delta.y * cos_r,
+            );
+            self.at(origin_px.to_vec2() + rotated)
+        };
+        let mut mesh = Mesh::with_texture(tex.id());
+        let idx = mesh.vertices.len() as u32;
+        for (p, uv) in [
+            (corner(bx.min.x, bx.min.y), pos2(0.0, 0.0)),
+            (corner(bx.max.x, bx.min.y), pos2(1.0, 0.0)),
+            (corner(bx.max.x, bx.max.y), pos2(1.0, 1.0)),
+            (corner(bx.min.x, bx.max.y), pos2(0.0, 1.0)),
+        ] {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: p,
+                uv,
+                color: tint,
+            });
+        }
+        mesh.add_triangle(idx, idx + 1, idx + 2);
+        mesh.add_triangle(idx, idx + 2, idx + 3);
+        self.painter.add(Shape::mesh(mesh));
+    }
+
+    /// A stroked polyline through stage-fraction points.
+    fn line(&self, pts: impl IntoIterator<Item = Vec2>, width: f32, color: Color32) {
+        let pts: Vec<Pos2> = pts.into_iter().map(|p| self.at(p)).collect();
+        self.painter
+            .add(Shape::line(pts, Stroke::new(width, color)));
+    }
+
+    /// An arc of the ellipse inscribed in `b`, from `start` over `extent`
+    /// (radians, clockwise from 3 o'clock on screen), rotated by `rot`
+    /// about the box centre.
+    fn arc_points(bx: Rect, start: f32, extent: f32, rot: f32) -> impl Iterator<Item = Vec2> {
+        let centre = bx.center().to_vec2();
+        let radius = bx.size() / 2.0;
+        let (sin_r, cos_r) = rot.sin_cos();
+        (0..=32).map(move |i| {
+            let angle = start + extent * i as f32 / 32.0;
+            let delta = vec2(radius.x * angle.cos(), radius.y * angle.sin());
+            centre
+                + vec2(
+                    delta.x * cos_r - delta.y * sin_r / ASPECT,
+                    delta.x * sin_r * ASPECT + delta.y * cos_r,
+                )
+        })
+    }
+
+    /// A filled ellipse with an outline, rotated about its centre.
+    fn ellipse(&self, b: Rect, rot: f32, fill: Color32, stroke: Stroke) {
+        let pts: Vec<Pos2> = Self::arc_points(b, 0.0, TAU, rot)
+            .take(32)
+            .map(|p| self.at(p))
+            .collect();
+        self.painter.add(Shape::convex_polygon(pts, fill, stroke));
+    }
+
+    /// A rounded bar (`border-radius: 999px`), rotated about its centre.
+    fn bar(&self, centre: Vec2, len: f32, width: f32, rot: f32, color: Color32) {
+        let (s, c) = rot.sin_cos();
+        let half = len / 2.0;
+        let d = vec2(half * c, half * s * ASPECT);
+        self.line([centre - d, centre + d], width, color);
+    }
+}
+
+// -------------------------------------------------------------------- body
+
+/// The whole-face movement for one expression at time `t`: the design's
+/// per-state keyframes, plus the Go face's breathing on top of all of
+/// them so nothing ever holds perfectly still.
+struct Body {
+    offset: Vec2,
+    rot: f32,
+    scale: Vec2,
+}
+
+fn body(e: Expression, t: f32) -> Body {
+    let cyc = |period: f32| (t % period) / period;
+    let sin = |period: f32| (cyc(period) * TAU).sin();
+    // 0..1..0 over a period, eased like `ease-in-out`.
+    let pulse = |period: f32| (1.0 - (cyc(period) * TAU).cos()) / 2.0;
+    let deg = |d: f32| d.to_radians();
+    let mut out = Body {
+        offset: Vec2::ZERO,
+        rot: 0.0,
+        scale: Vec2::splat(1.0),
+    };
+    match e {
+        Expression::Idle => out.offset.y = -0.012 * pulse(4.2),
+        Expression::Quiet => out.offset.y = -0.012 * pulse(3.6),
+        Expression::Loud => out.offset.y = -0.012 * pulse(3.2),
+        Expression::Listening => out.rot = deg(2.0) * sin(2.2),
+        Expression::Thinking => out.rot = deg(-3.0) * pulse(2.8),
+        Expression::Greeting => {
+            // 0% rest, 35% up 3% and 2% larger, 65% a touch below rest.
+            let phase = cyc(1.6);
+            let (dy, grow) = if phase < 0.35 {
+                let eased = ease(phase / 0.35);
+                (-0.03 * eased, 1.0 + 0.02 * eased)
+            } else if phase < 0.65 {
+                let eased = ease((phase - 0.35) / 0.30);
+                (-0.03 + 0.035 * eased, 1.02 - 0.023 * eased)
+            } else {
+                let eased = ease((phase - 0.65) / 0.35);
+                (0.005 - 0.005 * eased, 0.997 + 0.003 * eased)
+            };
+            out.offset.y = dy;
+            out.scale = Vec2::splat(grow);
+        }
+        Expression::Delighted => out.scale.x = 1.0 + 0.08 * pulse(2.0),
+        Expression::Curious => out.rot = deg(-5.0) + deg(9.0) * pulse(2.8),
+        Expression::Surprised => {
+            let phase = cyc(2.1);
+            let grow = if phase < 0.28 {
+                1.0 + 0.025 * ease(phase / 0.28)
+            } else if phase < 0.55 {
+                1.025 - 0.03 * ease((phase - 0.28) / 0.27)
+            } else {
+                0.995 + 0.005 * ease((phase - 0.55) / 0.45)
+            };
+            out.scale = Vec2::splat(grow);
+        }
+        Expression::Confused => out.rot = deg(-1.0) + deg(3.0) * pulse(2.5),
+        Expression::Asleep => {
+            let eased = pulse(4.5);
+            out.offset.y = 0.005 - 0.013 * eased;
+            out.scale = Vec2::splat(0.997 + 0.003 * eased);
+        }
+        // The glitch: still for 88% of 2.2 s, then four hard jumps.
+        Expression::Broken => {
+            out.offset = match (cyc(2.2) * 100.0) as u32 {
+                90..=91 => vec2(-0.015, 0.0),
+                92..=93 => vec2(0.018, -0.003),
+                94..=95 => vec2(-0.008, 0.002),
+                96..=97 => vec2(0.007, 0.0),
+                _ => Vec2::ZERO,
+            }
+        }
+    }
+    // Breathing (Go: the tile expands 0.6% on the in-breath, at 1.1 rad/s).
+    out.scale *= 1.0 + (t * 1.1).sin() * 0.006;
+    out
+}
+
+/// `ease-in-out` between two keyframes.
+fn ease(u: f32) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    (1.0 - (u * PI).cos()) / 2.0
+}
+
+// -------------------------------------------------------------------- eyes
+
+/// One eye box in stage fractions, with its own rotation (radians) about
+/// its origin (50%, 55%).
+#[derive(Clone, Copy, Debug)]
+struct EyeBox {
+    rect: Rect,
+    rot: f32,
+}
+
+/// Where the eye's transforms pivot (`.ew { transform-origin: 50% 55% }`).
+const EYE_ORIGIN: Vec2 = vec2(0.5, 0.55);
+
+/// The two eye boxes, at the design's asymmetric positions, scaled and
+/// shifted by the expression. Each rule is the HTML's `.ew` CSS for that
+/// state: `scale(a,b) translate(x%,y%)` moves the box by its own size then
+/// scales about the origin.
+fn eye_boxes(e: Expression) -> [EyeBox; 2] {
+    let at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(pos2(x, y), vec2(w, h));
+    let left = at(0.151, 0.296, 0.2665, 0.3495);
+    let right = at(0.578, 0.270, 0.2665, 0.376);
+    let deg = |d: f32| d.to_radians();
+    let plain = |r: Rect| EyeBox { rect: r, rot: 0.0 };
+    let xf = |r: Rect, sx: f32, sy: f32, tx: f32, ty: f32, rot: f32| {
+        let moved = r.translate(vec2(tx * r.width(), ty * r.height()));
+        let o = moved.min + moved.size() * EYE_ORIGIN;
+        let scaled = Rect::from_min_max(
+            o + (moved.min - o) * vec2(sx, sy),
+            o + (moved.max - o) * vec2(sx, sy),
+        );
+        EyeBox {
+            rect: scaled,
+            rot: deg(rot),
+        }
+    };
+    match e {
+        // Wide and focused.
+        Expression::Listening => [
+            xf(left, 1.11, 1.15, -0.02, -0.02, 0.0),
+            xf(right, 1.11, 1.15, 0.02, -0.02, 0.0),
+        ],
+        // Compressed and shifted up and sideways: working something out.
+        Expression::Thinking => [
+            xf(at(0.151, 0.35, 0.2665, 0.22), 1.0, 1.0, 0.06, 0.0, -5.0),
+            xf(at(0.578, 0.315, 0.2665, 0.22), 1.0, 1.0, 0.06, 0.0, -5.0),
+        ],
+        Expression::Quiet => [
+            xf(left, 1.0, 0.88, 0.0, 0.0, 0.0),
+            xf(right, 1.0, 0.88, 0.0, 0.0, 0.0),
+        ],
+        Expression::Loud => [
+            xf(left, 1.0, 0.95, 0.0, 0.0, 0.0),
+            xf(right, 1.0, 0.95, 0.0, 0.0, 0.0),
+        ],
+        // One eye huge, one squinted.
+        Expression::Curious => [
+            xf(left, 1.18, 1.22, -0.03, -0.03, 0.0),
+            xf(at(0.578, 0.36, 0.2665, 0.19), 0.9, 1.0, 0.0, 0.0, 4.0),
+        ],
+        Expression::Surprised => [
+            xf(left, 1.22, 1.28, -0.03, -0.04, 0.0),
+            xf(right, 1.22, 1.28, 0.03, -0.04, 0.0),
+        ],
+        Expression::Confused => [
+            xf(at(0.151, 0.37, 0.2665, 0.18), 1.0, 1.0, 0.0, 0.0, -7.0),
+            xf(right, 1.08, 1.08, 0.0, -0.02, 5.0),
+        ],
+        _ => [plain(left), plain(right)],
+    }
+}
+
 /// Draw the face into `rect`, which should already have [`ASPECT`].
 ///
 /// `level` is the scaled speech level 0..1; it only moves the mouth while
@@ -240,329 +577,217 @@ pub fn draw(
     now: Instant,
 ) {
     let t = motion.elapsed(now);
-    let w = rect.width();
-    let h = rect.height();
-    let frac = |x: f32, y: f32| pos2(rect.min.x + w * x, rect.min.y + h * y);
-
-    // Body animations. The idle float is 4.2 s and +-1.2% of the height
-    // (the design's `@keyframes float`); the rest are its siblings.
-    let (dy, rot) = body_motion(e, t);
-    let rect = rect.translate(vec2(0.0, dy * h));
-    let frac = |x: f32, y: f32| frac(x, y) + vec2(0.0, dy * h);
-    let _ = rot;
-
-    // The shell.
-    painter.rect_filled(rect, CornerRadius::same((w * 0.16) as u8), DARK);
-
-    let blinking = motion.blinking(now);
-    let closed = matches!(
-        e,
-        Expression::Asleep | Expression::Greeting | Expression::Delighted
-    ) || blinking;
-    if matches!(e, Expression::Broken) {
-        draw_x_eyes(painter, rect, w, h);
-    } else if closed {
-        // A crescent: up for the happy states, down for sleep and blinks.
-        let happy = matches!(e, Expression::Greeting | Expression::Delighted) && !blinking;
-        draw_closed_eyes(painter, rect, w, h, happy);
-    } else {
-        draw_open_eyes(painter, rect, tex, motion.gaze(), e);
-    }
-    draw_mouth(painter, rect, w, h, e, level, frac);
-    draw_extras(painter, rect, w, h, e, t);
-}
-
-/// Per-expression body movement: vertical offset as a fraction of height,
-/// and a rotation that is recorded but not applied (egui's painter has no
-/// cheap rotate for a whole subtree; the tilt reads in the eye offsets).
-fn body_motion(e: Expression, t: f32) -> (f32, f32) {
-    let sin = |period: f32| (t * std::f32::consts::TAU / period).sin();
-    match e {
-        Expression::Idle => (-0.012 * sin(4.2).abs(), 0.0),
-        Expression::Quiet => (-0.012 * sin(3.6).abs(), 0.0),
-        Expression::Loud => (-0.014 * sin(3.2).abs(), 0.0),
-        Expression::Listening => (0.0, 0.035 * sin(2.2)),
-        Expression::Thinking => (0.0, -0.05 * sin(2.8).abs()),
-        Expression::Greeting => (-0.03 * sin(1.6).abs(), 0.0),
-        Expression::Curious => (0.0, 0.08 * sin(2.8)),
-        Expression::Surprised => (-0.01 * sin(2.1).abs(), 0.0),
-        Expression::Confused => (0.0, 0.03 * sin(2.5)),
-        Expression::Asleep => (-0.008 * sin(4.5).abs(), 0.0),
-        // The glitch: a jump every ~2.2 s, on for a fraction of a second.
-        Expression::Broken => {
-            let phase = (t / 2.2).fract();
-            (if phase > 0.9 { 0.004 } else { 0.0 }, 0.0)
-        }
-        Expression::Delighted => (0.0, 0.0),
-    }
-}
-
-/// The two eye boxes, at the design's asymmetric positions, scaled and
-/// shifted by the expression.
-fn eye_boxes(rect: Rect, e: Expression) -> [Rect; 2] {
-    let w = rect.width();
-    let h = rect.height();
-    let at = |x: f32, y: f32, bw: f32, bh: f32| {
-        Rect::from_min_size(
-            pos2(rect.min.x + w * x, rect.min.y + h * y),
-            vec2(w * bw, h * bh),
-        )
+    let b = body(e, t);
+    let cv = Canvas {
+        painter,
+        rect,
+        pivot: vec2(0.5, 0.6),
+        offset: b.offset,
+        rot: b.rot,
+        scale: b.scale,
     };
-    // .ew.left / .ew.right from the design CSS.
-    let left = at(0.151, 0.296, 0.2665, 0.3495);
-    let right = at(0.578, 0.270, 0.2665, 0.376);
+    let stage = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+
+    // 1. The shell, covering the stage.
+    cv.image(&tex.shell, stage, vec2(0.5, 0.5), 0.0, 1.0, Color32::WHITE);
+
+    // 2. Eyes. Open eyes are the two PNGs; the happy and sleeping states
+    // replace them with drawn lids, and broken with X's.
     match e {
-        // Wide and focused.
-        Expression::Listening => [
-            scale(left, vec2(1.11, 1.15)),
-            scale(right, vec2(1.11, 1.15)),
-        ],
-        // Compressed and shifted up: working something out.
-        Expression::Thinking => [
-            at(0.151 + 0.016, 0.35, 0.2665, 0.22),
-            at(0.578 + 0.016, 0.315, 0.2665, 0.22),
-        ],
-        Expression::Quiet => [scale(left, vec2(1.0, 0.88)), scale(right, vec2(1.0, 0.88))],
-        Expression::Loud => [scale(left, vec2(1.0, 0.95)), scale(right, vec2(1.0, 0.95))],
-        // One eye huge, one squinted.
-        Expression::Curious => [scale(left, vec2(1.18, 1.22)), at(0.578, 0.36, 0.24, 0.19)],
-        Expression::Surprised => [
-            scale(left, vec2(1.22, 1.28)),
-            scale(right, vec2(1.22, 1.28)),
-        ],
-        Expression::Confused => [
-            at(0.151, 0.37, 0.2665, 0.18),
-            scale(right, vec2(1.08, 1.08)),
-        ],
-        _ => [left, right],
+        Expression::Broken => draw_x_eyes(&cv),
+        Expression::Greeting | Expression::Delighted | Expression::Asleep => {
+            draw_closed_eyes(&cv, e);
+        }
+        _ => draw_open_eyes(&cv, tex, motion.gaze(), motion.lid_open(now), e),
+    }
+
+    // 3. The mouth: the smile PNG where the design shows it, a drawn one
+    // elsewhere.
+    draw_mouth(&cv, tex, e, level, t);
+
+    // 4. Extras outside the features.
+    if e == Expression::Asleep {
+        draw_zzz(&cv, t);
     }
 }
 
-fn scale(r: Rect, by: Vec2) -> Rect {
-    Rect::from_center_size(r.center(), vec2(r.width() * by.x, r.height() * by.y))
-}
-
-fn draw_open_eyes(
-    painter: &egui::Painter,
-    rect: Rect,
-    tex: &FaceTextures,
-    gaze: Vec2,
-    e: Expression,
-) {
-    for eye in eye_boxes(rect, e) {
-        painter.image(
-            tex.eye.id(),
-            eye,
-            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+fn draw_open_eyes(cv: &Canvas, tex: &FaceTextures, gaze: Vec2, open: f32, e: Expression) {
+    for eye in eye_boxes(e) {
+        cv.image(
+            &tex.eye,
+            eye.rect,
+            EYE_ORIGIN,
+            eye.rot,
+            open,
             Color32::WHITE,
         );
-        // The pupil rides inside the white, clipped by nothing: the travel
-        // is small enough that it never reaches the edge.
-        let travel = vec2(eye.width() * GAZE_TRAVEL, eye.height() * GAZE_TRAVEL * 0.7);
-        let pupil = Rect::from_center_size(
-            eye.center() + vec2(gaze.x * travel.x, gaze.y * travel.y),
-            eye.size() * 0.92,
+        // The pupil rides inside the white, on the same canvas, offset by
+        // the gaze; the travel is small enough that it stays on the white.
+        // Clipped to the (unrotated) eye box as a backstop.
+        let shift = vec2(
+            gaze.x * GAZE_TRAVEL.x * eye.rect.width(),
+            gaze.y * GAZE_TRAVEL.y * eye.rect.height(),
         );
-        painter.image(
-            tex.pupil.id(),
-            pupil,
-            Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+        let clip = Rect::from_min_max(cv.at(eye.rect.min.to_vec2()), cv.at(eye.rect.max.to_vec2()));
+        let clipped = cv.painter.with_clip_rect(clip.expand(2.0));
+        let inner = Canvas {
+            painter: &clipped,
+            ..*cv
+        };
+        // The squash origin stays on the eye, not the pupil, so a blink
+        // shuts the lid over wherever the pupil is.
+        let origin = EYE_ORIGIN - vec2(shift.x / eye.rect.width(), shift.y / eye.rect.height());
+        inner.image(
+            &tex.pupil,
+            eye.rect.translate(shift),
+            origin,
+            eye.rot,
+            open,
             Color32::WHITE,
         );
     }
 }
 
-/// Lids: a stroked arc, curving down for a blink or sleep, up for happy.
-fn draw_closed_eyes(painter: &egui::Painter, rect: Rect, w: f32, h: f32, happy: bool) {
-    let width = (0.012 * w).max(2.0);
-    for cx in [0.287_f32, 0.713] {
-        let centre = pos2(rect.min.x + w * cx, rect.min.y + h * 0.545);
-        let half = w * 0.085;
-        let bulge = h * if happy { -0.045 } else { 0.045 };
-        let pts: Vec<Pos2> = (0..=16)
-            .map(|i| {
-                let u = i as f32 / 16.0 * 2.0 - 1.0;
-                pos2(centre.x + u * half, centre.y + bulge * (1.0 - u * u))
-            })
-            .collect();
-        painter.add(egui::Shape::line(pts, Stroke::new(width, CREAM)));
+/// Lids (`.closedEye`): an 18% x 9% box at 52.5% down; a downward curve
+/// for sleep, an arch for the happy states.
+fn draw_closed_eyes(cv: &Canvas, e: Expression) {
+    let happy = e != Expression::Asleep;
+    let top = match e {
+        Expression::Delighted => 0.50,
+        Expression::Asleep => 0.535,
+        _ => 0.525,
+    };
+    let width = cv.w()
+        * if e == Expression::Delighted {
+            0.0135
+        } else {
+            0.0115
+        };
+    for (i, left) in [0.197_f32, 0.627].into_iter().enumerate() {
+        let bx = Rect::from_min_size(pos2(left, top), vec2(0.18, 0.09));
+        let rot = match e {
+            Expression::Delighted if i == 0 => -4.0_f32.to_radians(),
+            Expression::Delighted => 4.0_f32.to_radians(),
+            _ => 0.0,
+        };
+        // Screen angles: 0 is 3 o'clock, PI/2 is straight down.
+        let (start, extent) = if happy { (PI, PI) } else { (0.0, PI) };
+        cv.line(Canvas::arc_points(bx, start, extent, rot), width, CREAM);
     }
 }
 
-fn draw_x_eyes(painter: &egui::Painter, rect: Rect, w: f32, h: f32) {
-    let width = (0.014 * w).max(2.0);
-    for cx in [0.33_f32, 0.665] {
-        let c = pos2(rect.min.x + w * cx, rect.min.y + h * 0.52);
-        let r = w * 0.055;
-        painter.line_segment(
-            [c + vec2(-r, -r), c + vec2(r, r)],
-            Stroke::new(width, CREAM),
+/// `.xeye`: two rounded bars crossed in an 11% box at 47% down.
+fn draw_x_eyes(cv: &Canvas) {
+    let width = cv.w() * 0.009;
+    for left in [0.28_f32, 0.62] {
+        let bx = Rect::from_min_size(pos2(left, 0.47), vec2(0.11, 0.11));
+        let centre = bx.center().to_vec2();
+        let len = bx.height() * 0.95;
+        cv.bar(
+            centre,
+            len * ASPECT.recip(),
+            width,
+            45_f32.to_radians(),
+            CREAM,
         );
-        painter.line_segment(
-            [c + vec2(-r, r), c + vec2(r, -r)],
-            Stroke::new(width, CREAM),
+        cv.bar(
+            centre,
+            len * ASPECT.recip(),
+            width,
+            -45_f32.to_radians(),
+            CREAM,
         );
     }
 }
 
-fn draw_mouth(
-    painter: &egui::Painter,
-    rect: Rect,
-    width: f32,
-    height: f32,
-    expression: Expression,
-    level: f32,
-    frac: impl Fn(f32, f32) -> Pos2,
-) {
-    let (w, h) = (width, height);
-    let stroke_w = (0.011 * w).max(2.0);
-    let centre_x = rect.center().x;
-    match expression {
-        // Openness tracks the audio, floored so it never fully shuts
-        // mid-word (which reads as a stutter). The design's .openMouth,
-        // between its `quiet` and `loud` geometry.
-        Expression::Quiet | Expression::Loud => {
-            let mh = h * (0.055 + level * 0.09);
-            let mw = w * (0.075 + level * 0.07);
-            let top = h * (0.667 - level * 0.034);
-            let r =
-                Rect::from_center_size(pos2(centre_x, rect.min.y + top + mh / 2.0), vec2(mw, mh));
-            painter.rect_filled(
-                r,
-                CornerRadius::same((mh * 0.45) as u8),
-                Color32::from_rgb(0x12, 0x13, 0x19),
-            );
-            painter.rect_stroke(
-                r,
-                CornerRadius::same((mh * 0.45) as u8),
-                Stroke::new(stroke_w, CREAM),
-                egui::StrokeKind::Middle,
-            );
-        }
-        // A flat mouth pushed off centre.
-        Expression::Thinking => {
-            let base_y = rect.min.y + h * 0.7;
-            let half = w * 0.05;
-            painter.line_segment(
-                [
-                    pos2(centre_x + w * 0.03 - half, base_y),
-                    pos2(centre_x + w * 0.03 + half, base_y),
-                ],
-                Stroke::new(stroke_w * 1.2, CREAM),
-            );
-        }
-        Expression::Broken => {
-            let base_y = rect.min.y + h * 0.7;
-            let half = w * 0.05;
-            painter.line_segment(
-                [
-                    pos2(centre_x - half, base_y - half * 0.4),
-                    pos2(centre_x + half, base_y + half * 0.4),
-                ],
-                Stroke::new(stroke_w, CREAM),
-            );
-        }
-        // An O: caught off guard.
-        Expression::Surprised => {
-            painter.circle_stroke(frac(0.5, 0.695), w * 0.032, Stroke::new(stroke_w, CREAM));
-        }
-        // A wavy line: it did not follow that.
-        Expression::Confused => {
-            let base_y = rect.min.y + h * 0.70;
-            let pts: Vec<Pos2> = (0..=24)
-                .map(|i| {
-                    let frac_i = i as f32 / 24.0;
-                    pos2(
-                        centre_x + (frac_i - 0.5) * w * 0.17,
-                        base_y + (frac_i * std::f32::consts::TAU * 1.5).sin() * h * 0.012,
-                    )
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts, Stroke::new(stroke_w, CREAM)));
-        }
-        Expression::Asleep => {
-            let base_y = rect.min.y + h * 0.70;
-            painter.line_segment(
-                [
-                    pos2(centre_x - w * 0.05, base_y),
-                    pos2(centre_x + w * 0.05, base_y),
-                ],
-                Stroke::new(stroke_w, CREAM),
-            );
-        }
-        // Idle, listening, greeting, delighted, curious: a smile, wider the
-        // happier it is.
-        other => {
-            let widen = match other {
-                Expression::Delighted => 1.42,
-                Expression::Greeting => 1.25,
-                Expression::Curious => 0.74,
-                Expression::Listening => 0.82,
-                _ => 1.0,
+fn draw_mouth(cv: &Canvas, tex: &FaceTextures, e: Expression, level: f32, t: f32) {
+    let w = cv.w();
+    let stroke_w = w * 0.0077; // the CSS's 4 px borders on a 520 px stage
+    let bar_w = w * 0.0096; // the 5 px flat mouth
+    let deg = |d: f32| d.to_radians();
+    match e {
+        // The smile PNG: `.smile`, scaled about its centre per state.
+        Expression::Idle
+        | Expression::Listening
+        | Expression::Greeting
+        | Expression::Delighted
+        | Expression::Curious
+        | Expression::Asleep => {
+            let (scale, left, top, rot) = match e {
+                Expression::Listening => (0.82, 0.372, 0.642, 0.0),
+                Expression::Greeting => (1.25, 0.372, 0.608, 0.0),
+                Expression::Delighted => (1.42, 0.372, 0.598, 0.0),
+                Expression::Curious => (0.74, 0.39, 0.64, -8.0),
+                Expression::Asleep => (0.55, 0.372, 0.65, 0.0),
+                _ => (1.0, 0.372, 0.6245, 0.0),
             };
-            let half = w * 0.085 * widen;
-            let base_y = rect.min.y + h * 0.655;
-            let depth = h * 0.05 * widen;
-            let pts: Vec<Pos2> = (0..=20)
-                .map(|i| {
-                    let across = i as f32 / 20.0 * 2.0 - 1.0;
-                    pos2(
-                        centre_x + across * half,
-                        base_y + depth * (1.0 - across * across),
-                    )
-                })
-                .collect();
-            painter.add(egui::Shape::line(pts, Stroke::new(stroke_w, CREAM)));
+            let bx = Rect::from_min_size(pos2(left, top), vec2(0.2565, 0.1275));
+            let bx = Rect::from_center_size(bx.center(), bx.size() * scale);
+            cv.image(
+                &tex.smile,
+                bx,
+                vec2(0.5, 0.5),
+                deg(rot),
+                1.0,
+                Color32::WHITE,
+            );
+        }
+        // `.openMouth`: openness tracks the audio, between the design's
+        // `quiet` (8% x 6.5%, squashed to 55%) and `loud` (14% x 14%,
+        // stretched to 125%) geometry. The floor keeps it from shutting
+        // mid-word, which reads as a stutter.
+        Expression::Quiet | Expression::Loud => {
+            let openness = level.clamp(0.0, 1.0);
+            let mw = lerp(0.08 * 0.82, 0.14 * 1.05, openness);
+            let mh = lerp(0.065 * 0.55, 0.14 * 1.25, openness);
+            let cy = lerp(0.667 + 0.0325, 0.633 + 0.07, openness);
+            let bx = Rect::from_center_size(pos2(0.5, cy), vec2(mw, mh));
+            cv.ellipse(bx, 0.0, MOUTH_DARK, Stroke::new(stroke_w, CREAM));
+        }
+        // `.oMouth`: caught off guard.
+        Expression::Surprised => {
+            let bx = Rect::from_min_size(pos2(0.5 - 0.032, 0.652), vec2(0.064, 0.086));
+            cv.ellipse(bx, 0.0, MOUTH_DARK, Stroke::new(stroke_w, CREAM));
+        }
+        // `.flatMouth`: a small bar pushed off centre, the way a person's
+        // goes when they are working something out.
+        Expression::Thinking => cv.bar(vec2(0.53, 0.686 + 0.005), 0.10, bar_w, deg(-5.0), CREAM),
+        Expression::Broken => cv.bar(vec2(0.5, 0.68 + 0.005), 0.10, bar_w, deg(7.0), CREAM),
+        // `.wavyMouth`: a shallow arch, tilted; it did not follow that.
+        Expression::Confused => {
+            let bx = Rect::from_min_size(pos2(0.415, 0.673 + 0.032), vec2(0.17, 0.06));
+            let width = w * 0.0096;
+            let wobble = deg(5.0) + deg(1.5) * (t * 3.0).sin();
+            cv.line(Canvas::arc_points(bx, PI, PI, wobble), width, CREAM);
         }
     }
 }
 
-/// Things outside the face: sleep marks, and the listening bars from the Go
-/// face (the clearest "I am hearing you" cue at a glance).
-fn draw_extras(
-    painter: &egui::Painter,
-    rect: Rect,
-    width: f32,
-    height: f32,
-    expression: Expression,
-    secs: f32,
-) {
-    let (w, h, t) = (width, height, secs);
-    match expression {
-        Expression::Asleep => {
-            for (i, (dx, dy, size)) in [
-                (0.80_f32, 0.20_f32, 0.05_f32),
-                (0.87, 0.12, 0.065),
-                (0.95, 0.03, 0.085),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let drift = (t * 1.5 + i as f32).sin() * h * 0.01;
-                painter.text(
-                    pos2(rect.min.x + w * dx, rect.min.y + h * dy + drift),
-                    egui::Align2::CENTER_CENTER,
-                    "z",
-                    egui::FontId::proportional(h * size),
-                    MUTED,
-                );
-            }
-        }
-        Expression::Listening => {
-            for i in 0..3 {
-                let bar = (0.08 + (t * 4.0 - i as f32 * 0.6).sin().abs() * 0.16) * h * 0.5;
-                let bar_x = rect.max.x - w * (0.055 + i as f32 * 0.035);
-                painter.line_segment(
-                    [
-                        pos2(bar_x, rect.center().y - bar),
-                        pos2(bar_x, rect.center().y + bar),
-                    ],
-                    Stroke::new((0.009 * w).max(2.0), MUTED),
-                );
-            }
-        }
-        _ => {}
+/// `.zzz`: a bold z rising from the top-right of the shell and fading,
+/// every 2.7 s; three of them staggered so there is always one in flight.
+fn draw_zzz(cv: &Canvas, t: f32) {
+    let h = cv.rect.height();
+    for i in 0..3 {
+        let p = ((t + i as f32 * 0.9) % 2.7) / 2.7;
+        let alpha = if p < 0.35 {
+            p / 0.35 * 0.8
+        } else {
+            0.8 * (1.0 - (p - 0.35) / 0.65)
+        };
+        let origin = vec2(0.79, 0.24) + vec2(0.05 * p, -0.08 * p);
+        let size = h * (0.055 + 0.02 * i as f32) * (0.85 + 0.2 * p);
+        cv.painter.text(
+            cv.at(origin),
+            egui::Align2::CENTER_CENTER,
+            "z",
+            egui::FontId::proportional(size),
+            MUTED.gamma_multiply(alpha),
+        );
     }
+}
+
+fn lerp(a: f32, b: f32, k: f32) -> f32 {
+    a + (b - a) * k
 }
 
 #[cfg(test)]
@@ -571,12 +796,20 @@ mod tests {
 
     #[test]
     fn embedded_art_decodes_and_matches() {
-        // Same size for both, since the pupil is drawn inside the white
-        // with the same box and a gaze offset.
-        let eye = image::load_from_memory(EYE_WHITE_PNG).unwrap_or_else(|e| panic!("eye: {e}"));
-        let pupil = image::load_from_memory(PUPIL_PNG).unwrap_or_else(|e| panic!("pupil: {e}"));
-        assert_eq!((eye.width(), eye.height()), (265, 330));
-        assert_eq!((pupil.width(), pupil.height()), (eye.width(), eye.height()));
+        let dims = |png: &[u8]| {
+            let img = image::load_from_memory(png).unwrap_or_else(|e| panic!("art: {e}"));
+            (img.width(), img.height())
+        };
+        // The shell's aspect is the stage's, so `object-fit: cover` is a
+        // plain stretch.
+        let (sw, sh) = dims(SHELL_PNG);
+        assert_eq!((sw, sh), (995, 945));
+        assert!((sw as f32 / sh as f32 - ASPECT).abs() < 1e-3);
+        // Same canvas for the white and the pupil, since the pupil is drawn
+        // inside the white with the same box and a gaze offset.
+        assert_eq!(dims(EYE_WHITE_PNG), (265, 330));
+        assert_eq!(dims(PUPIL_PNG), dims(EYE_WHITE_PNG));
+        assert_eq!(dims(SMILE_PNG), (255, 120));
     }
 
     #[test]
@@ -588,8 +821,9 @@ mod tests {
     }
 
     #[test]
-    fn every_expression_keeps_the_eyes_on_the_face() {
-        let stage = Rect::from_min_size(Pos2::ZERO, vec2(ASPECT * 400.0, 400.0));
+    fn every_expression_keeps_the_eyes_on_the_shell() {
+        // The shell's opaque body spans roughly 5%..95% of the stage.
+        let shell = Rect::from_min_max(pos2(0.05, 0.06), pos2(0.95, 0.95));
         for e in [
             Expression::Idle,
             Expression::Listening,
@@ -600,15 +834,67 @@ mod tests {
             Expression::Surprised,
             Expression::Confused,
         ] {
-            for eye in eye_boxes(stage, e) {
-                // A pupil at full gaze must still be inside the stage, or
-                // the eye visibly slides off the shell.
-                let pad = eye.size() * GAZE_TRAVEL;
-                let reach = eye.expand2(pad);
+            for eye in eye_boxes(e) {
+                // A pupil at full gaze must still be on the shell, or the
+                // eye visibly slides off it.
+                let reach = eye.rect.expand2(eye.rect.size() * GAZE_TRAVEL);
                 assert!(
-                    stage.contains_rect(reach),
-                    "{} eye {eye:?} leaves the stage",
-                    e.name()
+                    shell.contains_rect(reach),
+                    "{} eye {:?} leaves the shell",
+                    e.name(),
+                    eye.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_lid_sweeps_shut_and_open_again() {
+        let now = Instant::now();
+        let mut m = Motion::new(now);
+        // Force a blink now.
+        m.blink_at = now;
+        m.tick(now, Expression::Idle);
+        assert!(m.blinking(now));
+        let mid = now + (m.blink_until - now) / 2;
+        assert!(m.lid_open(now) > 0.95);
+        assert!(
+            m.lid_open(mid) < 0.1,
+            "shut at the middle: {}",
+            m.lid_open(mid)
+        );
+        assert!(m.lid_open(m.blink_until) >= 1.0);
+    }
+
+    #[test]
+    fn body_motion_is_bounded() {
+        for e in [
+            Expression::Idle,
+            Expression::Listening,
+            Expression::Thinking,
+            Expression::Greeting,
+            Expression::Delighted,
+            Expression::Curious,
+            Expression::Surprised,
+            Expression::Confused,
+            Expression::Asleep,
+            Expression::Broken,
+        ] {
+            for i in 0..300 {
+                let motion = body(e, i as f32 * 0.037);
+                assert!(
+                    motion.offset.length() < 0.05,
+                    "{} offset {:?}",
+                    e.name(),
+                    motion.offset
+                );
+                assert!(motion.rot.abs() < 0.1, "{} rot {}", e.name(), motion.rot);
+                assert!(
+                    (0.98..1.12).contains(&motion.scale.x)
+                        && (0.98..1.05).contains(&motion.scale.y),
+                    "{} scale {:?}",
+                    e.name(),
+                    motion.scale
                 );
             }
         }

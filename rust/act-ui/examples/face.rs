@@ -1,7 +1,8 @@
 //! Open the face window and drive it, to see the expressions for real.
 //!
-//!     cargo run -p act-ui --example face            # cycles every state
-//!     cargo run -p act-ui --example face -- listen  # holds one state
+//!     cargo run -p act-ui --example face                 # cycles every state
+//!     cargo run -p act-ui --example face -- listen       # holds one state
+//!     cargo run -p act-ui --example face -- idle --debug # with the panel open
 //!
 //! Runs on the main thread, like the binary must.
 
@@ -13,7 +14,9 @@ use mind::{Event, EventKind, WorldView};
 
 fn main() {
     tracing_subscriber::fmt().init();
-    let hold = std::env::args().nth(1).and_then(|a| Expression::parse(&a));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let debug = args.iter().any(|a| a == "--debug");
+    let hold = args.iter().find_map(|a| Expression::parse(a));
 
     let queue = CommandQueue::new();
     let mut router = CommandRouter::new(queue.clone());
@@ -94,8 +97,10 @@ fn main() {
         })),
     };
 
+    // The panel is off by default, as in the binary: the face is the
+    // product and the panel is for whoever is debugging it.
     let config = UiConfig {
-        debug: true,
+        debug,
         ..UiConfig::default()
     };
     if let Err(e) = run_ui(&config, ui_rx, Some(obs_rx), sources) {
