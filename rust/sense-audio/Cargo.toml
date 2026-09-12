@@ -5,8 +5,29 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Feed frames from a WAV file or a synthetic generator instead of the
+# microphone, so CI can run the whole pipeline without hardware.
+mock = []
+
 [dependencies]
 common = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+cpal = { workspace = true }
+hound = { workspace = true }
+ort = { workspace = true }
+whisper-rs = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { workspace = true, features = ["metal"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

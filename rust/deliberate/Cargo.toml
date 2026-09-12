@@ -7,6 +7,22 @@ rust-version.workspace = true
 
 [dependencies]
 common = { workspace = true }
+mind = { workspace = true }
+smol_str = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# A scripted backend for tests and for running the loop without a model.
+mock = []
 
 [lints]
 workspace = true
