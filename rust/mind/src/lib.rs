@@ -19,24 +19,36 @@
 //! `intent` command for the deliberate path. All deterministic and
 //! allocation-light, so property 1 still holds.
 
+//!
+//! The LEARN stage adds, still on the same thread: [`Outcomes`] (what
+//! followed each proactive act, feeding the acknowledge and lull rules),
+//! [`Curiosity`] (novelty → `curious` intents), and a [`SelfModel`] the
+//! deliberate path can answer "what can you see?" from truthfully.
+
 pub mod belief;
+pub mod curiosity;
 pub mod engage;
 pub mod event;
 pub mod goal;
+pub mod outcome;
 pub mod plan;
 pub mod reflex;
 pub mod rules;
+pub mod selfmodel;
 pub mod stats;
 pub mod view;
 pub mod working;
 pub mod world;
 
 pub use belief::{Belief, BeliefSet, Likelihood, Pattern};
+pub use curiosity::{Curiosity, InterestView};
 pub use engage::Engagement;
 pub use event::{Event, EventKind, EventLog};
 pub use goal::{Goal, GoalStack};
+pub use outcome::{Attempt, EffectiveRates, Outcome, OutcomeRule, Outcomes, Tally};
 pub use plan::{Decision, Planner, PlannerRule};
 pub use reflex::{Cognition, RECENT_EVENTS, Reflex, ReflexHandle, Rule};
+pub use selfmodel::SelfModel;
 pub use stats::ReflexStats;
 pub use view::{NOBODY, ViewEntity, WorldView};
 pub use working::{Question, WorkingMemory, WorkingSnapshot};

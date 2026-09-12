@@ -48,6 +48,9 @@ pub struct Cognition<'a> {
     pub working: &'a mut WorkingMemory,
     /// What we are trying to do.
     pub goals: &'a mut GoalStack,
+    /// The events this fold or tick produced, in order. Empty on a quiet
+    /// tick. The outcome rule reads SAIDs from here.
+    pub events: &'a [Event],
 }
 
 /// Commands from one rule pass. Four inline: barge-in + attend + backchannel
@@ -74,6 +77,13 @@ pub trait Rule: Send {
     /// `apply` signature stays as it was.
     fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
         let _ = (cx, out);
+    }
+
+    /// How many things this rule is holding to do later (the planner's
+    /// commitments waiting for their person). Default: none. Summed by
+    /// [`Reflex::rules_pending`] for tests and the debug panel.
+    fn pending_count(&self) -> usize {
+        0
     }
 }
 
@@ -122,7 +132,7 @@ impl Reflex {
             log: EventLog::new(session_id),
             view: Arc::new(ArcSwap::new(WorldView::empty(now))),
             last_tick: now,
-            working: WorkingMemory::new(),
+            working: WorkingMemory::started_at(now),
             goals: GoalStack::new(),
             event_tap: None,
             recent: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
@@ -156,8 +166,9 @@ impl Reflex {
         let out = self.on_observation(o);
         self.latency.observation();
         self.latency.commands(out.len() as u64);
-        self.latency
-            .record(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.latency.record(us);
+        self.working.self_model.reaction(us);
         out
     }
 
@@ -170,6 +181,12 @@ impl Reflex {
     /// asked on its own).
     pub fn working_mut(&mut self) -> &mut WorkingMemory {
         &mut self.working
+    }
+
+    /// Everything the rules are holding to do later
+    /// ([`Rule::pending_count`], summed).
+    pub fn rules_pending(&self) -> usize {
+        self.rules.iter().map(|r| r.pending_count()).sum()
     }
 
     /// The goal stack.
@@ -203,10 +220,14 @@ impl Reflex {
             world: &self.world,
             working: &mut self.working,
             goals: &mut self.goals,
+            events,
         };
         for r in &self.rules {
             r.plan(&mut cx, out);
         }
+        // The self-model counts the interruptions this pass issued. A
+        // handful of comparisons over at most a few commands.
+        self.working.self_model.note_commands(out);
     }
 
     /// The room.
@@ -236,6 +257,7 @@ impl Reflex {
 
     /// Fold, run rules, log, publish. Returns the commands to enqueue.
     pub fn on_observation(&mut self, o: &Observation) -> Commands {
+        self.working.self_model.observe(o);
         let events = self.world.fold(o);
         let mut out = Commands::new();
         for r in &self.rules {

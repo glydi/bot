@@ -135,6 +135,14 @@ impl WorldView {
         })
     }
 
+    /// What the mind knows about itself at this snapshot (uptime, turns,
+    /// interruptions, reflex latency, which senses deliver). Lives on the
+    /// working half so views built by hand elsewhere keep compiling; this
+    /// is the `WorldView.self_model` the deliberate path reads.
+    pub fn self_model(&self) -> &crate::selfmodel::SelfModel {
+        &self.working.self_model
+    }
+
     /// The person we believe is currently talking, if any: the most
     /// confident of those speaking, or -- when the microphone could not
     /// say whose the voice is -- the one person the camera confirms is

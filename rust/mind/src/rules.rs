@@ -3,13 +3,14 @@
 //! and pushes commands into a stack buffer. No allocation on the hot path
 //! beyond the `SmolStr` literals, which are inline for names this short.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use common::{Command, EntityId, Observation, Payload, Priority};
 use smallvec::SmallVec;
 
-use crate::reflex::{Commands, Rule};
+use crate::outcome::{ack_factor, lull_factor};
+use crate::reflex::{Cognition, Commands, Rule};
 use crate::world::{LONG_SPEECH, World};
 
 /// Modality the audio sense uses for voice activity edges.
@@ -118,10 +119,21 @@ impl Rule for ListenOnVoice {
 /// The phrase is drawn from [`Acknowledge::PHRASES`], never the same one
 /// twice running, by a small xorshift generator seeded deterministically
 /// ([`Acknowledge::with_seed`]) so a replay produces the same sounds.
+///
+/// The probability adapts (LEARN stage): it is scaled by
+/// [`ack_factor`] of the speaker's backchannel outcome rate, read from
+/// working memory in the [`Rule::plan`] step -- which is why the roll
+/// happens there and `apply` only records the eligible turn. Someone who
+/// never engages after an "okay" hears it a third as often; someone who
+/// always does, half again as often. A probability of exactly 1.0 (tests,
+/// replays) is left alone: "deterministic" stays deterministic.
 #[derive(Debug)]
 pub struct Acknowledge {
     /// When we last acknowledged.
     last: Cell<Option<Instant>>,
+    /// The turn `apply` found eligible this pass, for `plan` to roll on:
+    /// whose it was (if attributed) and when.
+    eligible: RefCell<Option<(Option<EntityId>, Instant)>>,
     /// Index into [`Acknowledge::PHRASES`] of the last phrase used.
     prev: Cell<Option<usize>>,
     /// xorshift64 state. Never zero.
@@ -162,6 +174,7 @@ impl Acknowledge {
     pub fn new() -> Self {
         Self {
             last: Cell::new(None),
+            eligible: RefCell::new(None),
             prev: Cell::new(None),
             rng: Cell::new(Self::DEFAULT_SEED),
             probability: Self::PROBABILITY,
@@ -186,6 +199,15 @@ impl Acknowledge {
             Self::PROBABILITY
         };
         self
+    }
+
+    /// The chance of a spoken acknowledgement for someone whose
+    /// backchannel outcome rate is `rate` (see `outcome::rate_of`).
+    pub fn probability_for(&self, rate: f32) -> f32 {
+        if self.probability >= 1.0 {
+            return self.probability;
+        }
+        (self.probability * ack_factor(rate)).clamp(0.0, 1.0)
     }
 
     /// Next generator output: xorshift64, a handful of instructions.
@@ -247,7 +269,18 @@ impl Rule for Acknowledge {
             .last
             .get()
             .is_some_and(|t| now.saturating_duration_since(t) < Self::MIN_GAP);
-        if !long_enough || recently || self.roll() >= self.probability {
+        if !long_enough || recently {
+            return;
+        }
+        *self.eligible.borrow_mut() = Some((speech.and_then(|s| s.who.clone()), now));
+    }
+
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        let Some((who, now)) = self.eligible.borrow_mut().take() else {
+            return;
+        };
+        let rate = who.map_or(0.5, |id| cx.working.outcomes.rate(&id, "backchannel"));
+        if self.roll() >= self.probability_for(rate) {
             return;
         }
         self.last.set(Some(now));
@@ -392,6 +425,13 @@ impl Rule for BackchannelAfterLongSpeech {
 /// so the deliberate path can phrase it from memory; at most once per
 /// [`Lull::MIN_GAP`] per person, and never while anyone (the bot included)
 /// is talking or within [`Lull::SILENCE`] of the last voice.
+///
+/// The per-person gap adapts (LEARN stage): it is [`Lull::MIN_GAP`] times
+/// [`lull_factor`] of their small-talk outcome rate, read from working
+/// memory in [`Rule::plan`] (which runs on every observation and tick, so
+/// nothing is lost by deciding there rather than in `apply`/`on_tick`).
+/// Someone who never answers is opened to a third as often (9 min);
+/// someone who always answers, twice as often (90 s).
 #[derive(Debug)]
 pub struct Lull {
     /// Last time anyone spoke or the bot did; the lull is measured from it.
@@ -425,7 +465,14 @@ impl Lull {
         }
     }
 
-    fn check(&self, now: Instant, w: &World, out: &mut Commands) {
+    /// The gap before another opening line to someone whose small-talk
+    /// outcome rate is `rate`.
+    pub fn gap_for(rate: f32) -> Duration {
+        Self::MIN_GAP.mul_f32(lull_factor(rate))
+    }
+
+    fn check(&self, cx: &Cognition<'_>, out: &mut Commands) {
+        let (now, w) = (cx.now, cx.world);
         if w.bot_speaking() || w.anyone_speaking() {
             return;
         }
@@ -444,10 +491,12 @@ impl Lull {
         else {
             return;
         };
-        let recently =
-            self.last.borrow().iter().any(|(id, at)| {
-                *id == who.id && now.saturating_duration_since(*at) < Self::MIN_GAP
-            });
+        let gap = Self::gap_for(cx.working.outcomes.rate(&who.id, "small_talk"));
+        let recently = self
+            .last
+            .borrow()
+            .iter()
+            .any(|(id, at)| *id == who.id && now.saturating_duration_since(*at) < gap);
         if recently {
             return;
         }
@@ -492,11 +541,11 @@ impl Rule for Lull {
             "face" if self.last_voice.get().is_none() => self.last_voice.set(Some(o.at)),
             _ => {}
         }
-        self.check(o.at, w, out);
+        let _ = (w, out);
     }
 
-    fn on_tick(&self, now: Instant, w: &World, out: &mut Commands) {
-        self.check(now, w, out);
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        self.check(cx, out);
     }
 }
 
@@ -576,12 +625,18 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
 }
 
 /// [`default_rules`] plus the [`PlannerRule`](crate::PlannerRule), which
-/// emits `deliberate/intent` commands. Opt-in rather than default so that
+/// emits `deliberate/intent` commands, the [`Lull`], the
+/// [`Curiosity`](crate::Curiosity) rule and, last, the
+/// [`OutcomeRule`](crate::OutcomeRule) that learns from what the others
+/// did. Opt-in rather than default so that
 /// consumers counting commands from `Reflex::new` see exactly what they
 /// did before Phase 8; wire it in with `Reflex::with_rules`.
 pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v = default_rules();
-    v.push(Box::new(crate::plan::PlannerRule));
+    v.push(Box::<crate::plan::PlannerRule>::default());
     v.push(Box::new(Lull::new()));
+    v.push(Box::new(crate::curiosity::Curiosity::new()));
+    // Last: it reads every command the rules above pushed this pass.
+    v.push(Box::new(crate::outcome::OutcomeRule));
     v
 }

@@ -16,9 +16,16 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::belief::BeliefSet;
+use crate::curiosity::InterestView;
 use crate::event::{Event, EventKind};
 use crate::goal::task_in;
+use crate::outcome::{EffectiveRates, Outcomes, Tally};
+use crate::selfmodel::SelfModel;
 use crate::world::{Status, World};
+
+/// Interests published per snapshot. A handful: the debug panel shows
+/// what we are curious about right now, not the whole LRU.
+pub const MAX_INTERESTS: usize = 8;
 
 /// Events kept in the recent window. Eight covers "what happened while I
 /// was thinking" for one LLM turn.
@@ -54,7 +61,7 @@ pub struct Question {
 }
 
 /// The mind's scratch space. Owned by [`Reflex`](crate::Reflex).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkingMemory {
     /// What the conversation is about, if anyone has said.
     pub topic: Option<String>,
@@ -82,12 +89,55 @@ pub struct WorkingMemory {
     /// across the room: two strangers walking in together get one
     /// "what's your name?", not a volley.
     pub last_name_ask: Option<Instant>,
+    /// What followed our proactive acts, per person and kind (the LEARN
+    /// stage). Read by the acknowledge and lull rules to adapt.
+    pub outcomes: Outcomes,
+    /// What we know about ourselves: uptime, turns, senses that deliver.
+    pub self_model: SelfModel,
+    /// What we are curious about, as last published by the curiosity rule.
+    interests: Vec<InterestView>,
+}
+
+impl Default for WorkingMemory {
+    fn default() -> Self {
+        Self::started_at(Instant::now())
+    }
 }
 
 impl WorkingMemory {
-    /// Empty.
+    /// Empty, started now.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Empty, with the self-model's clock started at `now` (the reflex's
+    /// construction time, so a fake clock measures uptime too).
+    pub fn started_at(now: Instant) -> Self {
+        Self {
+            topic: None,
+            open_questions: Vec::new(),
+            current_speaker: None,
+            attention: None,
+            recent: VecDeque::new(),
+            threads: Vec::new(),
+            greeted: Vec::new(),
+            name_asked: Vec::new(),
+            last_name_ask: None,
+            outcomes: Outcomes::new(),
+            self_model: SelfModel::new(now),
+            interests: Vec::new(),
+        }
+    }
+
+    /// What we are curious about, as last published.
+    pub fn interests(&self) -> &[InterestView] {
+        &self.interests
+    }
+
+    /// Replace the published interests (at most [`MAX_INTERESTS`]).
+    pub fn set_interests(&mut self, it: impl IntoIterator<Item = InterestView>) {
+        self.interests.clear();
+        self.interests.extend(it.into_iter().take(MAX_INTERESTS));
     }
 
     /// The last few events, oldest first.
@@ -336,6 +386,14 @@ pub struct WorkingSnapshot {
     /// carries positive evidence only, unlike the per-person `engaged`
     /// flag, so the `[room]` speaker line never names someone on a default.
     pub engaged: Option<EntityId>,
+    /// Every outcome tally (bounded, see `outcome::MAX_TALLIES`).
+    pub outcomes: Vec<Tally>,
+    /// The rates the adaptive rules are using for everyone present.
+    pub rates: Vec<EffectiveRates>,
+    /// What the mind knows about itself, with `awake` filled in.
+    pub self_model: SelfModel,
+    /// What the mind is curious about right now.
+    pub interests: Vec<InterestView>,
 }
 
 impl WorkingSnapshot {
@@ -362,6 +420,13 @@ impl WorkingSnapshot {
                 attention: w.attention.clone(),
                 beliefs,
                 engaged,
+                outcomes: w.outcomes.tallies().to_vec(),
+                rates: world
+                    .present()
+                    .map(|e| EffectiveRates::of(&w.outcomes, &e.id))
+                    .collect(),
+                self_model: w.self_model.at(now),
+                interests: w.interests.clone(),
             },
             None => Self {
                 beliefs,

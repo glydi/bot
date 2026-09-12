@@ -415,6 +415,7 @@ fn planner_p99_under_50_microseconds() {
             world: &world,
             working: &mut working,
             goals: &mut goals,
+            events: &[],
         };
         let started = Instant::now();
         let d = PlannerRule::run(&mut cx, clock.at_secs(1.0), &mut out);

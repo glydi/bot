@@ -193,6 +193,14 @@ fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
     let got = step(&mut r, &clock, Lull::SETTLE.as_secs_f64() + 1.0);
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].contains(r#""name":"John""#), "{}", got[0]);
+    // He answers: the opening landed, so the next comes a little sooner
+    // than the base gap (LEARN stage; see `outcome::lull_factor`).
+    let _ = r.on_observation(&utterance(clock.at_secs(43.0), "john", "yeah, fine"));
+    assert!(
+        r.snapshot().working.rates[0].small_talk_gap < Lull::MIN_GAP,
+        "{:?}",
+        r.snapshot().working.rates
+    );
     // Not again for a while, even in silence.
     for t in [60.0, 100.0] {
         assert!(step(&mut r, &clock, t).is_empty());
