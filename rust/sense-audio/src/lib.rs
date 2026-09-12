@@ -7,11 +7,16 @@
 //!
 //! ```text
 //! cpal callback --chunks--> pipeline thread            utterance worker
-//!                           VAD (energy, hangover)     ECAPA -> gallery
-//!                           smart-turn v3 (ONNX)       whisper.cpp (Metal)
+//!                           VAD (energy, hangover)     whisper.cpp (Metal)
+//!                           smart-turn v3 (ONNX)         ‖ ECAPA -> gallery
 //!                           voice_activity, audio_level,   voice_identity,
 //!                           turn_ended                     utterance
 //! ```
+//!
+//! The worker gets the audio at the first quiet frame, not at the end of
+//! the 640 ms hangover, so by the time the turn is decided the transcript
+//! and the voice match are usually already computed; see
+//! [`pipeline`] for the measurements.
 //!
 //! Observations, all with `source = "mic0"` (or the configured name):
 //!
@@ -169,6 +174,11 @@ pub struct AudioConfig {
     pub max_utterance_secs: f32,
     /// whisper decoder threads.
     pub whisper_threads: usize,
+    /// Quiet frames (32 ms each) after which the worker starts whisper and
+    /// speaker-id on what has been said so far, ahead of the turn decision.
+    /// 0 waits for the hangover as the Go build did, which costs ~640 ms
+    /// per reply; see [`pipeline`].
+    pub speculate_after_frames: usize,
     /// Who voices are matched against. `None` uses an empty
     /// [`InMemoryGallery`] with the default gates.
     pub gallery: Option<Arc<dyn VoiceGallery>>,
@@ -193,6 +203,7 @@ impl std::fmt::Debug for AudioConfig {
             .field("max_deferrals", &self.max_deferrals)
             .field("max_utterance_secs", &self.max_utterance_secs)
             .field("whisper_threads", &self.whisper_threads)
+            .field("speculate_after_frames", &self.speculate_after_frames)
             .field("gallery", &self.gallery.as_ref().map(|_| "custom"))
             .field("warm_up", &self.warm_up)
             .finish()
@@ -225,6 +236,7 @@ impl AudioConfig {
             // short enough that whisper's cost stays bounded.
             max_utterance_secs: 20.0,
             whisper_threads: 4,
+            speculate_after_frames: 1,
             gallery: None,
             warm_up: true,
         }
@@ -627,6 +639,10 @@ impl AudioSense {
         // One slot: a source attached while another waits is a bug in the
         // caller, and `attach` reports it rather than queueing devices.
         let (source_tx, source_rx) = crossbeam_channel::bounded(1);
+        // Speculations go through a one-slot mailbox plus a wake-up; a
+        // newer pause replaces an older one nobody has picked up.
+        let spec_slot: pipeline::SpecSlot = Arc::default();
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         let listening = Arc::new(AtomicBool::new(false));
         let slot = SourceSlot {
             tx: source_tx,
@@ -643,8 +659,16 @@ impl AudioSense {
             max_utterance_samples: (config.max_utterance_secs * config.sample_rate as f32) as usize,
             // Everything before the frame that tipped the VAD over.
             preroll_frames: config.vad.start_frames.saturating_sub(1),
+            // Nothing to speculate on without a model to run.
+            speculate_after_frames: if stt.is_some() || encoder.is_some() {
+                config.speculate_after_frames
+            } else {
+                0
+            },
+            spec_slot: spec_slot.clone(),
+            spec_wake: wake_tx,
             source_name: config.source_name.clone(),
-            clock,
+            clock: clock.clone(),
             tx: tx.clone(),
             self_speaking,
             stop: stop.clone(),
@@ -653,10 +677,13 @@ impl AudioSense {
         };
         let worker = Worker {
             jobs: jobs_rx,
+            spec_slot,
+            spec_wake: wake_rx,
             stt,
             encoder,
             gallery,
             source_name: config.source_name,
+            clock,
             tx,
             stats: stats.clone(),
         };

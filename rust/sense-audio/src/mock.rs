@@ -2,7 +2,7 @@
 //! the microphone, so the whole pipeline runs in CI without hardware.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::Error;
 use crate::input::{FrameSource, Pull, Resampler, TARGET_RATE};
@@ -12,9 +12,15 @@ use crate::wav::load_wav;
 pub struct MockInput {
     samples: Vec<f32>,
     pos: usize,
-    /// Sleep 32 ms per frame so the pipeline sees wall-clock pacing (for a
-    /// demo); off by default so tests run as fast as the CPU allows.
+    /// Pace frames at 32 ms so the pipeline sees wall-clock timing (for a
+    /// demo, and for `tests/latency.rs`); off by default so tests run as
+    /// fast as the CPU allows.
     realtime: bool,
+    /// When the first frame went out, so pacing is `start + n * 32 ms`
+    /// rather than a sleep per frame: the pipeline's own work on a frame
+    /// (Silero, ~1-5 ms) would otherwise stretch every frame, and the
+    /// 20-frame hangover measured ~750 ms instead of 640.
+    started: Option<Instant>,
     name: String,
 }
 
@@ -36,6 +42,7 @@ impl MockInput {
             samples,
             pos: 0,
             realtime: false,
+            started: None,
             name: name.into(),
         }
     }
@@ -105,16 +112,21 @@ impl FrameSource for MockInput {
         if self.pos >= self.samples.len() {
             return Ok(Pull::Ended);
         }
+        if self.realtime {
+            // Deliver this frame when a microphone would have: at the end
+            // of its 32 ms.
+            let started = *self.started.get_or_insert_with(Instant::now);
+            let due = started
+                + Duration::from_secs_f64((self.pos + frame.len()) as f64 / f64::from(TARGET_RATE));
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
         let end = (self.pos + frame.len()).min(self.samples.len());
         let n = end - self.pos;
         frame[..n].copy_from_slice(&self.samples[self.pos..end]);
         frame[n..].fill(0.0);
         self.pos = end;
-        if self.realtime {
-            std::thread::sleep(Duration::from_secs_f64(
-                frame.len() as f64 / f64::from(TARGET_RATE),
-            ));
-        }
         Ok(Pull::Frame)
     }
 

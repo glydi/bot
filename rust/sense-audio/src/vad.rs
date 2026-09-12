@@ -59,6 +59,12 @@ pub trait Detector: Send {
     fn push(&mut self, samples: &[f32]) -> State;
     /// Forget everything; the next frame starts from silence.
     fn reset(&mut self);
+    /// How many consecutive unvoiced frames the hangover has absorbed since
+    /// the last voiced one: 0 while the person is audibly talking, 1 on the
+    /// first quiet frame, `hangover_frames` when [`State::Ended`] fires.
+    /// The pipeline starts transcribing at 1 rather than waiting for the
+    /// end, which is where ~640 ms of every reply's latency went.
+    fn quiet_frames(&self) -> usize;
 }
 
 /// Cheap loudness measure, used both by the VAD and as a permission probe:
@@ -255,6 +261,10 @@ impl Detector for EnergyVad {
         self.hangover.reset();
     }
 
+    fn quiet_frames(&self) -> usize {
+        self.hangover.quiet
+    }
+
     fn push(&mut self, samples: &[f32]) -> State {
         let level = mean_abs(samples);
         if !self.hangover.speaking {
@@ -403,6 +413,10 @@ impl Detector for SileroVad {
         self.last_prob = 0.0;
     }
 
+    fn quiet_frames(&self) -> usize {
+        self.hangover.quiet
+    }
+
     fn push(&mut self, samples: &[f32]) -> State {
         let voiced = match self.infer(samples) {
             Ok(p) if self.hangover.speaking => p >= self.end_threshold,
@@ -482,6 +496,27 @@ mod tests {
         }
         assert_eq!(v.push(&quiet()), State::Ended);
         assert_eq!(v.push(&quiet()), State::Silent);
+    }
+
+    #[test]
+    fn quiet_frames_counts_the_hangover_so_far() {
+        let mut v = EnergyVad::new();
+        for _ in 0..10 {
+            v.push(&loud());
+            assert_eq!(v.quiet_frames(), 0);
+        }
+        for i in 1..20 {
+            v.push(&quiet());
+            assert_eq!(v.quiet_frames(), i);
+        }
+        // A voiced frame inside the hangover resets the count: the pause
+        // was a pause, and any transcription started on it is stale.
+        v.push(&loud());
+        assert_eq!(v.quiet_frames(), 0);
+        for _ in 0..20 {
+            v.push(&quiet());
+        }
+        assert_eq!(v.quiet_frames(), 0, "cleared on Ended");
     }
 
     #[test]

@@ -53,6 +53,16 @@ pub const DEFAULT_MATCH_MARGIN: f32 = 0.08;
 /// Where the repo keeps the exported ECAPA model.
 pub const DEFAULT_MODEL_PATH: &str = "models/voiceid/ecapa.onnx";
 
+/// Intra-op threads for the ECAPA session. The embedding runs alongside
+/// whisper (see `pipeline::Worker::analyse`), and `ort`'s default -- one
+/// thread per core, spinning after every run -- starved whisper's CPU
+/// side: measured on an M2 with a 3 s clip, ECAPA at 8 threads alone is
+/// 46 ms but whisper beside it went from 95 ms to 260 ms, and even run
+/// *after* it whisper took ~200 ms while the pool spun down. At 4 threads
+/// with spinning off (below) ECAPA is 55 ms, whisper beside it 97-107 ms,
+/// so the embedding costs the utterance nothing.
+pub const DEFAULT_INTRA_OP_THREADS: usize = 4;
+
 /// Wraps a loaded `ecapa.onnx` session.
 ///
 /// Not `Sync`: keep one per thread.
@@ -61,8 +71,18 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Load the exported ECAPA model.
+    /// Load the exported ECAPA model with [`DEFAULT_INTRA_OP_THREADS`].
     pub fn open(model_path: impl AsRef<Path>, ort_lib: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with_threads(model_path, ort_lib, DEFAULT_INTRA_OP_THREADS)
+    }
+
+    /// Load the exported ECAPA model using `intra_op_threads` threads for
+    /// intra-op parallelism.
+    pub fn open_with_threads(
+        model_path: impl AsRef<Path>,
+        ort_lib: impl AsRef<Path>,
+        intra_op_threads: usize,
+    ) -> Result<Self, Error> {
         let model_path = model_path.as_ref();
         onnx::init(ort_lib.as_ref())?;
         if !model_path.is_file() {
@@ -71,9 +91,16 @@ impl Encoder {
                 path: PathBuf::from(model_path),
             });
         }
-        // ECAPA is small; the default threading is fine and the session is
-        // created once per process.
-        let session = Session::builder()?.commit_from_file(model_path)?;
+        let session = Session::builder()?
+            .with_intra_threads(intra_op_threads.max(1))
+            .map_err(ort::Error::from)?
+            .with_inter_threads(1)
+            .map_err(ort::Error::from)?
+            // See DEFAULT_INTRA_OP_THREADS: a spinning pool after a 50 ms
+            // run doubled the whisper call that followed it.
+            .with_intra_op_spinning(false)
+            .map_err(ort::Error::from)?
+            .commit_from_file(model_path)?;
         Ok(Self { session })
     }
 

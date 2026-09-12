@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 use crate::Error;
 
@@ -37,7 +39,20 @@ static LOG_HOOKS: Once = Once::new();
 
 /// A loaded whisper.cpp model.
 pub struct Whisper {
+    /// The state below holds its own reference to the model; this handle
+    /// is what the fresh-state check in the tests creates its states from.
+    #[cfg_attr(not(test), allow(dead_code))]
     ctx: WhisperContext,
+    /// One decoder state, kept across calls. `create_state` allocates the
+    /// KV caches and (on Metal) their GPU buffers: measured 9 ms per call
+    /// (30 ms the first time) on an M2 with `tiny.en`, against ~98 ms for a
+    /// whole 3 s transcription on a warm state and 88-132 ms on a fresh one
+    /// -- so the fresh state the Go port made per utterance cost a tenth of
+    /// the transcript. `no_context` (see `run`) is what keeps a reused state
+    /// from priming the next utterance with the last one;
+    /// `warm_state_matches_fresh_state` below pins that the text is the
+    /// same either way.
+    state: WhisperState,
     threads: i32,
 }
 
@@ -60,30 +75,27 @@ impl Whisper {
             Error::Model(format!("non-UTF-8 model path: {}", model_path.display()))
         })?;
         let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())?;
+        let state = ctx.create_state()?;
         Ok(Self {
             ctx,
+            state,
             threads: i32::try_from(threads.max(1)).unwrap_or(4),
         })
     }
 
-    /// Run one throwaway inference. The first call after loading pays
-    /// several hundred ms of Metal shader and graph setup; doing it at
-    /// startup keeps that cost out of the user's first sentence.
-    pub fn warm_up(&mut self) -> Result<(), Error> {
-        self.transcribe(&vec![0.0; 16_000]).map(|_| ())
-    }
-}
-
-impl Transcriber for Whisper {
-    fn transcribe(&mut self, samples: &[f32]) -> Result<String, Error> {
-        // A fresh state per call, as the Go build made a fresh context: the
-        // decoder carries no history between utterances, so one utterance
-        // cannot prime the next into a hallucination.
-        let mut state = self.ctx.create_state()?;
+    /// Decode `samples` into `state`. Shared by the warm path and the
+    /// fresh-state check in the tests.
+    fn run(state: &mut WhisperState, threads: i32, samples: &[f32]) -> Result<String, Error> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_n_threads(self.threads);
+        params.set_n_threads(threads);
         params.set_language(Some("en"));
         params.set_translate(false);
+        // The decoder must not see the previous utterance: whisper.cpp
+        // otherwise feeds the last transcript in as the prompt, and one
+        // sentence can prime the next into a hallucination. The Go build
+        // paid for that isolation with a fresh context per call; this is
+        // the flag that buys it for free on a reused state.
+        params.set_no_context(true);
         // Conversation, not transcription of a room: drop the bracketed
         // sound descriptions ("(whistling)", "[Music]") at the token level,
         // treat a segment the model itself rates as probably-not-speech as
@@ -101,16 +113,36 @@ impl Transcriber for Whisper {
         for seg in state.as_iter() {
             text.push_str(&seg.to_str_lossy()?);
         }
+        Ok(text)
+    }
+
+    /// Post-filter shared by every path: the blank sentinel, bracketed
+    /// sound notes, and whisper's stock guesses at near-silence.
+    fn clean(text: &str, samples: &[f32]) -> String {
         let text = text.trim();
         if text == BLANK_AUDIO
             || is_non_speech(text)
             || is_hallucination(text, speech_secs(samples))
         {
             tracing::debug!(text = %text, "dropped as non-speech");
-            return Ok(String::new());
+            return String::new();
         }
         // A longer transcript can still carry the sentinel inline.
-        Ok(text.replace(BLANK_AUDIO, "").trim().to_string())
+        text.replace(BLANK_AUDIO, "").trim().to_string()
+    }
+
+    /// Run one throwaway inference. The first call after loading pays
+    /// several hundred ms of Metal shader and graph setup; doing it at
+    /// startup keeps that cost out of the user's first sentence.
+    pub fn warm_up(&mut self) -> Result<(), Error> {
+        self.transcribe(&vec![0.0; 16_000]).map(|_| ())
+    }
+}
+
+impl Transcriber for Whisper {
+    fn transcribe(&mut self, samples: &[f32]) -> Result<String, Error> {
+        let text = Self::run(&mut self.state, self.threads, samples)?;
+        Ok(Self::clean(&text, samples))
     }
 }
 
@@ -297,5 +329,84 @@ mod non_speech_tests {
         ] {
             assert!(!is_non_speech(t), "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod warm_state_tests {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use super::{Transcriber, Whisper};
+    use crate::wav::load_wav;
+
+    fn model() -> Option<PathBuf> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let p = root.join(super::DEFAULT_MODEL_PATH);
+        if p.is_file() {
+            Some(p)
+        } else {
+            eprintln!("skipping: no whisper model at {}", p.display());
+            None
+        }
+    }
+
+    fn clip(name: &str) -> Vec<f32> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(name);
+        load_wav(&p).unwrap().0
+    }
+
+    /// The reused state must give the same text a fresh one would (that is
+    /// what `no_context` is for), and `create_state` must be worth
+    /// skipping. Numbers print with `--nocapture`; the comment on
+    /// `Whisper::state` quotes them.
+    #[test]
+    fn warm_state_matches_fresh_state() {
+        let Some(model) = model() else {
+            return;
+        };
+        let mut w = Whisper::open(&model, 4).unwrap();
+        w.warm_up().unwrap();
+        // Alternate the clips, so a leak of one transcript into the next
+        // (the failure `no_context` prevents) would show as a difference.
+        let mut fresh_ms = Vec::new();
+        let mut warm_ms = Vec::new();
+        let mut create_ms = Vec::new();
+        for name in [
+            "complete.wav",
+            "incomplete.wav",
+            "complete.wav",
+            "incomplete.wav",
+        ] {
+            let samples = clip(name);
+            let t = Instant::now();
+            let mut fresh = w.ctx.create_state().unwrap();
+            create_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            let want = Whisper::clean(
+                &Whisper::run(&mut fresh, w.threads, &samples).unwrap(),
+                &samples,
+            );
+            fresh_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let got = w.transcribe(&samples).unwrap();
+            warm_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(got, want, "{name}");
+            assert!(!got.is_empty(), "{name}");
+        }
+        // Steady state, nothing else allocating: what the pipeline sees.
+        let samples = clip("complete.wav");
+        let steady: Vec<f64> = (0..4)
+            .map(|_| {
+                let t = Instant::now();
+                w.transcribe(&samples).unwrap();
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        eprintln!(
+            "whisper create_state {create_ms:.1?} ms; fresh state {fresh_ms:.1?} ms; warm state {warm_ms:.1?} ms; steady warm 3 s clip {steady:.1?} ms"
+        );
     }
 }
