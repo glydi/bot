@@ -149,6 +149,24 @@ impl Rig {
         self.synth.spoken()
     }
 
+    /// What a camera emits for a gesture on a track.
+    fn gesture(&self, hint: EntityHint, kind: &str) {
+        self.push(
+            Observation::new("cam0", "gesture", self.now())
+                .with_confidence(0.8)
+                .with_entity(hint)
+                .with_payload(Payload::Text(kind.to_owned())),
+        );
+    }
+
+    /// Whether the face was told to `react` with `name`.
+    fn reacted(&self, name: &str) -> bool {
+        self.app
+            .ui_commands()
+            .iter()
+            .any(|(kind, text)| kind == "react" && text == name)
+    }
+
     fn said_containing(&self, needle: &str) -> bool {
         self.spoken().iter().any(|s| s.contains(needle))
     }
@@ -636,6 +654,109 @@ fn voice_edge_right_behind_a_level_still_cancels_the_reply() {
     rig.finish();
     assert!(
         started.elapsed() < Duration::from_secs(12),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+// --------------------------------------------------------- gestures
+
+/// A stranger waves at the camera: the face nods back at once and the
+/// mind says "Hi!", without a model turn. The name question follows on
+/// its own schedule and is not part of this.
+#[test]
+fn a_wave_from_a_stranger_gets_a_nod_and_a_hello() {
+    let started = Instant::now();
+    let rig = Rig::build(temp_db("wave"), Vec::new());
+    let track = EntityHint::Track(9);
+    rig.faces(track.clone(), 10, 0.3);
+    rig.gesture(track, "wave");
+    assert!(
+        wait_for(Duration::from_secs(3), || rig
+            .spoken()
+            .iter()
+            .any(|s| s == "Hi!")),
+        "no hello for the wave; spoken = {:?}, ui = {:?}",
+        rig.spoken(),
+        rig.app.ui_commands()
+    );
+    assert!(
+        wait_for(Duration::from_secs(1), || rig.reacted("nod")),
+        "the face never nodded: {:?}",
+        rig.app.ui_commands()
+    );
+    assert_eq!(rig.llm.requests().len(), 0, "a wave is not a model turn");
+    rig.finish();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+// ------------------------------------------------------- commitments
+
+/// A reminder falls due while John is in the room: the poller's
+/// `reminder_due` observation (pushed here by hand, the poller runs every
+/// 30 s) is spoken in his words once the greeting is over, and the row
+/// is marked done as the intent goes past, so a restart does not repeat it.
+#[test]
+fn due_reminder_is_spoken_to_the_person_and_marked_done() {
+    let started = Instant::now();
+    let db = temp_db("reminder");
+    let john = EntityId::new("john");
+    let id = {
+        let store = Store::open(&db).unwrap();
+        store
+            .enrol("John", Some(&john), Modality::Face, &[])
+            .unwrap();
+        // Due ten seconds ago.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        store.remind(&john, "call mum", now - 10.0).unwrap()
+    };
+    let rig = Rig::build(db, Vec::new());
+    let hint = EntityHint::KnownOnTrack(john.clone(), 1);
+    rig.faces(hint.clone(), 10, 0.5);
+    rig.push(
+        Observation::new("store", mind::plan::REMINDER_DUE, rig.now())
+            .with_payload(Payload::Text(format!("{id}\tjohn\tcall mum"))),
+    );
+    // Presence must outlast the greeting: keep him in shot meanwhile.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut said = false;
+    while Instant::now() < deadline {
+        rig.faces(hint.clone(), 10, 0.2);
+        if rig.said_containing("remind you to call mum") {
+            said = true;
+            break;
+        }
+    }
+    assert!(
+        said,
+        "the reminder was never spoken; spoken = {:?}, events = {:?}",
+        rig.spoken(),
+        rig.event_tags()
+    );
+    assert_eq!(
+        rig.llm.requests().len(),
+        0,
+        "a reminder is not a model turn"
+    );
+    let store = rig.app.store();
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            store.reminders_of(&john).unwrap().is_empty()
+        }),
+        "the reminder is still open: {:?}",
+        store.reminders_of(&john).unwrap()
+    );
+    assert!(!store.reminder_done(id).unwrap(), "already closed");
+    rig.finish();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
         "{:?}",
         started.elapsed()
     );

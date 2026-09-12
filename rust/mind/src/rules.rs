@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use common::{Command, EntityId, Observation, Payload, Priority};
 use smallvec::SmallVec;
+use smol_str::SmolStr;
 
+use crate::event::EventKind;
+use crate::goal::{GREET_WINDOW, RETURN_GREET_MIN_AWAY};
 use crate::outcome::{ack_factor, lull_factor};
 use crate::reflex::{Cognition, Commands, Rule};
-use crate::world::{LONG_SPEECH, World};
+use crate::world::{LONG_SPEECH, Status, World};
 
 /// Modality the audio sense uses for voice activity edges.
 pub const VOICE_ACTIVITY: &str = "voice_activity";
@@ -609,6 +612,310 @@ impl Rule for AddressedGate {
     }
 }
 
+/// Modality a camera reports gestures on: `Text("wave" | "nod" | "shake")`
+/// with the gesturer's entity hint.
+pub const GESTURE: &str = "gesture";
+/// Modality a camera reports objects on (`Text("<class>")`, appear and
+/// heartbeat) ...
+pub const OBJECT: &str = "object";
+/// ... and their disappearance (`Text("<class>")`, once).
+pub const OBJECT_GONE: &str = "object_gone";
+/// Modality a camera reports lighting on: `Text("dark" | "bright")` on
+/// change, `Level(lum)` periodically.
+pub const SCENE: &str = "scene";
+/// The scene payload that means the camera is in the dark.
+pub const DARK: &str = "dark";
+/// The face's reaction command: `Command { ui, react, Text(<name>) }`.
+pub const REACT: &str = "react";
+
+/// An intent command with a fixed, hand-escaped JSON shape (see
+/// `plan.rs`; the mind has no `serde`).
+fn intent(json: String) -> Command {
+    Command::new(
+        crate::plan::INTENT_TARGET,
+        crate::plan::INTENT_KIND,
+        Priority::Reflex,
+    )
+    .with_payload(Payload::Text(json))
+}
+
+/// `Command { ui, react, Text(name) }`: a one-shot face reaction.
+fn react(name: &'static str) -> Command {
+    Command::new("ui", REACT, Priority::Reflex).with_payload(Payload::Text(name.to_owned()))
+}
+
+/// Whether a rule pass has already produced an intent: one per step.
+fn has_intent(out: &Commands) -> bool {
+    out.iter()
+        .any(|c| c.target == crate::plan::INTENT_TARGET && c.kind == crate::plan::INTENT_KIND)
+}
+
+/// Someone waved: wave back. A `gesture` `Text("wave")` from a present
+/// entity while nobody (us included) is talking gets a nod from the face
+/// at once and, unless they were greeted within [`GREET_WINDOW`], a "Hi!"
+/// as a `say` intent with goal `greet` -- recorded as their greeting, so
+/// the planner does not say hello a second time when their ENTERED goal
+/// comes round. A stranger track is waved back at too: the name question
+/// is the planner's, and comes after.
+///
+/// The same rule reads a `nod` or `shake` from someone we are waiting on
+/// (`WorkingMemory::has_open_question`) as their answer:
+///
+/// ```json
+/// {"decision":"answer","entity":"john","text":"yes"}
+/// ```
+///
+/// as a `deliberate/intent`; the deliberate path treats it as the
+/// utterance "yes" / "no" from that person. The open question is marked
+/// answered here, since no SAID will do it. A nod from someone we asked
+/// nothing is just a nod.
+///
+/// `apply` records the gesture (it sees the world, not working memory);
+/// `plan` acts on it in the same pass.
+#[derive(Debug, Default)]
+pub struct WaveHello {
+    /// The gesture this pass, for `plan`.
+    seen: RefCell<Option<Gesture>>,
+}
+
+/// One gesture, held between `apply` and `plan`: who, what, when. The
+/// name is kept inline ("wave", "nod", "shake" all fit) so the hot path
+/// does not allocate.
+#[derive(Clone, Debug)]
+struct Gesture {
+    who: EntityId,
+    kind: SmallVec<[u8; 8]>,
+    at: Instant,
+}
+
+impl WaveHello {
+    /// What the wave gets said back.
+    pub const HELLO: &'static str = "Hi!";
+    /// The `decision` value of a gesture answer.
+    pub const ANSWER: &'static str = "answer";
+}
+
+impl Rule for WaveHello {
+    fn name(&self) -> &'static str {
+        "wave_hello"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        let _ = out;
+        if o.modality != GESTURE {
+            return;
+        }
+        let Some(kind) = o.payload.as_text() else {
+            return;
+        };
+        let Some(e) = o.entity.as_ref().and_then(|h| w.resolve(h)) else {
+            return;
+        };
+        if e.status != Status::Present {
+            return;
+        }
+        // The gesture name, without a heap allocation on the hot path:
+        // "wave", "nod", "shake" all fit inline.
+        let mut name: SmallVec<[u8; 8]> = SmallVec::new();
+        name.extend_from_slice(kind.as_bytes());
+        *self.seen.borrow_mut() = Some(Gesture {
+            who: e.id.clone(),
+            kind: name,
+            at: o.at,
+        });
+    }
+
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        let Some(Gesture {
+            who: id,
+            kind,
+            at: now,
+        }) = self.seen.borrow_mut().take()
+        else {
+            return;
+        };
+        match kind.as_slice() {
+            b"wave" => {
+                if cx.world.bot_speaking() || cx.world.anyone_speaking() {
+                    return;
+                }
+                out.push(react("nod"));
+                if cx.working.greeted_within(&id, now, GREET_WINDOW) || has_intent(out) {
+                    return;
+                }
+                cx.working.greeted(id.clone(), now);
+                out.push(intent(format!(
+                    "{{\"decision\":\"say\",\"text\":\"{}\",\"entity\":\"{}\",\"goal\":\"greet\"}}",
+                    Self::HELLO,
+                    id.as_str().replace('"', "")
+                )));
+            }
+            b"nod" | b"shake" => {
+                if !cx.working.has_open_question(&id) {
+                    return;
+                }
+                let text = if kind.as_slice() == b"nod" {
+                    "yes"
+                } else {
+                    "no"
+                };
+                for q in cx.working.open_questions.iter_mut().rev() {
+                    if !q.answered && q.entity == id {
+                        q.answered = true;
+                        break;
+                    }
+                }
+                out.push(intent(format!(
+                    "{{\"decision\":\"{}\",\"entity\":\"{}\",\"text\":\"{text}\"}}",
+                    Self::ANSWER,
+                    id.as_str().replace('"', "")
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One change to the inventory, held between `apply` and `plan`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SceneChange {
+    Seen(SmolStr),
+    Gone(SmolStr),
+    Dark(bool),
+}
+
+/// What is in the room, and whether the lights are on. `object` /
+/// `object_gone` observations are folded into
+/// [`WorkingMemory::objects`](crate::working::WorkingMemory::objects) (bounded,
+/// see `working::MAX_OBJECTS`), which the room note renders as "In view: a
+/// laptop, a cup"; a `scene` `Text("dark")` sets `WorkingMemory::dark`,
+/// which turns the note's NOBODY line into "the camera cannot see", and
+/// says so once:
+///
+/// ```json
+/// {"decision":"say","text":"It's dark in here.","goal":"scene"}
+/// ```
+///
+/// at the first quiet step after the lights go out (never over speech,
+/// never in the same pass as another intent). A "bright" clears both.
+/// Property 2 holds: these are modality *names*; nothing here knows what
+/// a camera is.
+#[derive(Debug, Default)]
+pub struct RoomInventory {
+    /// Changes this pass, for `plan`. Four inline: a detector round
+    /// reports a few classes at once.
+    changes: RefCell<SmallVec<[SceneChange; 4]>>,
+    /// The lights went out and nobody has been told.
+    say_dark: Cell<bool>,
+}
+
+impl RoomInventory {
+    /// What is said when the lights go out.
+    pub const DARK_LINE: &'static str = "It's dark in here.";
+}
+
+impl Rule for RoomInventory {
+    fn name(&self) -> &'static str {
+        "room_inventory"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        let _ = (w, out);
+        let Some(text) = o.payload.as_text().map(str::trim).filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let change = match o.modality.as_str() {
+            OBJECT => SceneChange::Seen(SmolStr::new(text)),
+            OBJECT_GONE => SceneChange::Gone(SmolStr::new(text)),
+            SCENE if text == DARK => SceneChange::Dark(true),
+            SCENE if text == "bright" => SceneChange::Dark(false),
+            _ => return,
+        };
+        let mut c = self.changes.borrow_mut();
+        if c.len() >= 32 {
+            c.remove(0);
+        }
+        c.push(change);
+    }
+
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        for c in self.changes.borrow_mut().drain(..) {
+            match c {
+                SceneChange::Seen(class) => cx.working.object_seen(&class),
+                SceneChange::Gone(class) => cx.working.object_gone(&class),
+                SceneChange::Dark(dark) => {
+                    if dark && !cx.working.dark {
+                        self.say_dark.set(true);
+                    }
+                    if !dark {
+                        self.say_dark.set(false);
+                    }
+                    cx.working.dark = dark;
+                }
+            }
+        }
+        if !self.say_dark.get()
+            || cx.world.bot_speaking()
+            || cx.world.anyone_speaking()
+            || has_intent(out)
+        {
+            return;
+        }
+        self.say_dark.set(false);
+        out.push(intent(format!(
+            "{{\"decision\":\"say\",\"text\":\"{}\",\"goal\":\"scene\"}}",
+            Self::DARK_LINE
+        )));
+    }
+}
+
+/// The face reacts to what happens, without waiting for the model: a
+/// SAID with a laugh in it ("haha", "lol") gets a `laugh`; a RETURNED
+/// after a real absence ([`RETURN_GREET_MIN_AWAY`]) gets a `gasp`, ahead
+/// of the planner's welcome-back. A shorter gap is a tracking gap, and
+/// gasping at it would read as broken. Reads the pass's events in
+/// `plan`, so it costs nothing on a quiet tick.
+#[derive(Debug, Default)]
+pub struct ReactToEvents;
+
+impl ReactToEvents {
+    /// Words that mean the person laughed, matched as whole words after
+    /// lower-casing; "haha" also as a prefix ("hahaha", "hahah").
+    pub const LAUGH_WORDS: [&'static str; 4] = ["lol", "lmao", "hehe", "haha"];
+
+    /// Whether `text` contains a laugh.
+    pub fn is_laugh(text: &str) -> bool {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .any(|w| {
+                let w = w.to_ascii_lowercase();
+                Self::LAUGH_WORDS.contains(&w.as_str()) || w.starts_with("haha")
+            })
+    }
+}
+
+impl Rule for ReactToEvents {
+    fn name(&self) -> &'static str {
+        "react_to_events"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        let _ = (o, w, out);
+    }
+
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        for e in cx.events {
+            match &e.kind {
+                EventKind::Said(text) if Self::is_laugh(text) => out.push(react("laugh")),
+                EventKind::Returned { away_for } if *away_for >= RETURN_GREET_MIN_AWAY => {
+                    out.push(react("gasp"));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
@@ -631,12 +938,201 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
 /// did. Opt-in rather than default so that
 /// consumers counting commands from `Reflex::new` see exactly what they
 /// did before Phase 8; wire it in with `Reflex::with_rules`.
+///
+/// Also here: the camera-fed rules ([`WaveHello`], [`RoomInventory`],
+/// [`ReactToEvents`]), which emit nothing without their modalities, and
+/// the [`CommitmentRule`](crate::plan::CommitmentRule) that delivers
+/// reminders and check-ins, after the planner and the lull (a hello
+/// before a reminder) and before curiosity.
 pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v = default_rules();
+    v.push(Box::new(ReactToEvents));
+    v.push(Box::new(RoomInventory::default()));
     v.push(Box::<crate::plan::PlannerRule>::default());
+    v.push(Box::new(WaveHello::default()));
     v.push(Box::new(Lull::new()));
+    v.push(Box::new(crate::plan::CommitmentRule::new()));
     v.push(Box::new(crate::curiosity::Curiosity::new()));
     // Last: it reads every command the rules above pushed this pass.
     v.push(Box::new(crate::outcome::OutcomeRule));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests may panic on the unexpected; the workspace deny is for library code.
+    #![allow(clippy::unwrap_used)]
+
+    use common::{Clock, EntityHint, FakeClock};
+
+    use super::*;
+    use crate::plan::{INTENT_KIND, INTENT_TARGET};
+    use crate::reflex::Reflex;
+    use crate::view::{NOBODY, NOBODY_DARK};
+
+    fn face(at: Instant, hint: EntityHint) -> Observation {
+        Observation::new("cam0", "face", at).with_entity(hint)
+    }
+
+    fn gesture(at: Instant, hint: EntityHint, kind: &str) -> Observation {
+        Observation::new("cam0", GESTURE, at)
+            .with_entity(hint)
+            .with_payload(Payload::Text(kind.to_owned()))
+    }
+
+    fn text_obs(at: Instant, modality: &str, text: &str) -> Observation {
+        Observation::new("cam0", modality, at).with_payload(Payload::Text(text.to_owned()))
+    }
+
+    /// The intents of the rules under test. Curiosity's questions about a
+    /// novel gesture or scene, and the planner's name question to a
+    /// settled stranger, land in the same passes and are other rules'
+    /// business.
+    fn intents(cmds: &[Command]) -> Vec<String> {
+        cmds.iter()
+            .filter(|c| c.target == INTENT_TARGET && c.kind == INTENT_KIND)
+            .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
+            .filter(|t| !t.contains("\"curious\"") && !t.contains("\"ask_name\""))
+            .collect()
+    }
+
+    fn reacts(cmds: &[Command]) -> Vec<String> {
+        cmds.iter()
+            .filter(|c| c.target == "ui" && c.kind == REACT)
+            .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_wave_gets_a_nod_and_one_hello() {
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("wave", clock.now(), cognitive_rules());
+        let t7 = EntityHint::Track(7);
+        r.on_observation(&face(clock.at_secs(0.0), t7.clone()));
+        let out = r.on_observation(&gesture(clock.at_secs(0.5), t7.clone(), "wave"));
+        assert_eq!(reacts(&out), ["nod"]);
+        assert_eq!(
+            intents(&out),
+            [r#"{"decision":"say","text":"Hi!","entity":"track:7","goal":"greet"}"#]
+        );
+        assert!(r.working().greeted_at(&EntityId::for_track(7)).is_some());
+        // A second wave inside the greet window: a nod, no second hello.
+        let out = r.on_observation(&gesture(clock.at_secs(30.0), t7.clone(), "wave"));
+        assert_eq!(reacts(&out), ["nod"]);
+        assert!(intents(&out).is_empty(), "{:?}", intents(&out));
+        // Nothing over speech.
+        r.world_mut().set_bot_speaking(true);
+        let out = r.on_observation(&gesture(clock.at_secs(31.0), t7, "wave"));
+        assert!(reacts(&out).is_empty() && intents(&out).is_empty());
+        // A wave from nobody in particular is not a wave.
+        let out = r.on_observation(&text_obs(clock.at_secs(32.0), GESTURE, "wave"));
+        assert!(reacts(&out).is_empty());
+    }
+
+    #[test]
+    fn known_person_waving_is_greeted_once_by_whichever_comes_first() {
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("wave2", clock.now(), cognitive_rules());
+        r.world_mut().set_name(&EntityId::new("ada"), "Ada");
+        let ada = EntityHint::Known(EntityId::new("ada"));
+        // The planner's hello lands on the ENTERED step ...
+        let out = r.on_observation(&face(clock.at_secs(0.0), ada.clone()));
+        assert_eq!(intents(&out).len(), 1);
+        // ... so the wave a moment later is a nod only.
+        let out = r.on_observation(&gesture(clock.at_secs(1.0), ada, "wave"));
+        assert_eq!(reacts(&out), ["nod"]);
+        assert!(intents(&out).is_empty(), "{:?}", intents(&out));
+    }
+
+    #[test]
+    fn nod_and_shake_answer_an_open_question_only() {
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("nod", clock.now(), cognitive_rules());
+        let john = EntityHint::Known(EntityId::new("john"));
+        r.world_mut().set_name(&EntityId::new("john"), "John");
+        r.on_observation(&face(clock.at_secs(0.0), john.clone()));
+        // Nothing asked: a nod is just a nod.
+        let out = r.on_observation(&gesture(clock.at_secs(1.0), john.clone(), "nod"));
+        assert!(intents(&out).is_empty(), "{:?}", intents(&out));
+        r.working_mut()
+            .ask(EntityId::new("john"), "Did you finish?", clock.at_secs(2.0));
+        let out = r.on_observation(&gesture(clock.at_secs(3.0), john.clone(), "nod"));
+        assert_eq!(
+            intents(&out),
+            [r#"{"decision":"answer","entity":"john","text":"yes"}"#]
+        );
+        assert!(!r.working().has_open_question(&EntityId::new("john")));
+        r.working_mut()
+            .ask(EntityId::new("john"), "Sure?", clock.at_secs(4.0));
+        let out = r.on_observation(&gesture(clock.at_secs(5.0), john, "shake"));
+        assert_eq!(
+            intents(&out),
+            [r#"{"decision":"answer","entity":"john","text":"no"}"#]
+        );
+    }
+
+    #[test]
+    fn objects_and_darkness_reach_the_room_note() {
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("inv", clock.now(), cognitive_rules());
+        r.on_observation(&text_obs(clock.at_secs(0.0), OBJECT, "laptop"));
+        r.on_observation(&text_obs(clock.at_secs(0.1), OBJECT, "cup"));
+        r.on_observation(&text_obs(clock.at_secs(0.2), OBJECT, "laptop"));
+        let none = |_: &EntityId| Vec::new();
+        let note = r.snapshot().describe_with_beliefs(&none);
+        assert!(note.ends_with("In view: a laptop, a cup"), "{note}");
+        r.on_observation(&text_obs(clock.at_secs(1.0), OBJECT_GONE, "cup"));
+        let note = r.snapshot().describe_with_beliefs(&none);
+        assert!(note.ends_with("In view: a laptop"), "{note}");
+
+        // Lights out while someone is talking: said once the room is quiet.
+        r.world_mut().set_bot_speaking(true);
+        let out = r.on_observation(&text_obs(clock.at_secs(2.0), SCENE, "dark"));
+        assert!(intents(&out).is_empty());
+        assert!(r.snapshot().working.dark);
+        assert!(
+            r.snapshot()
+                .describe_with_beliefs(&none)
+                .starts_with(NOBODY_DARK)
+        );
+        r.world_mut().set_bot_speaking(false);
+        let out = r.tick(clock.at_secs(2.5));
+        assert_eq!(
+            intents(&out),
+            [r#"{"decision":"say","text":"It's dark in here.","goal":"scene"}"#]
+        );
+        assert!(intents(&r.tick(clock.at_secs(2.6))).is_empty(), "once");
+        // A repeated "dark" (the sense re-emits on its first frame) is not
+        // a new transition; "bright" clears it.
+        let out = r.on_observation(&text_obs(clock.at_secs(3.0), SCENE, "dark"));
+        assert!(intents(&out).is_empty());
+        r.on_observation(&text_obs(clock.at_secs(4.0), SCENE, "bright"));
+        assert!(!r.snapshot().working.dark);
+        assert!(
+            r.snapshot()
+                .describe_with_beliefs(&none)
+                .starts_with(NOBODY)
+        );
+    }
+
+    #[test]
+    fn laughs_and_returns_get_a_reaction() {
+        assert!(ReactToEvents::is_laugh("haha that's great"));
+        assert!(ReactToEvents::is_laugh("LOL"));
+        assert!(!ReactToEvents::is_laugh("the hall is long"));
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("react", clock.now(), cognitive_rules());
+        let john = EntityHint::Known(EntityId::new("john"));
+        r.on_observation(&face(clock.at_secs(0.0), john.clone()));
+        let said = Observation::new("mic0", "utterance", clock.at_secs(1.0))
+            .with_entity(john.clone())
+            .with_payload(Payload::Text("hahaha no way".into()));
+        assert_eq!(reacts(&r.on_observation(&said)), ["laugh"]);
+        // A tracking gap is not a return worth a gasp; a real absence is.
+        r.tick(clock.at_secs(5.0));
+        assert!(reacts(&r.on_observation(&face(clock.at_secs(20.0), john.clone()))).is_empty());
+        r.tick(clock.at_secs(24.0));
+        let out = r.on_observation(&face(clock.at_secs(200.0), john));
+        assert_eq!(reacts(&out), ["gasp"]);
+    }
 }

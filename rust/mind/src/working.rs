@@ -46,6 +46,11 @@ pub const MAX_GREETED: usize = 16;
 /// track number that old has been recycled by the tracker anyway.
 pub const MAX_NAME_ASKED: usize = 16;
 
+/// Object classes held as "in view". Thirty-two: a camera pointed at a
+/// desk reports a dozen classes; the COCO set has eighty, and a thirty-
+/// third drops the oldest rather than growing.
+pub const MAX_OBJECTS: usize = 32;
+
 /// Something we asked and are waiting to hear back on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Question {
@@ -96,6 +101,14 @@ pub struct WorkingMemory {
     pub self_model: SelfModel,
     /// What we are curious about, as last published by the curiosity rule.
     interests: Vec<InterestView>,
+    /// Object classes a camera reports in view, oldest first, bounded by
+    /// [`MAX_OBJECTS`]. Folded by the `RoomInventory` rule from `object`
+    /// / `object_gone` observations; rendered as "In view: ..." in the
+    /// room note.
+    pub objects: Vec<SmolStr>,
+    /// The room is dark (`scene` said so and has not said "bright" since):
+    /// the camera cannot see anyone, and the room note says why.
+    pub dark: bool,
 }
 
 impl Default for WorkingMemory {
@@ -126,7 +139,27 @@ impl WorkingMemory {
             outcomes: Outcomes::new(),
             self_model: SelfModel::new(now),
             interests: Vec::new(),
+            objects: Vec::new(),
+            dark: false,
         }
+    }
+
+    /// A camera reports `class` in view: move it to the newest slot (a
+    /// heartbeat for a class already held does not reorder the list
+    /// past the bound; a newcomer evicts the oldest).
+    pub fn object_seen(&mut self, class: &str) {
+        if self.objects.iter().any(|c| c == class) {
+            return;
+        }
+        if self.objects.len() >= MAX_OBJECTS {
+            self.objects.remove(0);
+        }
+        self.objects.push(SmolStr::new(class));
+    }
+
+    /// A camera reports `class` gone.
+    pub fn object_gone(&mut self, class: &str) {
+        self.objects.retain(|c| c != class);
     }
 
     /// What we are curious about, as last published.
@@ -394,6 +427,10 @@ pub struct WorkingSnapshot {
     pub self_model: SelfModel,
     /// What the mind is curious about right now.
     pub interests: Vec<InterestView>,
+    /// See [`WorkingMemory::objects`].
+    pub objects: Vec<SmolStr>,
+    /// See [`WorkingMemory::dark`].
+    pub dark: bool,
 }
 
 impl WorkingSnapshot {
@@ -427,6 +464,8 @@ impl WorkingSnapshot {
                     .collect(),
                 self_model: w.self_model.at(now),
                 interests: w.interests.clone(),
+                objects: w.objects.clone(),
+                dark: w.dark,
             },
             None => Self {
                 beliefs,
@@ -439,6 +478,22 @@ impl WorkingSnapshot {
     /// Beliefs about one person.
     pub fn beliefs_of(&self, entity: &EntityId) -> Option<&EntityBeliefs> {
         self.beliefs.iter().find(|b| b.entity == *entity)
+    }
+
+    /// "a laptop, a cup": the objects in view, each with an article, or
+    /// `None` when the camera reports nothing. For the room note and for
+    /// the deliberate path's "what can you see?" answer.
+    pub fn inventory(&self) -> Option<String> {
+        if self.objects.is_empty() {
+            return None;
+        }
+        Some(
+            self.objects
+                .iter()
+                .map(|c| with_article(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     /// A terse `[working]` block for the prompt, or `None` when there is
@@ -465,9 +520,48 @@ impl WorkingSnapshot {
     }
 }
 
+/// "a cup", "an orange": the class with its indefinite article, the way
+/// it reads in a sentence. COCO classes are lower-case nouns; a class the
+/// detector spells with an underscore (`cell_phone`) is read with a space.
+fn with_article(class: &str) -> String {
+    let word = class.replace('_', " ");
+    let article = match word.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    };
+    format!("{article} {word}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn objects_are_bounded_and_read_with_articles() {
+        let mut w = WorkingMemory::new();
+        for i in 0..(MAX_OBJECTS + 2) {
+            w.object_seen(&format!("thing{i}"));
+        }
+        assert_eq!(w.objects.len(), MAX_OBJECTS);
+        assert_eq!(w.objects[0].as_str(), "thing2", "oldest evicted");
+        w.object_seen("thing5");
+        assert_eq!(
+            w.objects.len(),
+            MAX_OBJECTS,
+            "a heartbeat is not a newcomer"
+        );
+        w.object_gone("thing5");
+        assert!(!w.objects.iter().any(|c| c == "thing5"));
+        let mut w = WorkingMemory::new();
+        w.object_seen("laptop");
+        w.object_seen("orange");
+        w.object_seen("cell_phone");
+        let s = WorkingSnapshot::capture(Some(&w), &World::new(), Instant::now());
+        assert_eq!(
+            s.inventory().as_deref(),
+            Some("a laptop, an orange, a cell phone")
+        );
+    }
 
     #[test]
     fn open_questions_are_bounded_and_answered_first_to_go() {

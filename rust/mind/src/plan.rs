@@ -506,8 +506,8 @@ fn has_intent(out: &Commands) -> bool {
 /// one as an intent when the planner has nothing to say this step (a
 /// hello before a reminder) and the person is present and not being
 /// waited on. A `CheckIn` records the open question so the answer is
-/// waited for. Not part of `cognitive_rules()` (see the module docs for
-/// the wiring): `rules.push(Box::new(CommitmentRule::new()))` after it.
+/// waited for. Part of `cognitive_rules()`, after the planner and the
+/// lull.
 #[derive(Debug, Default)]
 pub struct CommitmentRule {
     /// Commitments waiting for their person. A `RefCell`, not a `Cell`:
@@ -901,10 +901,10 @@ mod tests {
         );
     }
 
+    /// `cognitive_rules()` carries the commitment rule; a second copy
+    /// would deliver everything twice.
     fn rules_with_commitments() -> SmallVec<[Box<dyn Rule>; 4]> {
-        let mut v = cognitive_rules();
-        v.push(Box::new(CommitmentRule::new()));
-        v
+        cognitive_rules()
     }
 
     fn due(at: Instant, modality: &str, payload: &str) -> Observation {

@@ -5,7 +5,8 @@
 //!                                  \-> ui ring             |
 //!                            try_send copy -> Deliberator  | CommandRouter
 //!   Reflex --Event--> MemoryWorker --> Store               v
-//!                                            speaker | ui | deliberate | mind
+//!                                  speaker | ui | deliberate | mind | memory
+//!   Store --(every 30 s)--> reminder_due / check_in_due --> ring
 //! ```
 //!
 //! Build order follows the data: whatever consumes is started before
@@ -69,6 +70,15 @@ const EVENT_TAP_CAPACITY: usize = 1024;
 /// both are cancelled first, so this is generous.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the store is asked for commitments that have fallen due
+/// (`Store::due_reminders`, `Store::pending_check_in`). Thirty seconds:
+/// nobody notices a reminder half a minute late, and the mind holds what
+/// it is handed until the person is in front of it (`mind::plan`).
+const COMMITMENT_POLL: Duration = Duration::from_secs(30);
+
+/// UI commands the headless tap keeps for tests, newest last.
+const UI_TAP_CAPACITY: usize = 256;
+
 /// How long the microphone (and the camera) may take to open before the
 /// run carries on without them and says so. The only thing that takes
 /// this long is the macOS permission prompt, which blocks the open until
@@ -77,6 +87,9 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// launch logged "vad configured" and then hung at 0% CPU, window never
 /// shown, Quit timing out, because the open was on the main thread.
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The headless UI tap: every `(kind, text)` that reached the `ui` route.
+type UiTap = Arc<Mutex<Vec<(SmolStr, String)>>>;
 
 /// What the caller supplies (or leaves default) to change the wiring:
 /// flags from the command line, mocks from tests.
@@ -149,6 +162,10 @@ pub struct App {
     timeline_thread: Option<JoinHandle<()>>,
     reflex: Option<Arc<ReflexHandle>>,
     memory: Option<WorkerHandle>,
+    /// The commitments poller: dropping the sender wakes and ends it.
+    commitments: Option<(crossbeam_channel::Sender<()>, JoinHandle<()>)>,
+    /// What reached the `ui` route, headless runs only (tests read it).
+    ui_tap: Option<UiTap>,
 }
 
 impl App {
@@ -201,8 +218,11 @@ impl App {
 
         // -- memory -----------------------------------------------------
         let db = parts.db.clone().unwrap_or_else(|| config.db.clone());
+        // The zone: "first sighting of the day" for check-ins turns over
+        // at local midnight, and reminder times are parsed in local time.
         let store = Store::open(&db)
             .with_context(|| format!("opening {}", db.display()))?
+            .with_utc_offset(deliberate::tools::local_utc_offset())
             .with_gates(
                 Gates {
                     threshold: config.face_gates.0,
@@ -294,6 +314,7 @@ impl App {
         let ui_rx = router.route("ui");
         let intent_rx = router.route("deliberate");
         let mind_rx = router.route("mind");
+        let memory_rx = router.route("memory");
         let router = router.spawn().context("spawning router")?;
 
         // Not a bridge: it reads the tee's ring, so it can only exit after
@@ -319,22 +340,18 @@ impl App {
         })?);
         bridges.push(spawn_named("glydi-intent-bridge", {
             let intents = deliberator.as_ref().map(DeliberatorHandle::intent_sender);
-            move || {
-                // The planner's intents (ask / say / recall) go to the
-                // deliberate path, which speaks them between turns. With
-                // no deliberator they are logged so a headless run still
-                // shows what the mind decided.
-                for c in &intent_rx {
-                    let Some(tx) = &intents else {
-                        tracing::info!(payload = ?c.payload, "intent (no deliberator)");
-                        continue;
-                    };
-                    if tx.send(c).is_err() {
-                        break;
-                    }
-                }
-            }
+            let store = Arc::clone(&store);
+            move || intent_bridge(&intent_rx, intents.as_ref(), &store)
         })?);
+        bridges.push(spawn_named("glydi-memory-bridge", move || {
+            memory_bridge(&memory_rx);
+        })?);
+        let commitments = Some(spawn_commitments(
+            Arc::clone(&store),
+            reflex.view(),
+            obs_tx.clone(),
+            Arc::clone(&clock),
+        )?);
         bridges.push(spawn_named("glydi-mind-bridge", {
             let tx = obs_tx.clone();
             let view = reflex.view();
@@ -349,8 +366,18 @@ impl App {
         // thread, so a microphone stuck behind the permission prompt no
         // longer stands between the person and the window.
         let sources = ui_sources(&reflex, &timeline, epoch);
+        let mut ui_tap = None;
         let (ui, headless) = if parts.headless {
-            let h = Headless::spawn(ui_rx, ui_obs_rx).context("spawning headless ui")?;
+            // Through a tap, so a test can see what the face was told
+            // (a `react`, an `attend`) without a window to look at.
+            let tap: UiTap = Arc::new(Mutex::new(Vec::new()));
+            let (tapped_tx, tapped_rx) = crossbeam_channel::unbounded();
+            bridges.push(spawn_named("glydi-ui-tap", {
+                let tap = Arc::clone(&tap);
+                move || ui_tap_bridge(&ui_rx, &tapped_tx, &tap)
+            })?);
+            ui_tap = Some(tap);
+            let h = Headless::spawn(tapped_rx, ui_obs_rx).context("spawning headless ui")?;
             (None, Some(h))
         } else {
             (
@@ -415,6 +442,8 @@ impl App {
             timeline_thread,
             reflex: Some(reflex),
             memory: Some(memory),
+            commitments,
+            ui_tap,
         })
     }
 
@@ -476,6 +505,15 @@ impl App {
         self.ui.take()
     }
 
+    /// Every `(kind, text)` that reached the `ui` route so far, oldest
+    /// first (the last [`UI_TAP_CAPACITY`]). Headless runs only; a window
+    /// consumes its commands itself and this is empty.
+    pub fn ui_commands(&self) -> Vec<(SmolStr, String)> {
+        self.ui_tap
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.lock().clone())
+    }
+
     /// One log line of counters, for the headless heartbeat.
     pub fn log_stats(&self) {
         if let Some(r) = &self.reflex {
@@ -519,6 +557,11 @@ impl App {
         drop(self.ui.take());
         if let Some(mut h) = self.headless.take() {
             join_timeout("ui", move || h.stop(), JOIN_TIMEOUT);
+        }
+        // Dropping the poller's sender wakes it out of its 30 s wait.
+        if let Some((stop, h)) = self.commitments.take() {
+            drop(stop);
+            join_timeout("commitments", move || h.join().ok(), JOIN_TIMEOUT);
         }
         if let Some(mut r) = self.router.take() {
             let dropped = join_timeout("router", move || r.stop(), JOIN_TIMEOUT).unwrap_or(0);
@@ -599,9 +642,13 @@ fn backends(
                     else {
                         return;
                     };
+                    // The same tool list the session sends, so the cached
+                    // prefix matches.
                     match rt.block_on(warm.warm(
                         deliberate::LOCAL_SYSTEM_PROMPT,
-                        deliberate::full_tool_specs(),
+                        deliberate::tools::full_tool_specs_with(
+                            deliberate::tools::ToolPolicy::from_env(),
+                        ),
                     )) {
                         Ok(took) => tracing::info!(model, ms = took.as_millis(), "llm warm"),
                         Err(e) => tracing::warn!(model, error = %e, "llm warm-up failed"),
@@ -665,6 +712,164 @@ fn speaker_bridge(
         }
         if to.send(c).is_err() {
             break;
+        }
+    }
+}
+
+/// The planner's intents (ask / say / recall / remind / ...) go to the
+/// deliberate path, which speaks them between turns. With no deliberator
+/// they are logged so a headless run still shows what the mind decided.
+///
+/// A commitment is marked done in the store as its intent goes past --
+/// `remind` by row id, `check_in` by person -- not when it is spoken: the
+/// mind re-sends nothing it has delivered, so an intent that reaches the
+/// deliberate path is the one chance, and a row left open would come
+/// round again on the next poll after a restart. Marking here rather
+/// than in `deliberate` keeps that crate ignorant of the store.
+fn intent_bridge(
+    from: &Receiver<Command>,
+    to: Option<&crossbeam_channel::Sender<Command>>,
+    store: &Store,
+) {
+    for c in from {
+        mark_commitment_done(&c, store);
+        let Some(tx) = to else {
+            tracing::info!(payload = ?c.payload, "intent (no deliberator)");
+            continue;
+        };
+        if tx.send(c).is_err() {
+            break;
+        }
+    }
+}
+
+/// `Store::reminder_done` / `Store::check_in_done` for a `remind` /
+/// `check_in` intent (`mind::plan` documents the JSON); anything else is
+/// left alone.
+fn mark_commitment_done(c: &Command, store: &Store) {
+    if c.kind != deliberate::INTENT_KIND {
+        return;
+    }
+    let Some(v) = c
+        .payload
+        .as_text()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+    else {
+        return;
+    };
+    let field = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+    match field("decision") {
+        Some("remind") => {
+            if let Some(id) = v.get("id").and_then(serde_json::Value::as_i64) {
+                match store.reminder_done(id) {
+                    Ok(closed) => tracing::info!(id, closed, "reminder delivered"),
+                    Err(e) => tracing::warn!(id, error = %e, "could not mark reminder done"),
+                }
+            }
+        }
+        Some("check_in") => {
+            if let Some(entity) = field("entity") {
+                match store.check_in_done(&EntityId::new(entity)) {
+                    Ok(()) => tracing::info!(entity, "check-in asked"),
+                    Err(e) => tracing::warn!(entity, error = %e, "could not mark check-in done"),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Command{memory, outcome, Text(json)}` from the mind's learning
+/// (`mind::outcome`): what followed each proactive act, per person and
+/// kind. Logged at debug. The store has no home for outcome tallies yet
+/// (`Outcomes::seed` at start-up is the other half); when it grows one,
+/// this is where the row is written.
+fn memory_bridge(from: &Receiver<Command>) {
+    for c in from {
+        match c.payload.as_text() {
+            Some(json) if c.kind == "outcome" => {
+                tracing::debug!(%json, "outcome tally (not persisted)");
+            }
+            _ => tracing::debug!(kind = %c.kind, "memory command ignored"),
+        }
+    }
+}
+
+/// Record every `ui` command (bounded) and pass it on to the headless
+/// consumer.
+fn ui_tap_bridge(
+    from: &Receiver<Command>,
+    to: &crossbeam_channel::Sender<Command>,
+    tap: &Mutex<Vec<(SmolStr, String)>>,
+) {
+    for c in from {
+        {
+            let mut v = tap.lock();
+            if v.len() >= UI_TAP_CAPACITY {
+                v.remove(0);
+            }
+            v.push((
+                c.kind.clone(),
+                c.payload.as_text().unwrap_or_default().to_owned(),
+            ));
+        }
+        if to.send(c).is_err() {
+            break;
+        }
+    }
+}
+
+/// The commitments poller (`glydi-commitments`): every [`COMMITMENT_POLL`],
+/// every reminder that has fallen due becomes a `reminder_due`
+/// observation and every present known person with a pending check-in a
+/// `check_in_due` one, in the shapes `mind::plan` documents. No entity
+/// hint on either: a hint would count as a sighting. The mind
+/// deduplicates, so re-sending a row every poll until it is marked done
+/// is the point, not a bug. Returns the stop sender and the thread.
+fn spawn_commitments(
+    store: Arc<Store>,
+    view: Arc<ArcSwap<WorldView>>,
+    tx: RingSender,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<(crossbeam_channel::Sender<()>, JoinHandle<()>)> {
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(0);
+    let thread = spawn_named("glydi-commitments", move || {
+        // A stop (or the sender going away) ends the wait early.
+        while let Err(crossbeam_channel::RecvTimeoutError::Timeout) =
+            stop_rx.recv_timeout(COMMITMENT_POLL)
+        {
+            poll_commitments(&store, &view.load(), &tx, clock.now());
+        }
+    })
+    .context("spawning commitments poller")?;
+    Ok((stop_tx, thread))
+}
+
+/// One round of the poller: due reminders, then check-ins for whoever
+/// known is present.
+fn poll_commitments(store: &Store, view: &WorldView, tx: &RingSender, now: Instant) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    match store.due_reminders(secs) {
+        Ok(due) => {
+            for r in due {
+                tracing::debug!(id = r.id, entity = %r.entity, "reminder due");
+                tx.send(
+                    Observation::new("store", mind::plan::REMINDER_DUE, now)
+                        .with_payload(Payload::Text(format!("{}\t{}\t{}", r.id, r.entity, r.text))),
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not read due reminders"),
+    }
+    for p in view.people.iter().filter(|p| p.is_known()) {
+        if let Some(about) = store.pending_check_in(&p.id) {
+            tracing::debug!(entity = %p.id, about, "check-in due");
+            tx.send(
+                Observation::new("store", mind::plan::CHECK_IN_DUE, now)
+                    .with_payload(Payload::Text(format!("{}\t{about}", p.id))),
+            );
         }
     }
 }
@@ -997,7 +1202,7 @@ fn spawn_vision(
         tracing::info!("camera off (GLYDI_IDENTITY=0)");
         return None;
     }
-    let cfg = VisionConfig {
+    let mut cfg = VisionConfig {
         source: Source::Camera {
             index: config.camera_index,
             width: 1280,
@@ -1007,6 +1212,10 @@ fn spawn_vision(
         ort_lib: config.ort_lib.clone(),
         ..VisionConfig::default()
     };
+    // The object detector lives beside the other models
+    // (`models/vision/yolov8n.onnx` or `yolov5n.onnx`); a missing file
+    // only costs the object path, not the camera.
+    cfg.objects.model_dir = Some(config.models_dir.join("vision"));
     if !cfg.models_present() {
         tracing::warn!(dir = %cfg.models_dir.display(), "face models not found; camera disabled");
         return None;

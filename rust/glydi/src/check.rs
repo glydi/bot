@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use deliberate::OpenAiBackend;
+use deliberate::tools::{SystemRunner, ToolPolicy, list_shortcuts};
 use sense_audio::input::{FrameSource, MicInput, Pull};
 use sense_audio::vad::FRAMES_PER_BUFFER;
 
@@ -60,6 +61,7 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
         file("voice-id model", &config.voice_model, false),
         file("face detector", &config.face_models_dir.join(det), false),
         file("face recogniser", &config.face_models_dir.join(rec), false),
+        object_model(&config.models_dir.join("vision")),
         ort(&config.ort_lib),
         db(&config.db),
         mic(config.mic_device.as_deref()),
@@ -67,6 +69,7 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
         camera(),
         llm(config),
         speaker(tts.unwrap_or(config.tts)),
+        shortcuts(),
     ]
 }
 
@@ -98,6 +101,69 @@ fn file(what: &'static str, path: &Path, required: bool) -> Line {
 /// when the feature is off.
 fn sense_vision_model_names() -> (&'static str, &'static str) {
     ("det_500m.onnx", "w600k_mbf.onnx")
+}
+
+/// The object detector, either export `sense_vision::objects::MODEL_FILES`
+/// accepts (the same names, spelled here so the check compiles without the
+/// feature). Optional: a camera without objects is still a camera.
+fn object_model(dir: &Path) -> Line {
+    const FILES: [&str; 2] = ["yolov8n.onnx", "yolov5n.onnx"];
+    let found = FILES.iter().map(|f| dir.join(f)).find(|p| p.is_file());
+    Line {
+        what: "object model",
+        ok: found.is_some(),
+        required: false,
+        detail: found.map_or_else(
+            || {
+                format!(
+                    "{} (yolov8n.onnx or yolov5n.onnx; scripts/download_yolo.sh)",
+                    dir.display()
+                )
+            },
+            |p| p.display().to_string(),
+        ),
+    }
+}
+
+/// The Shortcuts `run_shortcut` could run: `shortcuts list` through the
+/// same runner the tool uses. Reported, never required; and when the
+/// policy has Shortcuts off (`GLYDI_ALLOW_SHORTCUTS=0`) the list is not
+/// even asked for.
+fn shortcuts() -> Line {
+    let policy = ToolPolicy::from_env();
+    let (ok, detail) = if policy.shortcuts {
+        match list_shortcuts(&SystemRunner) {
+            Ok(names) if names.is_empty() => (false, "none defined".to_owned()),
+            Ok(names) => {
+                let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
+                let more = names.len().saturating_sub(shown.len());
+                (
+                    true,
+                    if more > 0 {
+                        format!("{} ({}, +{more} more)", names.len(), shown.join(", "))
+                    } else {
+                        format!("{} ({})", names.len(), shown.join(", "))
+                    },
+                )
+            }
+            Err(e) => (false, e),
+        }
+    } else {
+        (false, "disabled (GLYDI_ALLOW_SHORTCUTS=0)".to_owned())
+    };
+    Line {
+        what: "shortcuts",
+        ok,
+        required: false,
+        detail: format!(
+            "{detail}; contact tools {}",
+            if policy.contact {
+                "allowed"
+            } else {
+                "off (GLYDI_ALLOW_CONTACT_TOOLS=1 to allow)"
+            }
+        ),
+    }
 }
 
 /// Load the runtime, not just stat it: a wrong-architecture dylib exists

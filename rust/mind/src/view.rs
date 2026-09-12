@@ -26,6 +26,11 @@ use crate::world::{Status, World};
 pub const NOBODY: &str = "Nobody is visible right now. To answer about anyone who is not here, \
 call recall_person.";
 
+/// Rendered instead of [`NOBODY`] while the room is dark: the model asked
+/// "can you see me?" should say why not, not guess. The tool hint stays.
+pub const NOBODY_DARK: &str = "It is dark: the camera cannot see anyone right now. To answer \
+about anyone who is not here, call recall_person.";
+
 /// A returned person keeps the "back after N min" extra on their line for
 /// this long. After that it is just noise on every turn.
 pub const RETURN_NOTE_TTL: Duration = Duration::from_secs(120);
@@ -204,8 +209,16 @@ impl WorldView {
     /// carry into its answer, whereas a recognition score became an
     /// invented fact. A separate method so `describe`'s measured output
     /// is byte-for-byte what it was.
+    ///
+    /// Two more lines from the working half: while the room is dark and
+    /// empty the [`NOBODY`] line becomes [`NOBODY_DARK`], and the objects
+    /// a camera reports are appended as "In view: a laptop, a cup" -- what
+    /// lets "what can you see?" be answered from the note.
     pub fn describe_with_beliefs(&self, facts: &dyn Fn(&EntityId) -> Vec<String>) -> String {
         let mut s = self.describe(facts);
+        if self.people.is_empty() && self.working.dark {
+            NOBODY_DARK.clone_into(&mut s);
+        }
         for p in self.people.iter().filter(|p| p.is_known()) {
             let Some(eb) = self.working.beliefs_of(&p.id) else {
                 continue;
@@ -220,6 +233,9 @@ impl WorldView {
                     );
                 }
             }
+        }
+        if let Some(inv) = self.working.inventory() {
+            let _ = write!(s, "\nIn view: {inv}");
         }
         s
     }
@@ -346,5 +362,24 @@ mod tests {
         );
         assert!(!s.contains("unknown_3"));
         assert!(render_room(&people, None).ends_with("Currently speaking: unclear"));
+    }
+
+    #[test]
+    fn dark_and_inventory_are_rendered_with_beliefs_only() {
+        let mut working = WorkingMemory::new();
+        working.object_seen("laptop");
+        working.object_seen("cup");
+        working.dark = true;
+        let now = Instant::now();
+        let world = World::new();
+        let v = WorldView::snapshot_with(&world, &working, now);
+        let none = |_: &EntityId| Vec::new();
+        assert_eq!(v.describe(&none), NOBODY, "the measured note is untouched");
+        let s = v.describe_with_beliefs(&none);
+        assert!(s.starts_with(NOBODY_DARK), "{s}");
+        assert!(s.ends_with("\nIn view: a laptop, a cup"), "{s}");
+        working.dark = false;
+        let v = WorldView::snapshot_with(&world, &working, now);
+        assert!(v.describe_with_beliefs(&none).starts_with(NOBODY));
     }
 }
