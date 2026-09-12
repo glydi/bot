@@ -170,8 +170,14 @@ mod tests {
             .with_payload(Payload::Embedding(Arc::from([0.5f32, 0.25].as_slice())));
         let r = Recorded::new(&o, epoch);
         let line = serde_json::to_string(&r).unwrap();
-        assert!(line.contains(r#""entity":{"known":"john","track":3}"#), "{line}");
-        assert!(line.contains(r#""payload":{"embedding":[0.5,0.25]}"#), "{line}");
+        assert!(
+            line.contains(r#""entity":{"known":"john","track":3}"#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#""payload":{"embedding":[0.5,0.25]}"#),
+            "{line}"
+        );
         let back: Recorded = serde_json::from_str(&line).unwrap();
         assert_eq!(back, r);
         let o2 = back.to_observation(epoch);

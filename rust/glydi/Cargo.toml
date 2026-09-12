@@ -46,11 +46,19 @@ serde_json = { workspace = true }
 smol_str = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+futures-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 cpal = { workspace = true }
 ctrlc = "3"
+
+[dev-dependencies]
+# The headless test reads the `sessions` table straight from the file: the
+# store has no public "list sessions" call, and the test wants to see what
+# the memory worker actually committed, not what the store thinks it did.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,7 +4,7 @@
 //! records: calling `say(1)` costs ~950 ms per utterance, essentially all of
 //! it process startup; one warm `AVSpeechSynthesizer` behind a long-lived
 //! process answers in ~6 ms and synthesises at ~80x realtime. The helper
-//! (`go/cmd/ttsd/ttsd.swift`) was written for the Go build and is reused
+//! (`rust/ttsd/ttsd.swift`) was written for the Go build and is reused
 //! here unchanged, wire protocol and all, so every build speaks with one
 //! voice.
 //!
@@ -58,7 +58,7 @@ struct Frame {
 #[derive(Clone, Debug)]
 pub struct MacConfig {
     /// Explicit helper path. `None` searches: next to the executable,
-    /// `go/cmd/ttsd/ttsd` under the working directory and its parents, then
+    /// `rust/ttsd/ttsd` under the working directory and its parents, then
     /// `ttsd` on `$PATH`.
     pub helper: Option<PathBuf>,
     /// Voice identifier (`ttsd -list`), or `None` for the system default.
@@ -97,11 +97,11 @@ pub fn find_helper(explicit: Option<&Path>) -> Result<PathBuf, SynthError> {
             return Ok(p);
         }
     }
-    // The repo layout: rust/ and go/ are siblings, and the binary is run
+    // The repo layout: the helper lives in rust/ttsd, and the binary is run
     // from either the repo root or rust/.
     if let Ok(cwd) = std::env::current_dir() {
         for dir in cwd.ancestors().take(4) {
-            if let Some(p) = try_path(dir.join("go/cmd/ttsd/ttsd")) {
+            if let Some(p) = try_path(dir.join("rust/ttsd/ttsd")) {
                 return Ok(p);
             }
         }
@@ -114,7 +114,7 @@ pub fn find_helper(explicit: Option<&Path>) -> Result<PathBuf, SynthError> {
         }
     }
     Err(SynthError::Unavailable(format!(
-        "ttsd helper not found (looked in {}); build it with: make -C go/cmd/ttsd",
+        "ttsd helper not found (looked in {}); build it with: make -C rust/ttsd",
         tried.join(", ")
     )))
 }

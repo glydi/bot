@@ -11,3 +11,4 @@ go/bin/
 *.egg-info/
 .pytest_cache/
 *.log
+rust/ttsd/ttsd

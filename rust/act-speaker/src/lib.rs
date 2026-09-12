@@ -23,7 +23,7 @@
 //! Two backends implement [`Synth`]:
 //!
 //! * [`MacSpeech`] -- the macOS system voice through the persistent `ttsd`
-//!   helper (`go/cmd/ttsd`). Always available, ~6 ms to first audio, ~80x
+//!   helper (`rust/ttsd`). Always available, ~6 ms to first audio, ~80x
 //!   realtime, no model files, no unsafe code. This is the default and the
 //!   one the shipping Python build uses (`mac_tts.py`): Kokoro "produced no
 //!   audio on more than half of the utterances in live use", and a bot that
