@@ -14,14 +14,29 @@ use crate::world::{LONG_SPEECH, World};
 
 /// Modality the audio sense uses for voice activity edges.
 pub const VOICE_ACTIVITY: &str = "voice_activity";
+/// Modality the audio sense uses for its end-of-turn verdict: `Bool(true)`
+/// when the person has finished, `Bool(false)` when the judge thinks they
+/// are pausing mid-thought.
+pub const TURN_ENDED: &str = "turn_ended";
+/// Modality the speaker actuator reports its own playback on.
+pub const SELF_SPEAKING: &str = "self_speaking";
 
 fn voice_started(o: &Observation) -> bool {
     o.modality == VOICE_ACTIVITY && o.payload.as_bool().unwrap_or(true)
 }
 
+fn voice_stopped(o: &Observation) -> bool {
+    o.modality == VOICE_ACTIVITY && o.payload.as_bool() == Some(false)
+}
+
 /// Someone started talking and we know who: turn the face toward them.
 /// Fires on the edge only (the sense emits `voice_activity` as
 /// started/stopped), so a long monologue is one `attend`, not a stream.
+///
+/// The payload is the speaker's bearing (`Payload::Direction`) when the
+/// room knows one from their latest sighting, so the eyes move toward the
+/// voice on the same frame it starts; otherwise their id as text, which
+/// the face reads as a glance.
 #[derive(Debug, Default)]
 pub struct AttendToSpeaker;
 
@@ -37,9 +52,206 @@ impl Rule for AttendToSpeaker {
         let Some(e) = o.entity.as_ref().and_then(|h| w.resolve(h)) else {
             return;
         };
+        let payload = match e.bearing_at(o.at) {
+            Some(azimuth_deg) => Payload::Direction { azimuth_deg },
+            None => Payload::Text(e.id.to_string()),
+        };
+        out.push(Command::new("ui", "attend", Priority::Reflex).with_payload(payload));
+    }
+}
+
+/// A voice started while we were idle: show we are listening, now, not a
+/// second later when the turn ends and the transcript arrives. Once per
+/// run of speech: the VAD re-asserts its start edge every so often, and
+/// the face reacting to each would twitch. Never while the bot is
+/// talking -- that voice is either an interruption (`BargeInStop`'s
+/// business) or a noise.
+#[derive(Debug, Default)]
+pub struct ListenOnVoice {
+    /// Whether the current run of speech has already been shown.
+    hearing: Cell<bool>,
+}
+
+impl Rule for ListenOnVoice {
+    fn name(&self) -> &'static str {
+        "listen_on_voice"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        if voice_started(o) {
+            if w.bot_speaking() || self.hearing.get() {
+                return;
+            }
+            self.hearing.set(true);
+            out.push(Command::new("ui", "listening", Priority::Reflex));
+        } else if voice_stopped(o)
+            || (o.modality == SELF_SPEAKING && o.payload.as_bool() == Some(true))
+        {
+            self.hearing.set(false);
+        }
+    }
+
+    fn on_tick(&self, _now: Instant, w: &World, _out: &mut Commands) {
+        // A run aged out by SPEAKING_TTL ends without a stop edge.
+        if !w.anyone_speaking() {
+            self.hearing.set(false);
+        }
+    }
+}
+
+/// The person stopped talking to us: react *now*, before STT has run and
+/// long before the LLM answers. The face goes to "thinking" at once, and
+/// sometimes -- tuned by [`Acknowledge::PROBABILITY`], never twice in
+/// [`Acknowledge::MIN_GAP`], never for a turn shorter than
+/// [`Acknowledge::MIN_SPEECH`] (a "yes" needs no "mm-hm") -- a short
+/// spoken acknowledgement goes to the speaker, which plays it only if idle
+/// and drops it otherwise, so it can never delay the real reply.
+///
+/// Fires on the sense's semantic end of turn (`turn_ended` `Bool(true)`),
+/// not on the raw voice stop: a `Bool(false)` means the judge heard a
+/// pause mid-thought, and an "okay" there reads as hurrying them. The
+/// observation carries no entity (speaker-id runs after STT), so whose
+/// turn it was, and how long, comes from [`World::last_speech`]: it must
+/// be someone present and engaged, or -- without camera data to say
+/// otherwise -- anyone. Nothing over the bot's own voice.
+///
+/// The phrase is drawn from [`Acknowledge::PHRASES`], never the same one
+/// twice running, by a small xorshift generator seeded deterministically
+/// ([`Acknowledge::with_seed`]) so a replay produces the same sounds.
+#[derive(Debug)]
+pub struct Acknowledge {
+    /// When we last acknowledged.
+    last: Cell<Option<Instant>>,
+    /// Index into [`Acknowledge::PHRASES`] of the last phrase used.
+    prev: Cell<Option<usize>>,
+    /// xorshift64 state. Never zero.
+    rng: Cell<u64>,
+    /// Chance of a spoken acknowledgement per eligible turn, 0..=1.
+    probability: f32,
+}
+
+impl Default for Acknowledge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Acknowledge {
+    /// What we may say. Short enough to finish before the reply's first
+    /// sentence is synthesised, so the speaker is idle again by then.
+    pub const PHRASES: [&'static str; 4] = ["Mm-hm.", "Hm.", "Okay.", "Right."];
+    /// Chance of a spoken acknowledgement per eligible turn. Every turn
+    /// answered with "mm-hm" sounds like a call centre; none sounds
+    /// like the bot did not hear.
+    pub const PROBABILITY: f32 = 0.5;
+    /// Minimum time between two spoken acknowledgements.
+    pub const MIN_GAP: Duration = Duration::from_secs(8);
+    /// A turn shorter than this gets no vocal acknowledgement.
+    pub const MIN_SPEECH: Duration = Duration::from_millis(600);
+    /// The speech must have ended within this of the `turn_ended` for the
+    /// two to be the same turn: the sense emits the verdict right after
+    /// the stop edge, a deferred verdict a few hundred ms later.
+    pub const SAME_TURN: Duration = Duration::from_secs(2);
+    /// The default seed. Any non-zero constant; this one is the
+    /// splitmix64 increment, chosen for having no structure.
+    pub const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// A rule with the default probability and seed.
+    pub fn new() -> Self {
+        Self {
+            last: Cell::new(None),
+            prev: Cell::new(None),
+            rng: Cell::new(Self::DEFAULT_SEED),
+            probability: Self::PROBABILITY,
+        }
+    }
+
+    /// Reseed the generator. Zero is replaced by the default: xorshift
+    /// sticks at zero.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = Cell::new(if seed == 0 { Self::DEFAULT_SEED } else { seed });
+        self
+    }
+
+    /// Set the chance of a spoken acknowledgement (clamped to 0..=1).
+    /// `1.0` makes the rule deterministic, for tests.
+    #[must_use]
+    pub fn with_probability(mut self, p: f32) -> Self {
+        self.probability = if p.is_finite() {
+            p.clamp(0.0, 1.0)
+        } else {
+            Self::PROBABILITY
+        };
+        self
+    }
+
+    /// Next generator output: xorshift64, a handful of instructions.
+    fn next_u64(&self) -> u64 {
+        let mut x = self.rng.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng.set(x);
+        x
+    }
+
+    /// A uniform draw in 0..1.
+    fn roll(&self) -> f32 {
+        // 24 bits: exactly representable in an f32.
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// The next phrase: any but the last one.
+    fn phrase(&self) -> &'static str {
+        let n = Self::PHRASES.len();
+        // The draw is at most n - 1 < 4, so the narrowing is exact.
+        let idx = match self.prev.get() {
+            None => (self.next_u64() % n as u64) as usize,
+            Some(p) => (p + 1 + (self.next_u64() % (n as u64 - 1)) as usize) % n,
+        };
+        self.prev.set(Some(idx));
+        Self::PHRASES[idx]
+    }
+}
+
+impl Rule for Acknowledge {
+    fn name(&self) -> &'static str {
+        "acknowledge"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        if o.modality != TURN_ENDED || o.payload.as_bool() != Some(true) || w.bot_speaking() {
+            return;
+        }
+        let now = o.at;
+        // The turn that just ended, if the room saw it end.
+        let speech = w
+            .last_speech()
+            .filter(|s| now.saturating_duration_since(s.ended) <= Self::SAME_TURN);
+        let addressed = match speech.and_then(|s| s.who.as_ref()) {
+            Some(id) => w
+                .get(id)
+                .is_some_and(|e| e.status == crate::world::Status::Present && e.engaged(now)),
+            None => w.room_addressed(now),
+        };
+        if !addressed {
+            return;
+        }
+        out.push(Command::new("ui", "thinking", Priority::Reflex));
+
+        let long_enough = speech.is_some_and(|s| s.len() >= Self::MIN_SPEECH);
+        let recently = self
+            .last
+            .get()
+            .is_some_and(|t| now.saturating_duration_since(t) < Self::MIN_GAP);
+        if !long_enough || recently || self.roll() >= self.probability {
+            return;
+        }
+        self.last.set(Some(now));
         out.push(
-            Command::new("ui", "attend", Priority::Reflex)
-                .with_payload(Payload::Text(e.id.to_string())),
+            Command::new("speaker", "backchannel", Priority::Reflex)
+                .with_payload(Payload::Text(self.phrase().to_owned())),
         );
     }
 }
@@ -351,6 +563,9 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
     v.push(Box::new(BargeInStop::default()));
     v.push(Box::new(AttendToSpeaker));
+    // After attend, so a voice start still yields `attend` first.
+    v.push(Box::new(ListenOnVoice::default()));
+    v.push(Box::new(Acknowledge::new()));
     v.push(Box::new(BackchannelAfterLongSpeech::new()));
     // Default, not opt-in: it emits nothing without facing data, so every
     // consumer counting commands sees exactly what it did before.

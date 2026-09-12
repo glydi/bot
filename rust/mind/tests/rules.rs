@@ -25,11 +25,13 @@ fn attend_to_speaker() {
     r.on_observation(&face_known(clock.at_secs(0.0), "john"));
 
     let cmds = r.on_observation(&voice(clock.at_secs(1.0), Some("john"), true));
-    assert_eq!(kinds(&cmds), ["ui/attend"]);
+    // Attend first, then the face's "listening" (once per run of speech).
+    assert_eq!(kinds(&cmds), ["ui/attend", "ui/listening"]);
     assert_eq!(cmds[0].payload.as_text(), Some("john"));
     assert_eq!(cmds[0].priority, common::Priority::Reflex);
 
-    // No entity: nothing to attend to. Stop edge: nothing either.
+    // No entity: nothing to attend to, and the run is already shown as
+    // heard. Stop edge: nothing either.
     assert!(
         r.on_observation(&voice(clock.at_secs(2.0), None, true))
             .is_empty()
@@ -45,10 +47,10 @@ fn barge_in_stop() {
     let clock = FakeClock::new();
     let mut r = Reflex::new("t", clock.now());
 
-    // Bot silent: a voice is not an interruption.
-    assert!(
-        r.on_observation(&voice(clock.at_secs(0.0), None, true))
-            .is_empty()
+    // Bot silent: a voice is not an interruption, only something to hear.
+    assert_eq!(
+        kinds(&r.on_observation(&voice(clock.at_secs(0.0), None, true))),
+        ["ui/listening"]
     );
 
     r.on_observation(&self_speaking(clock.at_secs(1.0), true));
@@ -85,8 +87,9 @@ fn barge_in_stop() {
 fn step(r: &mut Reflex, clock: &FakeClock, t: f64) -> Vec<String> {
     let mut cmds = r.on_observation(&voice(clock.at_secs(t), Some("john"), true));
     cmds.extend(r.tick(clock.at_secs(t)));
-    // Every voiced "started" frame also yields an attend; not under test here.
-    cmds.retain(|c| c.kind != "attend");
+    // Every voiced "started" frame also yields an attend, and the first
+    // of a run a listening; not under test here.
+    cmds.retain(|c| c.kind != "attend" && c.kind != "listening");
     kinds(&cmds)
 }
 
@@ -96,7 +99,7 @@ fn backchannel_after_long_speech() {
     let mut r = Reflex::new("t", clock.now());
     r.on_observation(&face_known(clock.at_secs(0.0), "john"));
     let cmds = r.on_observation(&voice(clock.at_secs(0.0), Some("john"), true));
-    assert_eq!(kinds(&cmds), ["ui/attend"]);
+    assert_eq!(kinds(&cmds), ["ui/attend", "ui/listening"]);
 
     // Nothing up to and including 4 s: the threshold is strictly "more than".
     for i in 1..=4 {

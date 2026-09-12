@@ -34,6 +34,11 @@ pub const RECOGNITION_MODALITIES: [&str; 2] = ["face", "voice_identity"];
 /// backchannel is warranted.
 pub const LONG_SPEECH: Duration = Duration::from_secs(4);
 
+/// A bearing older than this no longer says where someone is: the camera
+/// refreshes it at 10 Hz while it can see them, and a presence that old
+/// has expired anyway ([`PRESENCE_TTL`]).
+pub const BEARING_FRESH: Duration = PRESENCE_TTL;
+
 /// Whether an entity is in the room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -74,6 +79,11 @@ pub struct Entity {
     pub spoke_at: Option<Instant>,
     /// Start of the current unbroken run of speech; `None` when silent.
     pub speaking_since: Option<Instant>,
+    /// Where they were last seen, as the latest `Direction` payload of any
+    /// observation about them (the camera's `face`, a microphone array's
+    /// bearing), and when. Lets `attend` turn the eyes toward the voice
+    /// on the same frame the voice starts, before any further sighting.
+    pub bearing: Option<(f32, Instant)>,
     /// What we think is going on with them, as distributions
     /// (Phase 8). Fed by every observation about them in [`World::fold`],
     /// decayed in [`World::tick`].
@@ -99,6 +109,7 @@ impl Entity {
             is_speaking: false,
             spoke_at: None,
             speaking_since: None,
+            bearing: None,
             beliefs: BeliefSet::default(),
             engagement: Engagement::default(),
         }
@@ -129,6 +140,41 @@ impl Entity {
             .filter(|_| self.is_speaking)
             .map(|s| now.saturating_duration_since(s))
     }
+
+    /// Their bearing in degrees (0 ahead, positive right), if one was
+    /// reported within [`BEARING_FRESH`] of `now`.
+    pub fn bearing_at(&self, now: Instant) -> Option<f32> {
+        self.bearing
+            .filter(|(_, at)| now.saturating_duration_since(*at) < BEARING_FRESH)
+            .map(|(az, _)| az)
+    }
+}
+
+/// The most recent completed run of speech in the room: who (if the voice
+/// was attributed), and its bounds. A `turn_ended` arrives with no entity
+/// -- speaker-id runs with STT, after it -- so a rule reacting to the end
+/// of a turn reads this to learn how long the turn was and whose it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Speech {
+    /// The speaker, or `None` for a voice speaker-id had not resolved.
+    pub who: Option<EntityId>,
+    /// First voiced frame.
+    pub started: Instant,
+    /// Last voiced frame (the stop edge, or the last start edge when the
+    /// run was aged out by [`SPEAKING_TTL`]).
+    pub ended: Instant,
+}
+
+impl Speech {
+    /// How long the run lasted.
+    pub fn len(&self) -> Duration {
+        self.ended.saturating_duration_since(self.started)
+    }
+
+    /// Whether the run had no measurable length (a single edge).
+    pub fn is_empty(&self) -> bool {
+        self.len().is_zero()
+    }
 }
 
 /// Events from one fold. Four inline: a merge that also returns and starts
@@ -148,6 +194,10 @@ pub struct World {
     /// resolved). Enough for barge-in; not enough to attend to anyone.
     unattributed_speaking: bool,
     unattributed_spoke_at: Option<Instant>,
+    /// Start of the current unattributed run; `None` when silent.
+    unattributed_since: Option<Instant>,
+    /// The last run of speech that ended, from anyone.
+    last_speech: Option<Speech>,
     /// The last `voice_activity` edge from anyone, either direction. A
     /// stop edge means a voice was live until that instant, which is what
     /// the coincidence window in [`World::refresh_engagement`] asks.
@@ -170,6 +220,26 @@ impl World {
     /// Set by the actuator (directly or via the `self_speaking` modality).
     pub fn set_bot_speaking(&mut self, speaking: bool) {
         self.bot_speaking = speaking;
+    }
+
+    /// The most recent completed run of speech, if any has ended yet.
+    pub fn last_speech(&self) -> Option<&Speech> {
+        self.last_speech.as_ref()
+    }
+
+    /// Whether a voice at `now` would be addressed to us, as far as the
+    /// room can tell, without knowing whose it is: `true` when no present
+    /// face has ever reported facing data (a microphone-only build, or a
+    /// room the camera cannot see), else when someone present is engaged.
+    pub fn room_addressed(&self, now: Instant) -> bool {
+        let mut any_facing = false;
+        for e in self.present() {
+            if e.engaged(now) {
+                return true;
+            }
+            any_facing |= e.engagement.has_facing();
+        }
+        !any_facing
     }
 
     /// Whether anyone — attributed or not — is talking.
@@ -323,6 +393,11 @@ impl World {
         if let Some(e) = id.as_ref().and_then(|id| self.entities.get_mut(id)) {
             e.beliefs.observe(o);
             e.engagement.observe(o);
+            if let Payload::Direction { azimuth_deg } = o.payload
+                && azimuth_deg.is_finite()
+            {
+                e.bearing = Some((azimuth_deg, now));
+            }
         }
 
         match o.modality.as_str() {
@@ -331,9 +406,20 @@ impl World {
                 self.last_voice_at = Some(now);
                 if let Some(id) = id {
                     self.set_speaking(&id, started, now, &mut out);
+                } else if started {
+                    self.unattributed_speaking = true;
+                    self.unattributed_spoke_at = Some(now);
+                    self.unattributed_since.get_or_insert(now);
                 } else {
-                    self.unattributed_speaking = started;
-                    self.unattributed_spoke_at = started.then_some(now);
+                    self.unattributed_speaking = false;
+                    self.unattributed_spoke_at = None;
+                    if let Some(since) = self.unattributed_since.take() {
+                        self.last_speech = Some(Speech {
+                            who: None,
+                            started: since,
+                            ended: now,
+                        });
+                    }
                 }
             }
             "utterance" => {
@@ -389,7 +475,13 @@ impl World {
                     .is_none_or(|t| now.saturating_duration_since(t) >= SPEAKING_TTL)
             {
                 e.is_speaking = false;
-                e.speaking_since = None;
+                if let Some(since) = e.speaking_since.take() {
+                    self.last_speech = Some(Speech {
+                        who: Some(e.id.clone()),
+                        started: since,
+                        ended: e.spoke_at.unwrap_or(now),
+                    });
+                }
                 out.push(Event::new(now, e.id.clone(), EventKind::SpeakingStopped));
             }
         }
@@ -399,6 +491,13 @@ impl World {
                 .is_none_or(|t| now.saturating_duration_since(t) >= SPEAKING_TTL)
         {
             self.unattributed_speaking = false;
+            if let Some(since) = self.unattributed_since.take() {
+                self.last_speech = Some(Speech {
+                    who: None,
+                    started: since,
+                    ended: self.unattributed_spoke_at.unwrap_or(now),
+                });
+            }
         }
         // Tracks of absent strangers are stale: the tracker will hand out a
         // new number if the same face comes back, and keeping the old
@@ -526,7 +625,13 @@ impl World {
             }
         } else if e.is_speaking {
             e.is_speaking = false;
-            e.speaking_since = None;
+            if let Some(since) = e.speaking_since.take() {
+                self.last_speech = Some(Speech {
+                    who: Some(id.clone()),
+                    started: since,
+                    ended: now,
+                });
+            }
             out.push(Event::new(now, id.clone(), EventKind::SpeakingStopped));
         }
     }

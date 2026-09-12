@@ -40,4 +40,4 @@ pub use reflex::{Cognition, RECENT_EVENTS, Reflex, ReflexHandle, Rule};
 pub use stats::ReflexStats;
 pub use view::{NOBODY, ViewEntity, WorldView};
 pub use working::{Question, WorkingMemory, WorkingSnapshot};
-pub use world::{Entity, PRESENCE_TTL, SPEAKING_TTL, Status, World};
+pub use world::{Entity, PRESENCE_TTL, SPEAKING_TTL, Speech, Status, World};

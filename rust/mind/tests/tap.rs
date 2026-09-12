@@ -41,13 +41,14 @@ fn tap_recent_and_stats_follow_the_thread() {
         .expect("SPEAKING_STARTED on tap");
     assert_eq!(second.kind, EventKind::SpeakingStarted);
     assert_eq!(commands.pop().kind, "attend");
+    assert_eq!(commands.pop().kind, "listening");
 
     let recent = handle.recent_events(10);
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].kind, EventKind::Entered);
     let stats = handle.stats();
     assert_eq!(stats.observations, 2);
-    assert_eq!(stats.commands, 1);
+    assert_eq!(stats.commands, 2);
 
     // Overflow the ring: the tap is full (capacity 8, never drained) and
     // must not block; the recent ring keeps the newest RECENT_EVENTS.

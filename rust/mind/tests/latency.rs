@@ -54,10 +54,11 @@ fn p99_under_one_millisecond_with_deliberate_stalled() {
         }
     }
     // Every "started" edge with an entity yields exactly one attend, and
-    // nothing else is in the queue (bot never spoke, no long speech run
-    // exceeds 4 s within the test's few hundred ms... unless the machine is
-    // very slow, in which case a backchannel may appear and is popped
-    // above without counting).
+    // nothing else is in the queue but the single "listening" the first
+    // edge of the run adds (bot never spoke, no long speech run exceeds
+    // 4 s within the test's few hundred ms... unless the machine is very
+    // slow, in which case a backchannel may appear and is popped above
+    // without counting).
     assert!(attends >= N - 1, "attend commands: {attends} of {N}");
 
     drop(tx);
