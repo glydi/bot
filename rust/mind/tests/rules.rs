@@ -146,7 +146,7 @@ fn backchannel_after_long_speech() {
         }
     }
     let c = found.expect("a backchannel within 5 s");
-    assert_eq!(c.payload.as_text(), Some("mm-hm"));
+    assert_eq!(c.payload.as_text(), Some("Go on."));
     assert_eq!(c.priority, common::Priority::Reflex);
 }
 

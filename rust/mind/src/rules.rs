@@ -139,11 +139,13 @@ impl Default for Acknowledge {
 impl Acknowledge {
     /// What we may say. Short enough to finish before the reply's first
     /// sentence is synthesised, so the speaker is idle again by then.
-    pub const PHRASES: [&'static str; 4] = ["Mm-hm.", "Hm.", "Okay.", "Right."];
+    // Words, not vocalisations: the neural voice reads "Mm-hm." as
+    // letters ("m, m, h, m"), which the user heard as noise.
+    pub const PHRASES: [&'static str; 4] = ["Okay.", "Right.", "Got it.", "I see."];
     /// Chance of a spoken acknowledgement per eligible turn. Every turn
     /// answered with "mm-hm" sounds like a call centre; none sounds
     /// like the bot did not hear.
-    pub const PROBABILITY: f32 = 0.5;
+    pub const PROBABILITY: f32 = 0.35;
     /// Minimum time between two spoken acknowledgements.
     pub const MIN_GAP: Duration = Duration::from_secs(8);
     /// A turn shorter than this gets no vocal acknowledgement.
@@ -364,7 +366,7 @@ impl BackchannelAfterLongSpeech {
         self.last.set(Some(now));
         out.push(
             Command::new("speaker", "backchannel", Priority::Reflex)
-                .with_payload(Payload::Text("mm-hm".to_owned())),
+                .with_payload(Payload::Text("Go on.".to_owned())),
         );
     }
 }
