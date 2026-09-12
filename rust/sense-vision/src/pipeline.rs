@@ -13,6 +13,7 @@ use tracing::{debug, info, info_span, warn};
 
 use crate::align::norm_crop;
 use crate::arcface::{CROP_SIZE, FaceEmbedder, normalize};
+use crate::attention::FaceAttention;
 use crate::gallery::FaceGallery;
 use crate::scrfd::FaceDetector;
 use crate::source::{Frame, FrameSource};
@@ -23,6 +24,15 @@ use crate::{Error, VisionConfig};
 pub const MODALITY_FACE: &str = "face";
 /// Modality of a stranger's embedding, offered for enrolment.
 pub const MODALITY_FACE_EMBEDDING: &str = "face_embedding";
+/// Modality carrying both attention scores at once as
+/// `Payload::Opaque(Arc<FaceAttention>)`, for a consumer that knows this
+/// crate (the UI's debug panel).
+pub const MODALITY_FACE_ATTENTION: &str = "face_attention";
+/// `Payload::Level(facing)`: 1 = looking straight at the camera, 0 =
+/// profile. For consumers that never downcast (the mind's rules).
+pub const MODALITY_FACING: &str = "facing";
+/// `Payload::Level(lips)`: 1 = the jaw is clearly moving, 0 = still.
+pub const MODALITY_LIP_MOTION: &str = "lip_motion";
 
 /// The three replaceable stages, so tests can run the loop with fakes and
 /// the binary can run it with the ONNX models and the camera.
@@ -231,6 +241,11 @@ fn process_frame(
 /// plus a `face_embedding` for strangers so whoever owns enrolment can act
 /// on it. Direction is the face centre mapped through the horizontal field
 /// of view, so the UI can attend without knowing about cameras.
+///
+/// The same tick also carries the attention scores three ways:
+/// `face_attention` (both, opaque), `facing` and `lip_motion` (one
+/// `Level` each). Three extra observations per track per 100 ms is cheap:
+/// the ring is lossy and none of them allocates beyond one `Arc`.
 fn emit(
     cfg: &VisionConfig,
     clock: &dyn Clock,
@@ -262,10 +277,25 @@ fn emit(
         };
         let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE, now)
             .with_confidence(confidence)
-            .with_entity(entity)
+            .with_entity(entity.clone())
             .with_payload(Payload::Direction { azimuth_deg });
         bump(&stats.evicted, tx.send(obs) as u64);
         bump(&stats.observations, 1);
+
+        let att: FaceAttention = t.attention.scores();
+        let attention = [
+            (MODALITY_FACE_ATTENTION, Payload::Opaque(Arc::new(att))),
+            (MODALITY_FACING, Payload::Level(att.facing)),
+            (MODALITY_LIP_MOTION, Payload::Level(att.lips)),
+        ];
+        for (modality, payload) in attention {
+            let obs = Observation::new(cfg.source_name.clone(), modality, now)
+                .with_confidence(confidence)
+                .with_entity(entity.clone())
+                .with_payload(payload);
+            bump(&stats.evicted, tx.send(obs) as u64);
+            bump(&stats.observations, 1);
+        }
 
         if t.person.is_none()
             && let Some(emb) = t.last_embedding()

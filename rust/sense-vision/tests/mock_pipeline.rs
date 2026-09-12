@@ -1,7 +1,7 @@
 //! End-to-end through `VisionSense::spawn_with` with synthetic frames, a
 //! fake detector and a fake embedder: no camera, no models. Checks the
-//! shape of what reaches the ring, the per-track rate limit, enrolment and
-//! the stranger -> known transition.
+//! shape of what reaches the ring, the per-track rate limit, enrolment,
+//! the stranger -> known transition and the attention scores.
 
 #![cfg(feature = "mock")]
 
@@ -13,9 +13,14 @@ use common::{Clock, EntityHint, EntityId, FakeClock, Observation, ObservationRin
 use sense_vision::arcface::{EMBEDDING_DIM, FaceEmbedder};
 use sense_vision::scrfd::FaceDetector;
 use sense_vision::{
-    Detection, Error, InMemoryFaceGallery, MODALITY_FACE, MODALITY_FACE_EMBEDDING, MockFrames,
-    Parts, Rgb, VisionConfig, VisionSense,
+    Detection, Error, FaceAttention, InMemoryFaceGallery, MODALITY_FACE, MODALITY_FACE_ATTENTION,
+    MODALITY_FACE_EMBEDDING, MODALITY_FACING, MODALITY_LIP_MOTION, MockFrames, Parts, Rgb,
+    VisionConfig, VisionSense,
 };
+
+/// Everything a live track emits per tick besides its `face_embedding`:
+/// `face`, `face_attention`, `facing`, `lip_motion`.
+const PER_TICK: usize = 4;
 
 /// Detects nothing, ever.
 struct NoFaces;
@@ -134,8 +139,9 @@ fn a_stranger_is_reported_as_a_track_with_a_direction_and_an_embedding() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 
     let obs = drain(&rx);
-    // Each frame: one `face` and one `face_embedding` (unknown person).
-    assert_eq!(obs.len(), 6, "{obs:#?}");
+    // Each frame: the four per-tick observations and one `face_embedding`
+    // (unknown person).
+    assert_eq!(obs.len(), 3 * (PER_TICK + 1), "{obs:#?}");
     let faces: Vec<&Observation> = obs.iter().filter(|o| o.modality == MODALITY_FACE).collect();
     let embs: Vec<&Observation> = obs
         .iter()
@@ -184,7 +190,15 @@ fn emission_is_rate_limited_per_track() {
         .unwrap_or_else(|e| panic!("spawn: {e}"));
     wait_finished(&handle);
     let obs = drain(&rx);
-    assert_eq!(obs.len(), 2, "{obs:#?}"); // one face + one embedding
+    assert_eq!(obs.len(), PER_TICK + 1, "{obs:#?}"); // one tick + one embedding
+    // The attention modalities share the face's cadence exactly.
+    for m in [
+        MODALITY_FACE_ATTENTION,
+        MODALITY_FACING,
+        MODALITY_LIP_MOTION,
+    ] {
+        assert_eq!(obs.iter().filter(|o| o.modality == m).count(), 1, "{m}");
+    }
     handle.stop();
 }
 
@@ -263,9 +277,127 @@ fn enrolling_a_track_turns_it_into_a_known_person() {
     let later = drain(&rx);
     assert!(!later.is_empty());
     assert!(
-        later.iter().all(|o| o.modality == MODALITY_FACE),
+        later.iter().all(|o| o.modality != MODALITY_FACE_EMBEDDING),
         "{later:#?}"
     );
+    // And the attention observations name the person too, same track.
+    assert!(
+        later
+            .iter()
+            .filter(|o| o.modality == MODALITY_FACING)
+            .all(|o| o.entity == Some(EntityHint::KnownOnTrack(EntityId::new("ana"), 1))),
+        "{later:#?}"
+    );
+    handle.stop();
+}
+
+/// One face whose landmarks change per frame: the nose is shifted by
+/// `yaw_px` toward the right eye and the mouth gap alternates by
+/// `+-mouth_px` every frame, so facing and lip motion can be driven from a
+/// test.
+struct TalkingFace {
+    yaw_px: f32,
+    mouth_px: f32,
+    calls: usize,
+}
+
+impl FaceDetector for TalkingFace {
+    fn detect(&mut self, _frame: &Rgb) -> Result<Vec<Detection>, Error> {
+        self.calls += 1;
+        let wobble = if self.calls % 2 == 0 {
+            self.mouth_px
+        } else {
+            -self.mouth_px
+        };
+        // Inter-ocular distance 100 px; frontal nose at x = 250.
+        Ok(vec![Detection {
+            bbox: [150.0, 150.0, 350.0, 400.0],
+            score: 0.9,
+            landmarks: [
+                [200.0, 200.0],
+                [300.0, 200.0],
+                [250.0 + self.yaw_px, 250.0],
+                [220.0, 310.0 + wobble],
+                [280.0, 310.0 + wobble],
+            ],
+        }])
+    }
+}
+
+fn attention_of(obs: &[Observation]) -> (Vec<f32>, Vec<f32>, Vec<FaceAttention>) {
+    let level = |m: &str| -> Vec<f32> {
+        obs.iter()
+            .filter(|o| o.modality == m)
+            .map(|o| match o.payload {
+                Payload::Level(v) => v,
+                ref p => panic!("{m}: unexpected payload {p:?}"),
+            })
+            .collect()
+    };
+    let opaque: Vec<FaceAttention> = obs
+        .iter()
+        .filter(|o| o.modality == MODALITY_FACE_ATTENTION)
+        .map(|o| match &o.payload {
+            Payload::Opaque(a) => *a
+                .downcast_ref::<FaceAttention>()
+                .unwrap_or_else(|| panic!("face_attention must carry a FaceAttention")),
+            p => panic!("unexpected payload {p:?}"),
+        })
+        .collect();
+    (level(MODALITY_FACING), level(MODALITY_LIP_MOTION), opaque)
+}
+
+#[test]
+fn a_frontal_talking_face_scores_facing_one_and_lips_high() {
+    let (tx, rx) = ObservationRing::bounded(256);
+    let clock = Arc::new(FakeClock::new());
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    let det = TalkingFace {
+        yaw_px: 0.0,
+        mouth_px: 10.0, // +-0.1 inter-ocular: variance 0.01, saturates
+        calls: 0,
+    };
+    let handle = VisionSense::spawn_with(config(12), clock, tx, gallery, parts(12, Box::new(det)))
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    let obs = drain(&rx);
+    let (facing, lips, opaque) = attention_of(&obs);
+    assert_eq!((facing.len(), lips.len(), opaque.len()), (12, 12, 12));
+    for o in obs.iter().filter(|o| o.modality != MODALITY_FACE_EMBEDDING) {
+        assert_eq!(o.source, "cam0");
+        assert_eq!(o.entity, Some(EntityHint::Track(1)));
+        assert!((o.confidence - 0.9).abs() < 1e-6);
+    }
+    assert!(facing.iter().all(|&f| (f - 1.0).abs() < 1e-6), "{facing:?}");
+    // Nothing until the window has enough samples, then saturated.
+    assert!(lips[0].abs() < 1e-6, "{lips:?}");
+    let last = lips[lips.len() - 1];
+    assert!(last > 0.9, "{lips:?}");
+    // The opaque payload agrees with the two levels, sample for sample.
+    for (i, a) in opaque.iter().enumerate() {
+        assert!((a.facing - facing[i]).abs() < 1e-6);
+        assert!((a.lips - lips[i]).abs() < 1e-6);
+    }
+    handle.stop();
+}
+
+#[test]
+fn a_turned_still_face_scores_facing_low_and_lips_zero() {
+    let (tx, rx) = ObservationRing::bounded(256);
+    let clock = Arc::new(FakeClock::new());
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    let det = TalkingFace {
+        yaw_px: 40.0, // 0.4 inter-ocular toward the right eye
+        mouth_px: 0.0,
+        calls: 0,
+    };
+    let handle = VisionSense::spawn_with(config(12), clock, tx, gallery, parts(12, Box::new(det)))
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    let (facing, lips, _) = attention_of(&drain(&rx));
+    assert_eq!(facing.len(), 12);
+    assert!(facing.iter().all(|&f| f < 0.4), "{facing:?}");
+    assert!(lips.iter().all(|&l| l.abs() < 1e-6), "{lips:?}");
     handle.stop();
 }
 

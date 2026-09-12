@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use common::EntityId;
 
+use crate::attention::AttentionState;
 use crate::scrfd::Detection;
 
 /// How many recent frames the identity vote considers. At the Python
@@ -84,6 +85,9 @@ pub struct Track {
     /// When this track last produced an observation; the pipeline uses it
     /// to rate-limit emission.
     pub last_emitted: Option<Instant>,
+    /// Rolling facing / lip-motion windows, fed from the landmarks of every
+    /// matched frame and cleared on a miss.
+    pub attention: AttentionState,
 }
 
 impl Track {
@@ -101,6 +105,7 @@ impl Track {
             person: None,
             confidence: 0.0,
             last_emitted: None,
+            attention: AttentionState::default(),
         }
     }
 
@@ -251,6 +256,7 @@ impl Tracker {
                 t.landmarks = det.landmarks;
                 t.age_frames += 1;
                 t.misses = 0;
+                t.attention.push(&det.landmarks);
             }
             out.push(Assignment {
                 track: id,
@@ -262,6 +268,10 @@ impl Tracker {
             let expired = match self.tracks.get_mut(&tid) {
                 Some(t) => {
                     t.misses += 1;
+                    // A face that left the shot must not keep scoring as
+                    // "talking" off frozen readings (Python cleared
+                    // `mouth_signal` here for the same reason).
+                    t.attention.clear();
                     t.misses > self.max_age_frames
                 }
                 None => false,

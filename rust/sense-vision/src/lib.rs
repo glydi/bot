@@ -3,7 +3,8 @@
 //!
 //! This crate is the proof of the architecture's modality-blindness: it
 //! emits `Observation { modality: "face", entity: KnownOnTrack | Track,
-//! payload: Direction }` and nothing in `mind` knows a camera exists.
+//! payload: Direction }` (plus `face_attention` / `facing` / `lip_motion`
+//! alongside it) and nothing in `mind` knows a camera exists.
 //!
 //! Ports `go/internal/vision/*` (detector, alignment, embedding, camera) and
 //! the tracking/voting half of `src/glydi_bot/identity/vision.py`.
@@ -13,6 +14,8 @@
 //! - [`image`], [`align`], [`scrfd`], [`arcface`]: pure image math and the
 //!   two ONNX models.
 //! - [`tracker`]: greedy `IoU` tracks with per-track identity votes.
+//! - [`attention`]: per-track facing and lip-motion scores from the same
+//!   five landmarks, so the mind can tell who is addressing the bot.
 //! - [`gallery`]: the [`FaceGallery`] trait and an in-memory one.
 //! - [`source`]: the [`FrameSource`] trait; `MockFrames` under `mock`.
 //! - `camera`: `AVFoundation` capture. The only `unsafe` in the crate.
@@ -22,6 +25,7 @@
 
 pub mod align;
 pub mod arcface;
+pub mod attention;
 #[cfg(target_os = "macos")]
 pub mod camera;
 pub mod gallery;
@@ -42,9 +46,13 @@ use crossbeam_channel::Sender;
 use smol_str::SmolStr;
 use tracing::{info, warn};
 
+pub use crate::attention::FaceAttention;
 pub use crate::gallery::{FaceGallery, InMemoryFaceGallery};
 pub use crate::image::Rgb;
-pub use crate::pipeline::{MODALITY_FACE, MODALITY_FACE_EMBEDDING, Parts, Stats};
+pub use crate::pipeline::{
+    MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_EMBEDDING, MODALITY_FACING,
+    MODALITY_LIP_MOTION, Parts, Stats,
+};
 pub use crate::scrfd::Detection;
 #[cfg(feature = "mock")]
 pub use crate::source::MockFrames;
