@@ -5,8 +5,54 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Feed frames from image files or a synthetic generator instead of the
+# camera, so CI can run the whole pipeline without hardware or models.
+mock = []
+
 [dependencies]
 common = { workspace = true }
+# Only for the one-per-process ONNX Runtime environment (`sense_audio::onnx`);
+# both senses must load the same dylib once, and duplicating the guard would
+# mean two `OnceLock`s that could disagree about which path won.
+sense-audio = { path = "../sense-audio" }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ort = { workspace = true }
+image = { workspace = true, features = ["jpeg"] }
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true, features = ["objc2-core-media"] }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+dispatch2 = { workspace = true }
+block2 = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+# The workspace forbids unsafe code; this crate needs one FFI module for the
+# camera (src/camera.rs), so it denies instead and that module allows.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
