@@ -24,7 +24,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{ChatBackend, ChatEvent, ChatRequest, LlmError, OpenAiBackend};
 use crate::condense::condense;
-use crate::prompt::{Conversation, LOCAL_SYSTEM_PROMPT, Message, ToolCall};
+use crate::prompt::{
+    Conversation, LOCAL_SYSTEM_PROMPT, Message, NOTE_ABSENT_PERSON, NOTE_ALREADY_GREETED,
+    NOTE_ONLY_NAME, NOTE_REACT_FIRST, NOTE_STRANGER_SPEAKING, ToolCall,
+};
 use crate::sentence::SentenceSplitter;
 use crate::tools::{FactSource, REMEMBER_NAME, Tools, full_tool_specs};
 
@@ -80,17 +83,42 @@ struct Intent {
 
 /// What the bot says to someone it does not know. Once per track (the
 /// planner guarantees that); the answer is handled by [`Session::pending_name`].
-pub const ASK_NAME_LINE: &str = "Hi! I don't think we've met. What's your name?";
+///
+/// No "Hi!" in front: qwen2.5:3b mirrors its own hello, and with the
+/// greeting in this line it answered "it's Mukesh actually" with "Hi
+/// Mukesh, nice to meet you" and no `remember_name` 3/4; without it, the
+/// call came 4/4 (`tests/conversation_quality.rs`).
+pub const ASK_NAME_LINE: &str = "I don't think we've met. What's your name?";
 
 /// How long after asking for a name the next utterance counts as the
 /// answer. Longer and an unrelated remark gets a name forced out of it.
 pub const NAME_ANSWER_WINDOW: Duration = Duration::from_secs(20);
 
+/// How long an `ignore_utterance` intent stays valid. The mind raises it
+/// synchronously with the utterance it forwards, so the two arrive within
+/// about a millisecond of each other; anything older is about a different
+/// utterance.
+pub const IGNORE_TTL: Duration = Duration::from_millis(1500);
+
+/// How long to wait for that intent when an utterance arrives and the
+/// intent channel is empty. The two travel on different channels, so the
+/// intent can land a hair after the utterance; one short wait keeps the
+/// pairing from depending on scheduling luck.
+pub const IGNORE_GRACE: Duration = Duration::from_millis(5);
+
 /// Prefixed to the utterance that answers the name question. A small
 /// model given only the transcript "Ada" replies "Hi Ada!" and never calls
 /// `remember_name`; told what the exchange is, it calls the tool 6/6.
+///
+/// The last sentence is for qwen2.5:3b, which otherwise greets first and
+/// never calls (0/4 without it, 4/4 with, `tests/conversation_quality.rs`).
 pub const NAME_ANSWER_HINT: &str = "[note] You just asked this person their name and this is their \
-answer. Call remember_name with the name they give, then greet them by it.";
+answer. Call remember_name with the name they give, then greet them by it. Reply with the \
+remember_name tool call only; you greet them after it returns.";
+
+/// How long after a planner greeting the room note still says so. Longer
+/// and "skip the hello" would be pinned to every turn of the conversation.
+pub const GREETED_RECENTLY: Duration = Duration::from_secs(120);
 
 /// Settings for the deliberate path.
 #[derive(Clone, Debug)]
@@ -170,6 +198,22 @@ pub struct Session {
     /// Who we asked for a name, and when; the next utterance within
     /// [`NAME_ANSWER_WINDOW`] is the answer.
     pending_name: Option<(Option<EntityId>, Instant)>,
+    /// Who the mind said not to answer, and when it said so. An entry is
+    /// good for [`IGNORE_TTL`]; see [`Session::run`].
+    ignore: HashMap<EntityId, Instant>,
+    /// The utterance being answered names someone who is not in the room,
+    /// so this turn's note carries [`NOTE_ABSENT_PERSON`]. Set per turn by
+    /// [`Session::handle_utterance`]. On every turn instead, the line's
+    /// "reply with the tool call only" turned an off-topic remark into a
+    /// spoken `Recall_person {"name": "Bob"}` 3 times in 6.
+    absent_hint: bool,
+    /// This turn is a lull (see [`Session::small_talk`]): nobody said
+    /// anything, so the note must not say "react to what they said".
+    lull: bool,
+    /// The utterance asks to be forgotten. "React to what they said
+    /// first" then reads as "say sorry instead of calling `forget_person`":
+    /// 15/20 calls with the line on such turns, 20/20 without.
+    memory_request: bool,
 }
 
 impl Session {
@@ -199,6 +243,10 @@ impl Session {
             prefetched: HashMap::new(),
             last_intent_say: HashMap::new(),
             pending_name: None,
+            ignore: HashMap::new(),
+            absent_hint: false,
+            lull: false,
+            memory_request: false,
         }
     }
 
@@ -219,6 +267,9 @@ impl Session {
     ///   planner already chose the words -- at most once per
     ///   [`INTENT_SAY_GAP`] per entity. What was said goes into the
     ///   history so the model knows it asked.
+    /// * `ignore_utterance`: the person who just spoke was not talking to
+    ///   us; the utterance arriving with it is kept as context but not
+    ///   answered (see [`Session::run`]).
     /// * `recall`: look the person up now and hold the facts for the next
     ///   prompt's room note.
     pub fn handle_intent(&mut self, cmd: &Command) {
@@ -294,6 +345,14 @@ impl Session {
                 if self.proactive(entity.clone(), "ask_name", ASK_NAME_LINE.to_owned()) {
                     self.pending_name = Some((entity, self.clock.now()));
                 }
+            }
+            "ignore_utterance" => {
+                let Some(id) = entity else {
+                    tracing::warn!("ignore_utterance intent without an entity");
+                    return;
+                };
+                tracing::info!(%id, "mind says: not addressed, do not answer");
+                self.ignore.insert(id, self.clock.now());
             }
             other => tracing::warn!(decision = other, "unknown intent decision"),
         }
@@ -382,7 +441,7 @@ impl Session {
         // A `recall` intent may have fetched this person's facts already;
         // use those rather than hit the store again on the turn's path.
         let prefetched = &self.prefetched;
-        let note = view.describe(&|id| {
+        let mut note = view.describe(&|id| {
             prefetched
                 .get(id)
                 .cloned()
@@ -396,6 +455,30 @@ impl Session {
                 .find(|p| &p.id == id)
                 .map_or_else(|| id.to_string(), mind::ViewEntity::label)
         });
+        // The turn's own hints, after the note proper (see the constants).
+        if !view.people.is_empty() {
+            let stranger_talking = speaker.is_none() && view.people.iter().any(|p| !p.is_known());
+            if stranger_talking {
+                note.push('\n');
+                note.push_str(NOTE_STRANGER_SPEAKING);
+            }
+            if self.absent_hint {
+                note.push('\n');
+                note.push_str(NOTE_ABSENT_PERSON);
+            }
+            if let (Some(id), Some(n)) = (speaker, name.as_deref()) {
+                let no_facts = prefetched
+                    .get(id)
+                    .map_or_else(|| facts.recall(id).is_empty(), Vec::is_empty);
+                if no_facts {
+                    note.push('\n');
+                    note.push_str(&NOTE_ONLY_NAME.replace("{name}", n));
+                } else if !self.lull && !self.memory_request {
+                    note.push('\n');
+                    note.push_str(&NOTE_REACT_FIRST.replace("{name}", n));
+                }
+            }
+        }
         (view, note, name)
     }
 
@@ -419,13 +502,34 @@ impl Session {
         let answering_name = self.pending_name.take().is_some_and(|(_, asked)| {
             started.saturating_duration_since(asked) < NAME_ANSWER_WINDOW
         });
-        if answering_name {
-            self.conversation
-                .push(Message::user(format!("{NAME_ANSWER_HINT}\n\n{text}")));
-        } else {
-            self.conversation.push(Message::user(text));
-        }
+        // A planner greeting a moment ago: the reminder goes after the
+        // words, where the model obeyed it 8/8 against 6/8 in the note.
+        let greeted_line = speaker.and_then(|id| {
+            let recent = self
+                .last_intent_say
+                .get(&(Some(id.clone()), "greet"))
+                .is_some_and(|t| started.saturating_duration_since(*t) < GREETED_RECENTLY);
+            recent.then(|| {
+                let view = (self.snapshot)();
+                let name = view
+                    .people
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map_or_else(|| id.to_string(), mind::ViewEntity::label);
+                NOTE_ALREADY_GREETED.replace("{name}", &name)
+            })
+        });
+        let content = match (answering_name, greeted_line) {
+            (true, _) => format!("{NAME_ANSWER_HINT}\n\n{text}"),
+            (false, Some(line)) => format!("{text}\n\n{line}"),
+            (false, None) => text.to_owned(),
+        };
+        self.conversation.push(Message::user(content));
+        self.absent_hint = names_someone_absent(text, &(self.snapshot)());
+        self.memory_request = asks_to_be_forgotten(text);
         let result = self.respond(speaker, obs, &cancel).await;
+        self.absent_hint = false;
+        self.memory_request = false;
         // Prefetched facts were for this prompt; the next turn reads the
         // store, which may have gained a `remember` since.
         self.prefetched.clear();
@@ -456,7 +560,10 @@ impl Session {
              Do not greet them again. One sentence."
         );
         tracing::info!(name, "small talk");
-        self.handle_utterance(&note, entity, obs, cancel).await
+        self.lull = true;
+        let result = self.handle_utterance(&note, entity, obs, cancel).await;
+        self.lull = false;
+        result
     }
 
     #[allow(clippy::too_many_lines)]
@@ -674,19 +781,7 @@ impl Session {
                     continue;
                 }
                 Some(cmd) = intents.recv() => {
-                    if let Some((entity, name)) = small_talk_target(&cmd) {
-                        let token = shutdown.child_token();
-                        *current.lock() = Some(token.clone());
-                        if let Err(e) = self
-                            .small_talk(entity.as_ref(), &name, &mut obs, token)
-                            .await
-                        {
-                            tracing::warn!(error = %e, "small talk failed");
-                        }
-                        *current.lock() = None;
-                    } else {
-                        self.handle_intent(&cmd);
-                    }
+                    self.on_intent(cmd, &mut obs, &shutdown, &current).await;
                     continue;
                 }
                 o = obs.recv() => match o {
@@ -707,6 +802,40 @@ impl Session {
                 .as_ref()
                 .and_then(common::EntityHint::known)
                 .cloned();
+            // The mind's verdict on this utterance travels on the intent
+            // channel, a hair behind it: read what is there before the
+            // turn starts, so an `ignore_utterance` for it is not found
+            // after the reply has been spoken.
+            loop {
+                let next = match intents.try_recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        tokio::time::timeout(IGNORE_GRACE, intents.recv())
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                };
+                let Some(cmd) = next else { break };
+                self.on_intent(cmd, &mut obs, &shutdown, &current).await;
+            }
+            let who = o.entity.as_ref().map(|h| match h.known() {
+                Some(id) => id.clone(),
+                None => EntityId::for_track(h.track().unwrap_or_default()),
+            });
+            if who.as_ref().is_some_and(|id| self.ignored(id)) {
+                // Not talking to us: no prompt, no speech, but the words
+                // stay in the transcript so the next turn has the context.
+                tracing::info!(text, "utterance not addressed to us: kept, not answered");
+                let (_, _, name) = self.room(speaker.as_ref());
+                let line = match name {
+                    Some(n) => format!("{n} says: {text}"),
+                    None => text.to_owned(),
+                };
+                self.conversation.push(Message::user(line));
+                continue;
+            }
             let token = shutdown.child_token();
             *current.lock() = Some(token.clone());
             match self
@@ -720,6 +849,84 @@ impl Session {
         }
         tracing::info!("deliberate loop exiting");
     }
+
+    /// One intent off the channel: a `small_talk` is a turn of its own,
+    /// everything else is [`Session::handle_intent`].
+    async fn on_intent(
+        &mut self,
+        cmd: Command,
+        obs: &mut mpsc::Receiver<Observation>,
+        shutdown: &CancellationToken,
+        current: &Arc<Mutex<Option<CancellationToken>>>,
+    ) {
+        if let Some((entity, name)) = small_talk_target(&cmd) {
+            let token = shutdown.child_token();
+            *current.lock() = Some(token.clone());
+            if let Err(e) = self.small_talk(entity.as_ref(), &name, obs, token).await {
+                tracing::warn!(error = %e, "small talk failed");
+            }
+            *current.lock() = None;
+        } else {
+            self.handle_intent(&cmd);
+        }
+    }
+
+    /// Whether the mind told us, within [`IGNORE_TTL`], not to answer
+    /// `id`. Consumes the entry: one intent covers one utterance. Stale
+    /// entries are dropped on the way past.
+    fn ignored(&mut self, id: &EntityId) -> bool {
+        let now = self.clock.now();
+        self.ignore
+            .retain(|_, at| now.saturating_duration_since(*at) < IGNORE_TTL);
+        self.ignore.remove(id).is_some()
+    }
+}
+
+/// Whether `text` brings up a person who is not in `view`: a capitalised
+/// word that does not start a sentence and is not a visible person's name
+/// ("who is Bob?", "is Ada coming?"), or a "who is" question. This is
+/// what earns the turn its [`NOTE_ABSENT_PERSON`] line. Words that start
+/// a sentence are skipped: "Ugh, the traffic" names nobody.
+fn names_someone_absent(text: &str, view: &WorldView) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("who is ") || lower.contains("who's ") {
+        return true;
+    }
+    let known: Vec<String> = view
+        .people
+        .iter()
+        .map(|p| p.label().to_lowercase())
+        .collect();
+    let mut sentence_start = true;
+    for raw in text.split_whitespace() {
+        let word = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+        let starts = sentence_start;
+        sentence_start = raw.ends_with(['.', '!', '?']);
+        let Some(first) = word.chars().next() else {
+            continue;
+        };
+        if starts || !first.is_uppercase() || word.len() < 2 {
+            continue;
+        }
+        // "I'm", "I'll" and the like are the speaker, not a name.
+        if word.starts_with("I'") || word == "OK" {
+            continue;
+        }
+        let base = word.split('\'').next().unwrap_or(word).to_lowercase();
+        if base == "glydi" || known.contains(&base) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Whether `text` asks to be forgotten or to have data deleted: the turn
+/// where `forget_person` must fire and nothing in the note should invite
+/// a sympathetic sentence instead.
+fn asks_to_be_forgotten(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("forget") || lower.contains("delete") || lower.contains("erase")
 }
 
 /// The `small_talk` intent from the mind's lull rule: who to talk to.
@@ -1759,5 +1966,131 @@ mod tests {
             .is_some()
         );
         assert!(small_talk_target(&intent(r#"{"decision":"greet","entity":"john"}"#)).is_none());
+    }
+
+    /// Drive [`Session::run`] with one utterance from John, optionally
+    /// paired with the mind's `ignore_utterance`, then a second utterance
+    /// so the request that follows shows what the history kept.
+    async fn run_with_optional_ignore(ignore: bool) -> Vec<ChatRequest> {
+        let r = rig(
+            vec![Script::text(&["Right."]), Script::text(&["Still here."])],
+            vec![person("john", true)],
+        );
+        let Rig {
+            session,
+            llm,
+            obs_tx,
+            obs_rx,
+            ..
+        } = r;
+        let (itx, irx) = mpsc::unbounded_channel::<Command>();
+        let shutdown = CancellationToken::new();
+        let current = Arc::new(Mutex::new(None));
+        let task = tokio::spawn(session.run(obs_rx, irx, shutdown.clone(), Arc::clone(&current)));
+        let john = || EntityHint::Known(EntityId::new("john"));
+        obs_tx
+            .send(
+                Observation::new("mic0", UTTERANCE, Instant::now())
+                    .with_entity(john())
+                    .with_payload(Payload::Text("ugh, the traffic this morning".into())),
+            )
+            .await
+            .unwrap();
+        if ignore {
+            itx.send(intent(
+                r#"{"decision":"ignore_utterance","entity":"john","reason":"not_addressed"}"#,
+            ))
+            .unwrap();
+        }
+        // An observation arriving mid-turn is dropped (see `respond`), so
+        // the second utterance waits for the first turn to end. When the
+        // first is ignored there is no turn, and the channel's single slot
+        // means this send completes once the loop has taken the first.
+        if !ignore {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while (llm.requests().is_empty() || current.lock().is_some())
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        obs_tx
+            .send(
+                Observation::new("mic0", UTTERANCE, Instant::now())
+                    .with_entity(john())
+                    .with_payload(Payload::Text("are you there?".into())),
+            )
+            .await
+            .unwrap();
+        // Let the second turn run to completion before stopping the loop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while llm.requests().len() < if ignore { 1 } else { 2 } && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+        llm.requests()
+    }
+
+    #[test]
+    fn absent_person_detection() {
+        let view = WorldView {
+            at: Instant::now(),
+            people: vec![person("john", true)],
+            bot_speaking: false,
+            working: mind::WorkingSnapshot::default(),
+        };
+        for yes in [
+            "who is Bob?",
+            "do you know Ada?",
+            "is Ada coming today?",
+            "Who's Bob",
+        ] {
+            assert!(names_someone_absent(yes, &view), "{yes}");
+        }
+        for no in [
+            "ugh, the traffic this morning was unbelievable",
+            "Ugh. The traffic was bad.",
+            "what do you remember about me?",
+            "I'm John, and I'll be back",
+            "hey john, is Glydi on?",
+            "OK then",
+        ] {
+            assert!(!names_someone_absent(no, &view), "{no}");
+        }
+        // Someone in the room is not absent.
+        assert!(!names_someone_absent("tell John I said hi", &view));
+    }
+
+    #[tokio::test]
+    async fn ignore_utterance_intent_keeps_the_words_but_skips_the_turn() {
+        let reqs = run_with_optional_ignore(true).await;
+        // One request: the second utterance. The first cost no prompt and
+        // no speech, but its text is in the history the second turn sent.
+        assert_eq!(reqs.len(), 1, "ignored utterance still reached the model");
+        let users: Vec<&str> = reqs[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(users.len(), 2, "{users:?}");
+        assert_eq!(users[0], "john says: ugh, the traffic this morning");
+        assert!(users[1].contains("are you there?"), "{}", users[1]);
+    }
+
+    #[tokio::test]
+    async fn utterance_without_ignore_intent_is_answered() {
+        let reqs = run_with_optional_ignore(false).await;
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("ugh, the traffic"),
+            "first turn was the first utterance"
+        );
     }
 }

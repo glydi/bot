@@ -136,9 +136,16 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             kind: "function",
             function: FunctionSpec {
                 name: RECALL_PERSON,
+                // The reference wording plus one sentence: qwen2.5:3b answered
+                // "who is Bob?" for an absent Bob with "I'm not sure" and no
+                // look-up 3/3 times; naming the question in the description
+                // is what makes it call first (conversation_quality.rs).
                 description: "Look up what you already know about someone by name. Use this when \
                               you recognise a person and want to pick the conversation back up, \
-                              or when someone asks what you remember about them.",
+                              or when someone asks what you remember about them. Always call it \
+                              when someone asks about a person who is not in the [room] note \
+                              (\"who is Bob?\", \"do you know Bob?\") -- before saying you do \
+                              not know them.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -180,10 +187,16 @@ pub fn memory_tool_specs() -> Vec<ToolSpec> {
             kind: "function",
             function: FunctionSpec {
                 name: REMEMBER_NAME,
+                // The reference wording plus the mid-sentence case: with only
+                // "as soon as someone tells you their name" qwen2.5:3b greeted
+                // "hey I'm Ada, is this on?" by name and never enrolled, 0/3
+                // (conversation_quality.rs).
                 description: "Attach a name to the person you are currently talking to, so you \
                               recognise their face and voice next time. Call this as soon as \
-                              someone tells you their name, but only if you do not already know \
-                              them.",
+                              someone tells you their name, even in passing (\"hey I'm Ada, is \
+                              this on?\", \"it's Mukesh actually\"), but only if you do not \
+                              already know them. Pass just the name (\"Ada\"), not the \
+                              sentence.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
