@@ -1,0 +1,14 @@
+[package]
+name = "glydi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+common = { workspace = true }
+mind = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
