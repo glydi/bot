@@ -25,6 +25,9 @@
 //!   the device), so a log can show *what* started playing when, and
 //!   `audio_level` (the RMS of each 20 ms block, timed to when that block
 //!   is heard, see [`LevelQueue`]) so the face's mouth follows the voice.
+//!   The same blocks, with the same timing, go into the far-end tap
+//!   ([`FarEnd`]) for the audio sense's echo canceller; a stop pushes a
+//!   cut so the canceller forgets what will never be heard.
 //!
 //! The first sentence of a reply is cut once more, at its first clause
 //! boundary (`sentence::first_clause`), so the backend starts on 4-8 words
@@ -50,7 +53,7 @@ use common::{Clock, Command, Observation, Payload, RingSender};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use smol_str::SmolStr;
 
-use crate::output::Output;
+use crate::output::{FarBlock, FarEnd, Output};
 use crate::sentence::{first_clause, sentences};
 use crate::synth::Synth;
 
@@ -174,6 +177,8 @@ pub(crate) struct Shared {
     pub self_speaking: Arc<AtomicBool>,
     /// Set by `SpeakerHandle::stop`; every thread exits.
     pub shutdown: AtomicBool,
+    /// What the play thread sends to the device, for echo cancellation.
+    pub far_end: FarEnd,
 }
 
 impl Shared {
@@ -183,6 +188,7 @@ impl Shared {
             inflight: AtomicUsize::new(0),
             self_speaking,
             shutdown: AtomicBool::new(false),
+            far_end: FarEnd::new(),
         }
     }
 
@@ -408,7 +414,8 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
     let mut last_audio = Instant::now();
     let mut seen_generation = shared.current();
     let mut levels = LevelQueue::new();
-    let rate = f64::from(output.sample_rate()).max(1.0);
+    let sample_rate = output.sample_rate();
+    let rate = f64::from(sample_rate).max(1.0);
 
     // Levels not yet due are dropped on a stop (their audio was), and the
     // last word is a zero *before* `self_speaking` goes false, so a face
@@ -440,6 +447,13 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
         if g != seen_generation {
             seen_generation = g;
             output.clear();
+            // The blocks already tapped were stamped for a future that
+            // has been discarded: tell the canceller.
+            shared.far_end.push(FarBlock {
+                at: Instant::now(),
+                rate: sample_rate,
+                samples: Vec::new(),
+            });
             set_speaking(&mut speaking, &mut levels, false);
         }
 
@@ -464,6 +478,19 @@ fn play_loop(output: &mut dyn Output, pcm: &Receiver<Pcm>, shared: &Shared, repo
                     let ahead = output.pending().saturating_sub(chunk.samples.len());
                     let lead = Duration::from_secs_f64(ahead as f64 / rate);
                     levels.push(&chunk.samples, lead, now);
+                    // The far-end tap: the same block, at the same
+                    // instant. (A null output has no queue, so there the
+                    // stamp is the write's end, 20 ms late; nothing hears
+                    // a null output.)
+                    shared.far_end.push(FarBlock {
+                        at: now + lead,
+                        rate: sample_rate,
+                        samples: chunk
+                            .samples
+                            .iter()
+                            .map(|&s| f32::from(s) / 32768.0)
+                            .collect(),
+                    });
                 }
                 if chunk.last {
                     shared.inflight.fetch_sub(1, Ordering::AcqRel);

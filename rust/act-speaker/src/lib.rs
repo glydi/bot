@@ -70,7 +70,7 @@ use crossbeam_channel::Receiver;
 use smol_str::SmolStr;
 
 pub use engine::{INFLIGHT_HOLD, SPEAKING_HOLD, SPOKE_CHARS, spoke_text};
-pub use output::{CpalOutput, NullOutput, Output, OutputError};
+pub use output::{CpalOutput, FarBlock, FarEnd, NullOutput, Output, OutputError};
 pub use sentence::{ends_sentence, first_clause, phrases, sentences};
 #[cfg(feature = "kokoro")]
 pub use synth::kokoro::{Kokoro, KokoroConfig};
@@ -250,6 +250,13 @@ impl SpeakerHandle {
     /// Whether audio is playing (or a reply is mid-synthesis).
     pub fn is_speaking(&self) -> bool {
         self.shared.self_speaking.load(Ordering::Acquire)
+    }
+
+    /// The far-end tap: every block the play thread sends to the device,
+    /// stamped with when it starts playing, for the audio sense's echo
+    /// canceller. Clone it and hand it over; see [`FarEnd`].
+    pub fn far_end(&self) -> FarEnd {
+        self.shared.far_end.clone()
     }
 
     /// Cancel everything and shut the threads down. Blocks until they have

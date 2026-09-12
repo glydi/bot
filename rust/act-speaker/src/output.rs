@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
@@ -294,5 +294,90 @@ impl Output for NullOutput {
 
     fn pending(&self) -> usize {
         0
+    }
+}
+
+/// Blocks the far-end ring holds: 64 x 20 ms = 1.28 s. The audio sense
+/// drains it every 32 ms while it has a source; if nobody is reading (no
+/// microphone yet) the oldest block is dropped for the newest, so a late
+/// reader sees the recent past rather than a stale start.
+pub const FAR_END_BLOCKS: usize = 64;
+
+/// One block of what the speaker is sending to the device, for the audio
+/// sense's echo canceller. `samples` empty means a *cut*: everything
+/// scheduled after `at` was discarded by a `stop`.
+#[derive(Clone, Debug)]
+pub struct FarBlock {
+    /// When the block's first sample starts playing: the write's return
+    /// plus whatever was queued ahead of it in the device ring (the same
+    /// arithmetic the `audio_level` observations use, see
+    /// `engine::LevelQueue`). Before the device's own output latency,
+    /// which the canceller measures together with the acoustic path.
+    pub at: Instant,
+    /// Sample rate of `samples` (the synth's, 24 kHz for both voices).
+    pub rate: u32,
+    /// Mono PCM in -1..1.
+    pub samples: Vec<f32>,
+}
+
+impl FarBlock {
+    /// `(at, rate, samples)`, for handing to a consumer with its own block
+    /// type without naming this one.
+    pub fn into_parts(self) -> (Instant, u32, Vec<f32>) {
+        (self.at, self.rate, self.samples)
+    }
+}
+
+/// The far-end tap: a lossy, lock-free ring of [`FarBlock`]s from the play
+/// thread to whoever cancels echo. Cloning shares the ring. `push` and
+/// `pull` never block -- playback must not wait on the reader, and the
+/// reader is on the mic pipeline's hot loop.
+#[derive(Clone)]
+pub struct FarEnd {
+    tx: Sender<FarBlock>,
+    rx: Receiver<FarBlock>,
+}
+
+impl Default for FarEnd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FarEnd {
+    /// An empty ring of [`FAR_END_BLOCKS`].
+    pub fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::bounded(FAR_END_BLOCKS);
+        Self { tx, rx }
+    }
+
+    /// Queue a block; the oldest is evicted if the ring is full.
+    pub fn push(&self, block: FarBlock) {
+        let mut block = block;
+        loop {
+            match self.tx.try_send(block) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(back)) => {
+                    // Newest wins, as the observation ring does.
+                    let _ = self.rx.try_recv();
+                    block = back;
+                }
+            }
+        }
+    }
+
+    /// The next block in playback order, if any.
+    pub fn pull(&self) -> Option<FarBlock> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Blocks waiting to be pulled.
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Whether nothing is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
     }
 }

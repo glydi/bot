@@ -28,6 +28,7 @@
 //! | `voice_identity` | `Embedding`, entity `Known(id)` if matched | per utterance >= 1 s |
 //! | `utterance`      | `Text`, entity from the latest voice match | per transcribed utterance |
 
+pub mod aec;
 pub mod features;
 pub mod fft;
 pub mod input;
@@ -185,6 +186,14 @@ pub struct AudioConfig {
     /// Run one inference on each model at startup so the first real
     /// utterance does not pay Metal/graph setup.
     pub warm_up: bool,
+    /// Acoustic echo cancellation while the bot speaks, so a person can
+    /// talk over it and be heard (see [`aec`]). Needs `far_end`; without
+    /// one the mic is muted during playback as before. The binary maps
+    /// `GLYDI_AEC=0` onto `false`.
+    pub aec: bool,
+    /// What the speaker is playing, stamped with when: the reference the
+    /// canceller subtracts. `None` means no cancellation (mute instead).
+    pub far_end: Option<Arc<dyn aec::FarEndSource>>,
 }
 
 impl std::fmt::Debug for AudioConfig {
@@ -206,6 +215,8 @@ impl std::fmt::Debug for AudioConfig {
             .field("speculate_after_frames", &self.speculate_after_frames)
             .field("gallery", &self.gallery.as_ref().map(|_| "custom"))
             .field("warm_up", &self.warm_up)
+            .field("aec", &self.aec)
+            .field("far_end", &self.far_end.as_ref().map(|_| "set"))
             .finish()
     }
 }
@@ -239,6 +250,8 @@ impl AudioConfig {
             speculate_after_frames: 1,
             gallery: None,
             warm_up: true,
+            aec: true,
+            far_end: None,
         }
     }
 
@@ -650,8 +663,20 @@ impl AudioSense {
             stop: Arc::clone(&stop),
         };
 
+        // The canceller only exists with a far end to subtract; the
+        // pipeline mutes as before without one, and says so once because
+        // a bot that cannot be interrupted looks like a mind bug.
+        let aec = match (&config.far_end, config.aec) {
+            (Some(far), true) => Some(aec::Aec::new(Arc::clone(far))),
+            (Some(_), false) => {
+                tracing::info!("aec disabled by config; mic muted while the bot speaks");
+                None
+            }
+            (None, _) => None,
+        };
         let pipeline = Pipeline {
             source,
+            aec,
             source_rx,
             listening,
             vad,

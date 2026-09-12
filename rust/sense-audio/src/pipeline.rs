@@ -73,6 +73,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 
+use crate::aec::Aec;
 use crate::input::{FrameSource, Pull};
 use crate::stt::Transcriber;
 use crate::turn::TurnJudge;
@@ -105,6 +106,15 @@ pub struct Stats {
     pub frames: AtomicU64,
     /// Frames skipped because the bot was speaking.
     pub muted_frames: AtomicU64,
+    /// Frames the VAD saw *while* the bot was speaking, through the echo
+    /// canceller (barge-in was possible on them).
+    pub aec_frames: AtomicU64,
+    /// The canceller's smoothed single-talk ERLE, in tenths of a dB,
+    /// floored at 0. The number that decides whether the mic is open
+    /// while the bot talks (`aec::UNMUTE_DB`).
+    pub aec_erle_db_x10: AtomicU64,
+    /// The locked speaker-to-mic delay in ms; 0 until measured.
+    pub aec_delay_ms: AtomicU64,
     /// Turns the analyzer deferred (held for more speech).
     pub deferrals: AtomicU64,
     /// Utterances handed to the worker.
@@ -268,6 +278,11 @@ pub(crate) struct Pipeline {
     pub source_rx: Receiver<Box<dyn FrameSource>>,
     /// Set once frames are being pulled; read by `SourceSlot`.
     pub listening: Arc<AtomicBool>,
+    /// The echo canceller, when a far end is configured. Every frame goes
+    /// through it (it is the identity while the speaker is silent, at one
+    /// 16 ms block of latency), so its ERLE is known before the mic is
+    /// unmuted during playback.
+    pub aec: Option<Aec>,
     pub vad: Box<dyn Detector>,
     pub gate: TurnGate,
     pub max_utterance_samples: usize,
@@ -374,15 +389,38 @@ impl Pipeline {
             }
 
             // While the bot is talking, its own voice is coming out of the
-            // speakers and straight back into the microphone. Without this
-            // the loop hears itself, decides someone is speaking, and
+            // speakers and straight back into the microphone. Without a
+            // guard the loop hears itself, decides someone is speaking, and
             // interrupts its own sentence -- the Python build did exactly
             // that, 13 interruptions and not one completed reply, until the
-            // mic was muted during playback. Proper echo cancellation would
-            // let this be removed; headphones sidestep it entirely.
-            if self.self_speaking.load(Ordering::Relaxed) {
-                self.stats.muted_frames.fetch_add(1, Ordering::Relaxed);
-                continue;
+            // mic was muted during playback. With a far end the canceller
+            // subtracts the bot's voice instead and the frame goes on to
+            // the VAD, so a person talking over the reply is heard; it
+            // reverts to muting whenever it cannot vouch for its output
+            // (no delay lock yet, ERLE under `aec::UNMUTE_DB`). Headphones
+            // sidestep all of it.
+            let bot_speaking = self.self_speaking.load(Ordering::Relaxed);
+            let audible = match self.aec.as_mut() {
+                Some(aec) => {
+                    let r = aec.process(&mut frame, Instant::now());
+                    self.stats
+                        .aec_erle_db_x10
+                        .store((r.erle_db.max(0.0) * 10.0) as u64, Ordering::Relaxed);
+                    if let Some(ms) = aec.delay_ms() {
+                        self.stats
+                            .aec_delay_ms
+                            .store(ms.max(0) as u64, Ordering::Relaxed);
+                    }
+                    r.audible
+                }
+                None => false,
+            };
+            if bot_speaking {
+                if !audible {
+                    self.stats.muted_frames.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                self.stats.aec_frames.fetch_add(1, Ordering::Relaxed);
             }
 
             let state = self.vad.push(&frame);

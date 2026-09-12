@@ -490,3 +490,84 @@ fn audio_level_follows_the_audio_at_syllable_rate_and_stops_with_it() {
     );
     handle.stop();
 }
+
+/// The far-end tap: every block written to the output is on the ring,
+/// as -1..1 floats at the synth's rate, stamped in playback order 20 ms
+/// apart, and a stop leaves a cut behind the blocks it discarded. The
+/// audio sense's echo canceller subtracts exactly this from the mic.
+#[test]
+fn far_end_tap_carries_every_block_and_a_cut_on_stop() {
+    let config = SpeakerConfig {
+        backend: Backend::Mock,
+        silent: true,
+        source: "speaker".into(),
+    };
+    let synth = MockSynth::with_tone(16_000);
+    let (cmd, rx) = crossbeam_channel::unbounded();
+    let (obs_tx, _obs) = ObservationRing::bounded(1024);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut handle = Speaker::spawn_with(
+        &config,
+        Box::new(synth),
+        Box::new(NullOutput::new(SAMPLE_RATE)),
+        rx,
+        obs_tx,
+        Arc::clone(&flag),
+        Arc::new(RealClock),
+    )
+    .unwrap_or_else(|e| panic!("spawn: {e}"));
+    let far = handle.far_end();
+    assert!(far.is_empty());
+
+    // 20 chars = 600 ms of tone = 30 blocks of 20 ms.
+    cmd.send(say(&"y".repeat(20))).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        flag.load(Ordering::Acquire)
+    });
+    wait_until("down", Duration::from_secs(5), || {
+        !flag.load(Ordering::Acquire)
+    });
+    let blocks: Vec<_> = std::iter::from_fn(|| far.pull()).collect();
+    eprintln!("{} blocks tapped", blocks.len());
+    assert!((28..=31).contains(&blocks.len()), "{} blocks", blocks.len());
+    let block_len = (SAMPLE_RATE as usize) * 20 / 1000;
+    for b in &blocks {
+        assert_eq!(b.rate, SAMPLE_RATE);
+        assert_eq!(b.samples.len(), block_len);
+        let peak = b.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 16_000.0 / 32768.0).abs() < 0.01, "peak {peak}");
+    }
+    for w in blocks.windows(2) {
+        let gap = w[1].at.duration_since(w[0].at);
+        assert!(
+            gap >= Duration::from_millis(15) && gap <= Duration::from_millis(60),
+            "{gap:?} between blocks"
+        );
+    }
+
+    // A long sentence stopped half-way: some blocks, then a cut.
+    cmd.send(say(&"y".repeat(100))).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        flag.load(Ordering::Acquire)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    cmd.send(Command::new("speaker", "stop", Priority::Reflex))
+        .ok();
+    wait_until("down", Duration::from_secs(2), || {
+        !flag.load(Ordering::Acquire)
+    });
+    let blocks: Vec<_> = std::iter::from_fn(|| far.pull()).collect();
+    let cut = blocks
+        .iter()
+        .position(|b| b.samples.is_empty())
+        .unwrap_or_else(|| panic!("no cut after a stop"));
+    assert!(
+        cut >= 5 && cut < blocks.len(),
+        "cut at {cut} of {}",
+        blocks.len()
+    );
+    assert!(blocks[..cut].iter().all(|b| !b.samples.is_empty()));
+    let (at, rate, samples) = blocks[0].clone().into_parts();
+    assert!(at <= blocks[cut].at && rate == SAMPLE_RATE && samples.len() == block_len);
+    handle.stop();
+}
