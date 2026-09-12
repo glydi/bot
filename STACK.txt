@@ -1,0 +1,146 @@
+GLYDI — TECHNICAL STACK
+=======================
+
+A voice bot that talks to people in a room, recognises them by face and
+voice, and remembers them between conversations.
+
+Repo: github.com/glydi/bot
+Platform: macOS (Apple Silicon)
+Builds: Python (shipping) and Go (parity except camera)
+
+
+PIPELINE
+--------
+
+  you stop talking
+    -> smart-turn v3        decides you are FINISHED, not merely paused
+    -> Whisper tiny.en      speech to text
+    -> qwen2.5 3B (Ollama)  decides what to say, calls memory tools
+    -> Kokoro af_bella      text to speech
+    -> speakers
+
+  in parallel, never blocking a turn:
+    camera -> SCRFD detect -> track -> ArcFace embed -> gallery match
+    mic    -> ECAPA embed  -> gallery match
+
+
+COMPONENTS
+----------
+
+  Turn detection   smart-turn v3 (ONNX, 8.7MB)          local
+  Speech to text   Whisper tiny.en                       local
+  Language model   qwen2.5:3b via Ollama (OpenAI API)    local
+  Text to speech   Kokoro af_bella (neural, 325MB)       local
+                   macOS AVSpeech via helper (fallback)  local
+  Face detection   InsightFace SCRFD-500M                local
+  Face embedding   MobileFaceNet, 512-d                  local
+  Voice embedding  ECAPA-TDNN -> ONNX, 192-d             local
+  Memory           SQLite + in-memory numpy matrix       local
+  Orchestration    Pipecat 1.8.1 (Py) / custom loop (Go)
+  Interface        Tk (Py) / Ebiten 60fps (Go)
+
+  Nothing leaves the machine. No API keys. Hosted brains (Claude,
+  Gemini, OpenAI) and hosted speech remain available as opt-ins.
+
+
+MEASURED PERFORMANCE
+--------------------
+
+  Whisper (Go, Metal)       79 ms      30x realtime
+  Whisper (Python)         235 ms
+  TTS macOS helper         5.6 ms      to first audio
+  TTS Kokoro              ~1.4x        the audio duration
+  Face detection          12.8 ms      per frame at 640x640
+  Face embedding           2.4 ms      CoreML
+  Voice embedding         41.7 ms
+  smart-turn              34.7 ms      per prediction
+  Local LLM first token   70-130 ms   qwen2.5:3b, warm, 8 GB M2
+  Gemini first token     ~1190 ms      free tier (opt-in)
+
+  Turn latency today: ~0.8-1.2 s fully local
+  With a paid fast model: ~600 ms
+
+
+GO / PYTHON PARITY (verified numerically, not assumed)
+------------------------------------------------------
+
+  Face embeddings     cosine 0.9985 - 0.9995, box error 0.196 px
+  Voice embeddings    cosine 0.999999999997
+  smart-turn          features bit-identical, 13/13 decisions agree
+  Gallery format      identical little-endian float32; one DB serves both
+
+
+DESIGN DECISIONS
+----------------
+
+1. Cascaded pipeline, not speech-to-speech.
+   A single audio-in/audio-out model is ~200ms faster but black-boxes the
+   audio. You cannot attach an identity to a speaker turn, which is the
+   entire product.
+
+2. Recognition never blocks a conversational turn.
+   The vision loop writes what it sees to a plain attribute; the prompt
+   builder reads it. State being 300ms stale is invisible. Making it
+   synchronous would add its full cost to every single turn.
+
+3. Open-set matching needs two gates, not one.
+   A similarity threshold AND a margin to the runner-up. A probe that
+   matches two people almost equally is ambiguous, not confident. Calling
+   someone by the wrong name is worse than admitting uncertainty.
+
+4. Recognise per track, never per frame.
+   Detect, track, accumulate embeddings, vote. One bad frame otherwise
+   flips the identity mid-sentence.
+
+5. Facts are extracted after the bot finishes speaking, not during.
+   Models will not interrupt a friendly exchange to file paperwork; the
+   remember_fact tool went unused for the whole build. Extraction now runs
+   on a background thread, off the critical path.
+
+6. Room state carries what it knows, not just who it sees.
+   Recognising someone and having nothing to say next is not memory.
+   On a small local model it is also what stops invented memories:
+   asked cold, qwen2.5:3b made up facts 6 times in 6; with the facts
+   in the note, recall is reading.
+
+
+CONFIGURATION
+-------------
+
+  (no credential required)
+  GLYDI_LLM               local | claude | gemini | openai
+  GLYDI_LOCAL_LLM_URL     http://localhost:11434/v1 (any OpenAI-compatible)
+  GLYDI_LOCAL_MODEL       qwen2.5:3b
+  GLYDI_TTS               kokoro | macos
+  GLYDI_KOKORO_VOICE      af_bella, bf_emma, am_michael, ...
+  GLYDI_WHISPER_MODEL     tiny.en | base.en | small.en
+  GLYDI_FACE_THRESHOLD    0.36    match floor
+  GLYDI_FACE_MARGIN       0.06    required gap to runner-up
+  GLYDI_MAX_TOKENS        60      spoken replies should be short
+  GLYDI_IDENTITY          0 to run conversation-only
+
+
+KNOWN GAPS
+----------
+
+  - Go build has no camera wired in. SCRFD decode and AVFoundation
+    capture are both written and verified, just not connected.
+  - No anti-spoofing. A photo on a phone would fool it.
+  - Thresholds are defaults, tuned on nobody in particular.
+  - Single camera, single room. Not load tested.
+  - Kokoro is slower than realtime; gentle voice or fast voice, not both.
+
+
+PRIVACY
+-------
+
+  Face and voice embeddings are biometric data under GDPR Art. 9,
+  Illinois BIPA and Texas CUBI. The bot has a forget_person tool and
+  PersonStore.forget() deletes the person and every embedding.
+
+  EnrolNameOnly() exists for deployments where storing biometrics is not
+  appropriate: the bot still learns and uses names, and simply cannot
+  recognise anyone on sight.
+
+  Face recognition of minors is restricted or banned outright in several
+  jurisdictions. This repo does not make anyone compliant.
