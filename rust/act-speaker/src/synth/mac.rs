@@ -335,4 +335,15 @@ impl Synth for MacSpeech {
             }
         }
     }
+
+    /// One short utterance, discarded. The helper already loaded the voice
+    /// before `RDY`, so what is left is small: the first `SAY` after open
+    /// measured 7.5 ms to first audio against 5-6 ms steady state
+    /// (`tests/synth_timing.rs`), the first pass through the frame path
+    /// and `AVAudioConverter` on both sides of the pipe. Cheap enough to
+    /// take for the couple of milliseconds.
+    fn warm_up(&mut self) -> Result<(), SynthError> {
+        let mut discard = |_: &[i16]| true;
+        self.synthesize("Ready.", &mut discard)
+    }
 }

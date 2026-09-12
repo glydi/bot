@@ -1,5 +1,6 @@
 //! Behavioural tests on the mock synth + null output: ordering, cancellation
-//! latency, backchannel policy, and the `self_speaking` protocol.
+//! latency, backchannel policy, the `self_speaking` protocol, the
+//! clause-level first chunk, and the synth/play pipeline timing.
 
 #![cfg(feature = "mock")]
 
@@ -288,5 +289,123 @@ fn stop_emits_self_speaking_false_promptly() {
         || speaking_obs(&r.obs).contains(&false),
     );
     assert!(took < Duration::from_millis(100), "stop took {took:?}");
+    r.handle.stop();
+}
+
+/// Twelve words with a comma after six: the shape the first-chunk cut is
+/// for. Under the mock (30 ms/char) the head is ~1 s of audio.
+const CLAUSED: &str = "I think the weather looks bright, so we should walk to town.";
+const HEAD: &str = "I think the weather looks bright,";
+const REST: &str = "so we should walk to town.";
+
+#[test]
+fn first_sentence_of_a_reply_is_cut_at_its_first_clause() {
+    let mut r = rig();
+    // Two `say`s back to back: the first opens the reply and is cut; the
+    // second arrives while the first is in flight and is spoken whole,
+    // even though it has the same shape.
+    r.cmd.send(say(CLAUSED)).ok();
+    r.cmd.send(say(CLAUSED)).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        r.flag.load(Ordering::Acquire)
+    });
+    wait_until("down", Duration::from_secs(10), || {
+        !r.flag.load(Ordering::Acquire)
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    // Order is kept: head, its rest, then the next sentence.
+    assert_eq!(r.synth.spoken(), [HEAD, REST, CLAUSED]);
+    let got = trace(&r.obs);
+    // One latency figure per reply, for the head, before anything plays.
+    assert_eq!(got.iter().filter(|l| *l == "speaker_latency").count(), 1);
+    assert_eq!(got[0], "speaker_latency");
+    let rest: Vec<&str> = got[1..].iter().map(String::as_str).collect();
+    let truncated: String = CLAUSED.chars().take(act_speaker::SPOKE_CHARS).collect();
+    assert_eq!(
+        rest,
+        [
+            "self_speaking:true".to_owned(),
+            format!("spoke:{HEAD}"),
+            format!("spoke:{REST}"),
+            format!("spoke:{truncated}"),
+            "self_speaking:false".to_owned(),
+        ]
+    );
+    r.handle.stop();
+}
+
+#[test]
+fn short_first_sentence_is_spoken_whole() {
+    let mut r = rig();
+    r.cmd.send(say("Hi Karyan, nice to see you.")).ok();
+    wait_until("spoken", Duration::from_secs(2), || {
+        !r.synth.spoken().is_empty()
+    });
+    assert_eq!(r.synth.spoken(), ["Hi Karyan, nice to see you."]);
+    r.handle.stop();
+}
+
+#[test]
+fn next_chunk_is_synthesised_while_the_first_plays() {
+    let mut r = rig();
+    // Head: 33 chars = 990 ms of audio. If the engine serialised synth
+    // behind playback, the rest would not be synthesised until the head
+    // had drained; pipelined, the mock (instant) synthesises it within
+    // milliseconds of the head, while the head is still playing.
+    r.cmd.send(say(CLAUSED)).ok();
+    wait_until("both synthesised", Duration::from_secs(2), || {
+        r.synth.spoken().len() == 2
+    });
+    let tl = r.synth.timeline();
+    let gap = tl[1].started.duration_since(tl[0].first_audio);
+    let head_audio = Duration::from_millis(HEAD.chars().count() as u64 * MS_PER_CHAR);
+    assert!(
+        gap < head_audio / 4,
+        "rest started {gap:?} after the head's first audio; head plays for {head_audio:?}"
+    );
+    // ...and the head really is still playing at that point.
+    assert!(
+        r.flag.load(Ordering::Acquire),
+        "head should still be playing"
+    );
+    r.handle.stop();
+}
+
+#[test]
+fn first_chunk_reaches_the_output_within_20ms() {
+    let mut r = rig();
+    r.cmd.send(say("Hello there, this is a test.")).ok();
+    // The flag flips on the play thread right before the first write to
+    // the device, so flag-up minus the synth's first delivery is the
+    // synth -> play handoff (a channel send and a thread wake-up).
+    wait_until("up", Duration::from_secs(2), || {
+        r.flag.load(Ordering::Acquire)
+    });
+    let up = Instant::now();
+    let tl = r.synth.timeline();
+    let handoff = up.duration_since(tl[0].first_audio);
+    assert!(
+        handoff <= Duration::from_millis(20),
+        "handoff took {handoff:?}"
+    );
+    r.handle.stop();
+}
+
+#[test]
+fn stop_during_a_split_reply_discards_the_rest() {
+    let mut r = rig();
+    r.cmd.send(say(CLAUSED)).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        r.flag.load(Ordering::Acquire)
+    });
+    r.cmd
+        .send(Command::new("speaker", "stop", Priority::Reflex))
+        .ok();
+    let took = wait_until("down", Duration::from_secs(1), || {
+        !r.flag.load(Ordering::Acquire)
+    });
+    assert!(took <= Duration::from_millis(20), "stop took {took:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!r.flag.load(Ordering::Acquire), "the rest must not play");
     r.handle.stop();
 }

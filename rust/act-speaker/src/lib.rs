@@ -5,6 +5,11 @@
 //! * `say` (`Payload::Text`): queued, split into sentences, spoken in order.
 //!   Sentence N+1 is synthesised while N plays (`kokoro_tts.py`: "the first
 //!   sentence starts playing while the second is still being synthesised").
+//!   The first sentence of a reply is cut once more at its first clause
+//!   boundary ([`sentence::first_clause`]) so the backend starts on 4-8
+//!   words: with Kokoro that is ~0.8 s to first audio instead of 1.1-1.3 s
+//!   for a twelve-word sentence (`tests/synth_timing.rs`); ttsd streams
+//!   and is ~5 ms either way.
 //! * `backchannel` (`Payload::Text`): a short "mm-hm". Played at once if the
 //!   speaker is idle, dropped otherwise -- it must never wait behind a
 //!   queued reply.
@@ -14,12 +19,18 @@
 //! Reports back through observations from source `"speaker"`:
 //! `self_speaking` (`Payload::Bool`) on the start and end of playback,
 //! `audio_level` (`Payload::Level`, RMS 0..1, ~10 Hz) while speaking,
-//! `spoke` (`Payload::Text`, the first 40 chars) as each sentence starts
-//! playing, and `speaker_latency` (`Payload::Level`, milliseconds) once
-//! per reply: the synth time of its first sentence. The
-//! same start/stop is mirrored in a shared `AtomicBool` the audio sense
-//! reads on its callback to mute the mic, since an observation round trip
-//! is too slow for that.
+//! `spoke` (`Payload::Text`, the first 40 chars) as each chunk (a sentence,
+//! or the opening clause of the first one) starts playing, and
+//! `speaker_latency` (`Payload::Level`, milliseconds) once per reply: the
+//! backend's time to first audio for the reply's first chunk, sent as
+//! that audio appears and so always before the `self_speaking` it
+//! explains. The same
+//! start/stop is mirrored in a shared `AtomicBool` the audio sense reads on
+//! its callback to mute the mic, since an observation round trip is too
+//! slow for that.
+//!
+//! Every backend is warmed once on the synth thread at spawn
+//! ([`Synth::warm_up`]), so the first reply pays no model first-call cost.
 //!
 //! # Which voice
 //!
@@ -58,7 +69,7 @@ use smol_str::SmolStr;
 
 pub use engine::{INFLIGHT_HOLD, SPEAKING_HOLD, SPOKE_CHARS, spoke_text};
 pub use output::{CpalOutput, NullOutput, Output, OutputError};
-pub use sentence::{ends_sentence, phrases, sentences};
+pub use sentence::{ends_sentence, first_clause, phrases, sentences};
 #[cfg(feature = "kokoro")]
 pub use synth::kokoro::{Kokoro, KokoroConfig};
 pub use synth::mac::{MacConfig, MacSpeech};

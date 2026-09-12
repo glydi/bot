@@ -49,4 +49,16 @@ pub trait Synth: Send {
         text: &str,
         sink: &mut dyn FnMut(&[i16]) -> bool,
     ) -> Result<(), SynthError>;
+
+    /// Pay any first-call cost now, with nothing listening, so the first
+    /// real utterance does not. The engine calls this once on the synth
+    /// thread as soon as it starts, before any job; a backend with no such
+    /// cost keeps the default no-op. Measured in `tests/synth_timing.rs`:
+    /// the first `SAY` through ttsd is 2-4 ms slower than steady state
+    /// (its voice load already happens before `RDY`); Kokoro's first call
+    /// after `open` is within noise of steady state, and its warm-up is
+    /// kept as a cheap proof that the model runs.
+    fn warm_up(&mut self) -> Result<(), SynthError> {
+        Ok(())
+    }
 }

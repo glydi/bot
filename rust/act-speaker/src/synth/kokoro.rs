@@ -52,6 +52,12 @@ pub struct KokoroConfig {
     pub ort_dylib: Option<PathBuf>,
     /// espeak-ng library/data.
     pub espeak: EspeakPaths,
+    /// Run the throwaway inference inside `open` (the default), so a model
+    /// that loads but cannot run fails there and the caller can fall back
+    /// to another voice. `false` leaves that to [`Synth::warm_up`] on the
+    /// engine's synth thread; `tests/synth_timing.rs` uses it to measure
+    /// the cold penalty.
+    pub warm_in_open: bool,
 }
 
 impl Default for KokoroConfig {
@@ -62,6 +68,7 @@ impl Default for KokoroConfig {
             speed: 1.0,
             ort_dylib: None,
             espeak: EspeakPaths::default(),
+            warm_in_open: true,
         }
     }
 }
@@ -75,12 +82,23 @@ pub struct Kokoro {
     style: Vec<f32>,
     style_rows: usize,
     speed: f32,
+    /// A real-sized inference has run; `warm_up` is then a no-op.
+    warm: bool,
 }
 
+/// What `warm_up` runs. Short on purpose: measured (`tests/synth_timing.rs`,
+/// onnxruntime 1.29) the first real call after `open` is within the
+/// run-to-run noise of steady state whatever was synthesised first -- the
+/// graph is built in `commit_from_file`, not lazily -- so a longer input
+/// would only delay spawn. One word costs ~440 ms and proves the model
+/// runs.
+const WARM_UP_TEXT: &str = "Ready.";
+
 impl Kokoro {
-    /// Load the model, the voice, and espeak. Runs one throwaway synthesis:
-    /// the first real call otherwise pays for graph setup on top of its own
-    /// inference (`KokoroTTS._load`).
+    /// Load the model, the voice, and espeak, and (unless
+    /// `warm_in_open` is off) run one throwaway synthesis: the first real
+    /// call otherwise pays for graph setup on top of its own inference
+    /// (`KokoroTTS._load`), and a model that cannot run should fail here.
     pub fn open(cfg: &KokoroConfig) -> Result<Self, SynthError> {
         let dir = cfg.model_dir.clone().unwrap_or_else(default_model_dir);
         let model = dir.join("kokoro-v1.0.onnx");
@@ -130,9 +148,11 @@ impl Kokoro {
             style,
             style_rows,
             speed: cfg.speed.clamp(0.5, 2.0),
+            warm: false,
         };
-        let mut sink = |_: &[i16]| true;
-        me.synthesize("ready", &mut sink)?;
+        if cfg.warm_in_open {
+            me.warm_up()?;
+        }
         Ok(me)
     }
 
@@ -236,6 +256,18 @@ impl Synth for Kokoro {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    fn warm_up(&mut self) -> Result<(), SynthError> {
+        if self.warm {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let mut discard = |_: &[i16]| true;
+        self.synthesize(WARM_UP_TEXT, &mut discard)?;
+        self.warm = true;
+        tracing::debug!(ms = started.elapsed().as_millis(), "kokoro warm-up");
         Ok(())
     }
 }

@@ -2,6 +2,7 @@
 //! in real-time-sized chunks with a cancel check between them.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -17,10 +18,23 @@ pub const MS_PER_CHAR: u64 = 30;
 pub const CHUNK_MS: u64 = 20;
 
 /// Silence synth. Records every text it was asked to speak, in order, so a
-/// test can assert on ordering and on what never reached synthesis.
+/// test can assert on ordering and on what never reached synthesis, and
+/// when each synthesis started and first delivered audio, so a test can
+/// check the synth/play overlap and the synth-to-device handoff.
 #[derive(Clone, Default)]
 pub struct MockSynth {
-    spoken: Arc<Mutex<Vec<String>>>,
+    spoken: Arc<Mutex<Vec<Spoken>>>,
+}
+
+/// One synthesis the mock ran.
+#[derive(Clone, Debug)]
+pub struct Spoken {
+    /// The text.
+    pub text: String,
+    /// When `synthesize` was entered.
+    pub started: Instant,
+    /// When the first non-empty chunk was handed to the sink.
+    pub first_audio: Instant,
 }
 
 impl MockSynth {
@@ -31,6 +45,11 @@ impl MockSynth {
 
     /// Everything synthesised so far, oldest first.
     pub fn spoken(&self) -> Vec<String> {
+        self.spoken.lock().iter().map(|s| s.text.clone()).collect()
+    }
+
+    /// The same, with timestamps.
+    pub fn timeline(&self) -> Vec<Spoken> {
         self.spoken.lock().clone()
     }
 
@@ -55,17 +74,24 @@ impl Synth for MockSynth {
         text: &str,
         sink: &mut dyn FnMut(&[i16]) -> bool,
     ) -> Result<(), SynthError> {
-        self.spoken.lock().push(text.to_owned());
+        let started = Instant::now();
         let chunk = (CHUNK_MS * u64::from(SAMPLE_RATE) / 1000) as usize;
         let zeros = vec![0i16; chunk];
         let mut left = Self::samples_for(text);
+        let mut first_audio = None;
         while left > 0 {
             let n = left.min(chunk);
+            first_audio.get_or_insert_with(Instant::now);
             if !sink(&zeros[..n]) {
-                return Ok(());
+                break;
             }
             left -= n;
         }
+        self.spoken.lock().push(Spoken {
+            text: text.to_owned(),
+            started,
+            first_audio: first_audio.unwrap_or(started),
+        });
         Ok(())
     }
 }
