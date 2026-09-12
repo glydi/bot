@@ -35,11 +35,14 @@ pub mod tools;
 
 pub use backend::{ChatBackend, ChatEvent, ChatRequest, EventStream, LlmError, OpenAiBackend};
 pub use deliberator::{
-    Config, Deliberator, DeliberatorHandle, MAX_TOOL_ROUNDS, Session, Snapshot, TurnEnd,
+    Config, Deliberator, DeliberatorHandle, INTENT_KIND, INTENT_SAY_GAP, INTENT_TARGET,
+    MAX_TOOL_ROUNDS, SET_NAME_KIND, SET_NAME_TARGET, Session, Snapshot, TurnEnd,
 };
 pub use prompt::{
     Conversation, EARLIER, LOCAL_SYSTEM_PROMPT, MARKER, MAX_HISTORY, Message, Role, SYSTEM_PROMPT,
     TRIM_SLACK, ToolCall,
 };
 pub use sentence::{SentenceSplitter, ends_sentence};
-pub use tools::{FactSource, InMemoryFacts, ToolSpec, Tools, tool_specs};
+pub use tools::{
+    FactSource, InMemoryFacts, ToolSpec, Tools, full_tool_specs, memory_tool_specs, tool_specs,
+};

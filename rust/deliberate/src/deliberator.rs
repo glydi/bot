@@ -7,15 +7,18 @@
 //! miss mid-turn is "someone started talking", which is exactly the one the
 //! sense keeps repeating.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Clock, Command, CommandQueue, EntityId, Observation, Payload, Priority};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use futures_util::StreamExt;
 use mind::WorldView;
 use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -23,7 +26,7 @@ use crate::backend::{ChatBackend, ChatEvent, ChatRequest, LlmError, OpenAiBacken
 use crate::condense::condense;
 use crate::prompt::{Conversation, LOCAL_SYSTEM_PROMPT, Message, ToolCall};
 use crate::sentence::SentenceSplitter;
-use crate::tools::{FactSource, Tools, tool_specs};
+use crate::tools::{FactSource, REMEMBER_NAME, Tools, full_tool_specs};
 
 /// Modality of a transcribed utterance.
 pub const UTTERANCE: &str = "utterance";
@@ -33,6 +36,38 @@ pub const VOICE_ACTIVITY: &str = "voice_activity";
 /// Bounds the tool-call loop. Without it a model that keeps calling tools
 /// can spin forever while the person waits in silence.
 pub const MAX_TOOL_ROUNDS: usize = 3;
+
+/// Command target the router delivers to us (the planner's intents).
+pub const INTENT_TARGET: &str = "deliberate";
+/// Command kind of a planner intent; the payload is the JSON documented in
+/// `mind::plan`.
+pub const INTENT_KIND: &str = "intent";
+
+/// Target of the command we emit after a successful `remember_name`, so
+/// the binary can fold a `name_binding` observation into the world.
+pub const SET_NAME_TARGET: &str = "mind";
+/// Kind of that command. Payload: `{"entity": id, "name": name, "track": n?}`.
+pub const SET_NAME_KIND: &str = "set_name";
+
+/// Minimum gap between two spoken intents (`ask`/`say`) about the same
+/// person. The planner re-decides on every tick and will repeat itself
+/// until the world changes; ten seconds is long enough for the person to
+/// answer and short enough that a missed question comes round again.
+pub const INTENT_SAY_GAP: Duration = Duration::from_secs(10);
+
+/// A planner intent, parsed. The shape is fixed by `mind::plan`; every
+/// field but `decision` is optional so an unknown decision still parses
+/// and can be logged rather than dropped silently.
+#[derive(Debug, Deserialize)]
+struct Intent {
+    decision: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    goal: Option<String>,
+}
 
 /// Settings for the deliberate path.
 #[derive(Clone, Debug)]
@@ -104,6 +139,11 @@ pub struct Session {
     max_tool_rounds: usize,
     condense_tx: mpsc::UnboundedSender<CondenseOutcome>,
     condense_rx: mpsc::UnboundedReceiver<CondenseOutcome>,
+    /// Facts fetched on a `recall` intent, held for the next turn's room
+    /// note so the note is built without touching the store mid-turn.
+    prefetched: HashMap<EntityId, Vec<String>>,
+    /// When we last spoke an intent, per entity (`None` = no entity).
+    last_intent_say: HashMap<Option<EntityId>, Instant>,
 }
 
 impl Session {
@@ -130,12 +170,116 @@ impl Session {
             max_tool_rounds: config.max_tool_rounds,
             condense_tx,
             condense_rx,
+            prefetched: HashMap::new(),
+            last_intent_say: HashMap::new(),
         }
     }
 
     /// The conversation so far.
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
+    }
+
+    /// Facts held from a `recall` intent for the next prompt.
+    pub fn prefetched(&self, entity: &EntityId) -> Option<&[String]> {
+        self.prefetched.get(entity).map(Vec::as_slice)
+    }
+
+    /// Act on a command routed to us. Only [`INTENT_KIND`] is understood;
+    /// anything else is a wiring mistake and is logged, not acted on.
+    ///
+    /// * `ask` / `say` with text: spoken as is, no model round trip -- the
+    ///   planner already chose the words -- at most once per
+    ///   [`INTENT_SAY_GAP`] per entity. What was said goes into the
+    ///   history so the model knows it asked.
+    /// * `recall`: look the person up now and hold the facts for the next
+    ///   prompt's room note.
+    pub fn handle_intent(&mut self, cmd: &Command) {
+        if cmd.kind != INTENT_KIND {
+            tracing::warn!(kind = %cmd.kind, "unknown command kind for deliberate");
+            return;
+        }
+        let Some(text) = cmd.payload.as_text() else {
+            tracing::warn!("intent without a text payload");
+            return;
+        };
+        let intent: Intent = match serde_json::from_str(text) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %e, text, "unparseable intent");
+                return;
+            }
+        };
+        let entity = intent.entity.as_deref().map(EntityId::new);
+        match intent.decision.as_str() {
+            "ask" | "say" => {
+                let Some(line) = intent.text.filter(|t| !t.trim().is_empty()) else {
+                    tracing::warn!(decision = intent.decision, "intent without text");
+                    return;
+                };
+                let now = self.clock.now();
+                let recently = self
+                    .last_intent_say
+                    .get(&entity)
+                    .is_some_and(|t| now.saturating_duration_since(*t) < INTENT_SAY_GAP);
+                if recently {
+                    tracing::debug!(?entity, "intent suppressed: spoke to them recently");
+                    return;
+                }
+                self.last_intent_say.insert(entity, now);
+                tracing::info!(decision = intent.decision, goal = ?intent.goal, line, "intent");
+                self.conversation.push(Message::assistant(&line));
+                self.say(line);
+            }
+            "recall" => {
+                let Some(id) = entity else {
+                    tracing::warn!("recall intent without an entity");
+                    return;
+                };
+                let facts = self.facts.recall(&id);
+                tracing::info!(%id, n = facts.len(), "prefetched for the next prompt");
+                self.prefetched.insert(id, facts);
+            }
+            other => tracing::warn!(decision = other, "unknown intent decision"),
+        }
+    }
+
+    /// After a tool ran: a successful `remember_name` has attached a name
+    /// to an entity, and the world needs to hear about it. The track is
+    /// the speaker's, when the speaker was still a stranger, so the mind
+    /// can merge that track into the named id.
+    fn after_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        out: &serde_json::Value,
+        view: &WorldView,
+    ) {
+        if name != REMEMBER_NAME {
+            return;
+        }
+        let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let display = out
+            .get("remembered")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| args.get("name").and_then(serde_json::Value::as_str))
+            .unwrap_or(entity);
+        let track = view
+            .speaker()
+            .map(|p| &p.id)
+            .filter(|id| id.is_track())
+            .and_then(|id| id.as_str().strip_prefix("track:"))
+            .and_then(|n| n.parse::<u32>().ok());
+        let mut payload = json!({"entity": entity, "name": display});
+        if let Some(t) = track {
+            payload["track"] = json!(t);
+        }
+        self.commands.push(
+            Command::new(SET_NAME_TARGET, SET_NAME_KIND, Priority::Deliberate)
+                .with_payload(Payload::Text(payload.to_string())),
+        );
     }
 
     fn ui(&self, kind: &'static str) {
@@ -155,7 +299,15 @@ impl Session {
     fn room(&self, speaker: Option<&EntityId>) -> (Arc<WorldView>, String, Option<String>) {
         let view = (self.snapshot)();
         let facts = Arc::clone(&self.facts);
-        let note = view.describe(&|id| facts.recall(id));
+        // A `recall` intent may have fetched this person's facts already;
+        // use those rather than hit the store again on the turn's path.
+        let prefetched = &self.prefetched;
+        let note = view.describe(&|id| {
+            prefetched
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| facts.recall(id))
+        });
         // Who the senses say is talking beats who the camera saw talking:
         // voice identity is attached to the utterance itself.
         let name = speaker.map(|id| {
@@ -184,6 +336,9 @@ impl Session {
         self.ui("thinking");
         self.conversation.push(Message::user(text));
         let result = self.respond(speaker, obs, &cancel).await;
+        // Prefetched facts were for this prompt; the next turn reads the
+        // store, which may have gained a `remember` since.
+        self.prefetched.clear();
         self.ui("idle");
         tracing::info!(
             ms = self.clock.now().saturating_duration_since(started).as_millis(),
@@ -208,7 +363,9 @@ impl Session {
 
             let mut stream = self.backend.chat(ChatRequest {
                 messages,
-                tools: tool_specs(),
+                // The whole surface the local prompt names, so the model can
+                // enrol a stranger (`remember_name`) and not just note facts.
+                tools: full_tool_specs(),
                 max_tokens: self.max_tokens,
                 temperature: self.temperature,
                 json_object: false,
@@ -298,6 +455,7 @@ impl Session {
                         serde_json::from_str(&c.arguments).unwrap_or_default();
                     let out = self.tools.invoke(&c.name, &args, &view);
                     tracing::info!(tool = c.name, %args, %out, "tool");
+                    self.after_tool(&c.name, &args, &out, &view);
                     Message::tool_result(c.id.clone(), out.to_string())
                 })
                 .collect();
@@ -362,12 +520,19 @@ impl Session {
         }
     }
 
-    /// The main loop: wait for utterances, answer them, apply condense
-    /// results, until `shutdown` fires. `current` publishes the token of
-    /// the turn in flight so the handle can cancel it.
+    /// The main loop: wait for utterances, answer them, act on intents,
+    /// apply condense results, until `shutdown` fires. `current` publishes
+    /// the token of the turn in flight so the handle can cancel it.
+    ///
+    /// Intents are only read between turns: a turn holds the session, and
+    /// speaking a planner line over a streaming reply would talk over
+    /// ourselves. The ones that arrive mid-turn queue up (unbounded, they
+    /// are tiny) and are handled when the turn ends; the rate limit then
+    /// collapses the repeats.
     pub async fn run(
         mut self,
         mut obs: mpsc::Receiver<Observation>,
+        mut intents: mpsc::UnboundedReceiver<Command>,
         shutdown: CancellationToken,
         current: Arc<Mutex<Option<CancellationToken>>>,
     ) {
@@ -377,6 +542,10 @@ impl Session {
                 () = shutdown.cancelled() => break,
                 Some(o) = self.condense_rx.recv() => {
                     self.apply_one(o);
+                    continue;
+                }
+                Some(cmd) = intents.recv() => {
+                    self.handle_intent(&cmd);
                     continue;
                 }
                 o = obs.recv() => match o {
@@ -426,6 +595,7 @@ pub struct Deliberator;
 pub struct DeliberatorHandle {
     shutdown: CancellationToken,
     current: Arc<Mutex<Option<CancellationToken>>>,
+    intents: Sender<Command>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -486,6 +656,24 @@ impl Deliberator {
             })
             .map_err(|e| LlmError::Other(format!("spawn observation bridge: {e}")))?;
 
+        // Same bridge for intents, but lossless: the router hands us a few
+        // commands a minute, and dropping a `recall` would cost the next
+        // prompt its facts. The thread ends when the last sender (the
+        // handle's, or the router's clone) is dropped.
+        let (intent_tx, intent_rx) = crossbeam_channel::unbounded::<Command>();
+        let (itx, irx) = mpsc::unbounded_channel::<Command>();
+        let intent_shutdown = shutdown.clone();
+        std::thread::Builder::new()
+            .name("glydi-deliberate-intent".into())
+            .spawn(move || {
+                while let Ok(c) = intent_rx.recv() {
+                    if intent_shutdown.is_cancelled() || itx.send(c).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| LlmError::Other(format!("spawn intent bridge: {e}")))?;
+
         let loop_shutdown = shutdown.clone();
         let loop_current = Arc::clone(&current);
         let thread = std::thread::Builder::new()
@@ -503,19 +691,27 @@ impl Deliberator {
                         return;
                     }
                 };
-                rt.block_on(session.run(rx, loop_shutdown, loop_current));
+                rt.block_on(session.run(rx, irx, loop_shutdown, loop_current));
             })
             .map_err(|e| LlmError::Other(format!("spawn deliberate thread: {e}")))?;
 
         Ok(DeliberatorHandle {
             shutdown,
             current,
+            intents: intent_tx,
             thread: Some(thread),
         })
     }
 }
 
 impl DeliberatorHandle {
+    /// Where the router should deliver commands with target
+    /// [`INTENT_TARGET`]: hand this to a channel-forwarding thread, or
+    /// send into it directly. Cloneable, never blocks.
+    pub fn intent_sender(&self) -> Sender<Command> {
+        self.intents.clone()
+    }
+
     /// Stop the turn in flight, if any. Sentences already queued are the
     /// speaker's problem (the reflex `stop` clears them).
     pub fn cancel_current(&self) {
@@ -655,7 +851,7 @@ mod tests {
         );
         assert!(last.content.contains("Currently speaking: john"));
         assert!(last.content.ends_with("\n\njohn says: hello"));
-        assert_eq!(reqs[0].tools.len(), 2);
+        assert_eq!(reqs[0].tools.len(), full_tool_specs().len());
         assert_eq!(reqs[0].max_tokens, 300);
 
         let cmds = drain(&r.commands);
@@ -1003,6 +1199,242 @@ mod tests {
         assert!(!handle.is_busy());
         handle.cancel_current(); // nothing in flight: a no-op
         drop(obs_tx);
+        handle.shutdown();
+    }
+
+    fn intent(json: &str) -> Command {
+        Command::new(INTENT_TARGET, INTENT_KIND, Priority::Reflex)
+            .with_payload(Payload::Text(json.to_owned()))
+    }
+
+    fn says(cmds: &[(String, String, String)]) -> Vec<String> {
+        cmds.iter()
+            .filter(|c| c.1 == "say")
+            .map(|c| c.2.clone())
+            .collect()
+    }
+
+    #[test]
+    fn intent_ask_is_spoken_once_per_gap_per_entity() {
+        let commands = Arc::new(CommandQueue::new());
+        let clock = Arc::new(FakeClock::new());
+        let mut session = Session::new(
+            MockLlm::new(vec![]),
+            Config::default(),
+            room_with(vec![person("john", false)]),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            clock.clone(),
+        );
+        let ask = r#"{"decision":"ask","text":"Did you finish the Rust project?","entity":"john","goal":"resolve_unknown"}"#;
+        // The planner repeats itself every tick; we do not.
+        for _ in 0..5 {
+            session.handle_intent(&intent(ask));
+        }
+        clock.advance(INTENT_SAY_GAP.saturating_sub(Duration::from_millis(1)));
+        session.handle_intent(&intent(ask));
+        assert_eq!(
+            says(&drain(&commands)),
+            ["Did you finish the Rust project?"]
+        );
+        // Another person is a separate budget; no entity is its own.
+        session.handle_intent(&intent(
+            r#"{"decision":"say","text":"Hi Ada.","entity":"ada","goal":"greet"}"#,
+        ));
+        session.handle_intent(&intent(
+            r#"{"decision":"say","text":"Hello?","goal":"greet"}"#,
+        ));
+        assert_eq!(says(&drain(&commands)), ["Hi Ada.", "Hello?"]);
+        // After the gap john can be asked again.
+        clock.advance(Duration::from_millis(1));
+        session.handle_intent(&intent(ask));
+        let cmds = drain(&commands);
+        assert_eq!(says(&cmds), ["Did you finish the Rust project?"]);
+        assert!(cmds.iter().all(|c| c.0 == "speaker"));
+        // The model will see what was asked.
+        let hist = session.conversation().history();
+        assert_eq!(hist.len(), 4);
+        assert!(hist.iter().all(|m| m.role == Role::Assistant));
+        // Garbage is ignored, not spoken.
+        session.handle_intent(&intent("not json"));
+        session.handle_intent(&intent(r#"{"decision":"dance"}"#));
+        session.handle_intent(&Command::new(INTENT_TARGET, "stop", Priority::Reflex));
+        assert!(drain(&commands).is_empty());
+    }
+
+    /// A store that counts lookups, so a test can tell a prefetch from a
+    /// fresh recall.
+    #[derive(Default)]
+    struct CountingFacts {
+        inner: InMemoryFacts,
+        recalls: Mutex<usize>,
+    }
+
+    impl FactSource for CountingFacts {
+        fn recall(&self, entity: &EntityId) -> Vec<String> {
+            *self.recalls.lock() += 1;
+            self.inner.recall(entity)
+        }
+        fn remember(&self, entity: &EntityId, fact: &str) {
+            self.inner.remember(entity, fact);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_intent_prefetches_facts_for_the_next_prompt() {
+        let facts = Arc::new(CountingFacts::default());
+        facts.remember(&EntityId::new("john"), "John is writing a Rust project.");
+        let llm = MockLlm::new(vec![Script::text(&["Welcome back."])]);
+        let commands = Arc::new(CommandQueue::new());
+        let mut session = Session::new(
+            llm.clone(),
+            Config::default(),
+            room_with(vec![person("john", true)]),
+            facts.clone(),
+            commands.clone(),
+            Arc::new(FakeClock::new()),
+        );
+        session.handle_intent(&intent(
+            r#"{"decision":"recall","entity":"john","goal":"greet"}"#,
+        ));
+        assert_eq!(*facts.recalls.lock(), 1);
+        assert_eq!(
+            session.prefetched(&EntityId::new("john")),
+            Some(["John is writing a Rust project.".to_owned()].as_slice())
+        );
+        // Nothing is said for a recall: it is preparation, not speech.
+        assert!(drain(&commands).is_empty());
+
+        let (_tx, mut rx) = mpsc::channel(1);
+        session
+            .handle_utterance(
+                "hey",
+                Some(&EntityId::new("john")),
+                &mut rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let last = llm.requests()[0].messages.last().unwrap().clone();
+        assert!(
+            last.content.contains("John is writing a Rust project."),
+            "{}",
+            last.content
+        );
+        // The note came from the prefetch, not a second lookup...
+        assert_eq!(*facts.recalls.lock(), 1);
+        // ...and the prefetch is spent once used.
+        assert!(session.prefetched(&EntityId::new("john")).is_none());
+    }
+
+    /// A store with a gallery: `remember_name` enrols whoever is talking.
+    struct Enrolling;
+
+    impl FactSource for Enrolling {
+        fn recall(&self, _: &EntityId) -> Vec<String> {
+            Vec::new()
+        }
+        fn remember(&self, _: &EntityId, _: &str) {}
+        fn remember_name(
+            &self,
+            speaker: Option<&EntityId>,
+            name: &str,
+        ) -> Result<EntityId, String> {
+            assert_eq!(speaker, Some(&EntityId::for_track(3)));
+            Ok(EntityId::new(name.to_lowercase()))
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_name_emits_a_set_name_command_for_the_mind() {
+        let stranger = ViewEntity {
+            id: EntityId::for_track(3),
+            name: None,
+            confidence: 0.5,
+            is_speaking: true,
+            first_seen: Instant::now(),
+            returned: None,
+        };
+        let llm = MockLlm::new(vec![
+            Script::text(&[]).calling(REMEMBER_NAME, r#"{"name": "Karyan"}"#),
+            Script::text(&["Nice to meet you, Karyan."]),
+        ]);
+        let commands = Arc::new(CommandQueue::new());
+        let mut session = Session::new(
+            llm.clone(),
+            Config::default(),
+            room_with(vec![stranger]),
+            Arc::new(Enrolling),
+            commands.clone(),
+            Arc::new(FakeClock::new()),
+        );
+        let (_tx, mut rx) = mpsc::channel(1);
+        session
+            .handle_utterance("I'm Karyan", None, &mut rx, CancellationToken::new())
+            .await
+            .unwrap();
+        let cmds = drain(&commands);
+        let set: Vec<&(String, String, String)> =
+            cmds.iter().filter(|c| c.1 == SET_NAME_KIND).collect();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].0, SET_NAME_TARGET);
+        let payload: serde_json::Value = serde_json::from_str(&set[0].2).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"entity": "karyan", "name": "Karyan", "track": 3})
+        );
+        // It lands before the reply that follows the tool round.
+        let kinds: Vec<&str> = cmds.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(kinds, ["thinking", SET_NAME_KIND, "say", "idle"]);
+    }
+
+    #[tokio::test]
+    async fn every_tool_in_the_local_prompt_is_offered() {
+        let mut r = rig(vec![Script::text(&["Hi."])], vec![]);
+        r.session
+            .handle_utterance("hi", None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        let names: Vec<&str> = r.llm.requests()[0]
+            .tools
+            .iter()
+            .map(|t| t.function.name)
+            .collect();
+        for t in [
+            crate::tools::RECALL_PERSON,
+            crate::tools::REMEMBER,
+            REMEMBER_NAME,
+            crate::tools::REMEMBER_FACT,
+            crate::tools::FORGET_PERSON,
+        ] {
+            assert!(names.contains(&t), "{t} not offered: {names:?}");
+        }
+    }
+
+    #[test]
+    fn spawned_deliberator_speaks_routed_intents() {
+        let (obs_tx, obs_rx) = crossbeam_channel::bounded::<Observation>(1);
+        let commands = Arc::new(CommandQueue::new());
+        let handle = Deliberator::spawn_with(
+            MockLlm::new(vec![]),
+            Config::default(),
+            obs_rx,
+            room_with(vec![person("john", false)]),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            Arc::new(FakeClock::new()),
+        )
+        .unwrap();
+        let tx = handle.intent_sender();
+        tx.send(intent(
+            r#"{"decision":"say","text":"Hi John.","entity":"john","goal":"greet"}"#,
+        ))
+        .unwrap();
+        let c = commands.pop_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((c.target.as_str(), c.kind.as_str()), ("speaker", "say"));
+        assert_eq!(c.payload.as_text(), Some("Hi John."));
+        drop(obs_tx);
+        drop(tx);
         handle.shutdown();
     }
 }

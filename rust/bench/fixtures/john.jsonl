@@ -1,0 +1,11 @@
+{"at":0.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":1.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":2.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":3.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":4.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":5.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":5.0,"source":"mic0","modality":"utterance","confidence":1.0,"entity":{"known":"john","track":1},"payload":{"text":"I'm working on my Rust project"}}
+{"at":5.2,"source":"mic0","modality":"voice_activity","confidence":1.0,"entity":{"known":"john","track":1},"payload":{"bool":false}}
+{"at":900.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":901.0,"source":"cam0","modality":"face","confidence":0.9,"entity":{"known":"john","track":1},"payload":{"direction":{"azimuth_deg":0.0}}}
+{"at":902.0,"source":"mic0","modality":"utterance","confidence":1.0,"entity":{"known":"john","track":1},"payload":{"text":"hey"}}
