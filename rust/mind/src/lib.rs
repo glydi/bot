@@ -20,6 +20,7 @@
 //! allocation-light, so property 1 still holds.
 
 pub mod belief;
+pub mod engage;
 pub mod event;
 pub mod goal;
 pub mod plan;
@@ -31,6 +32,7 @@ pub mod working;
 pub mod world;
 
 pub use belief::{Belief, BeliefSet, Likelihood, Pattern};
+pub use engage::Engagement;
 pub use event::{Event, EventKind, EventLog};
 pub use goal::{Goal, GoalStack};
 pub use plan::{Decision, Planner, PlannerRule};

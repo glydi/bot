@@ -89,12 +89,16 @@ impl WorldView {
     /// on the entities); working memory is empty. `Reflex` uses
     /// [`WorldView::snapshot_with`].
     pub fn snapshot(world: &World, at: Instant) -> Arc<Self> {
-        Self::build(world, WorkingSnapshot::capture(None, world), at)
+        Self::build(world, WorkingSnapshot::capture(None, world, at), at)
     }
 
     /// Take a snapshot of the room and working memory.
     pub fn snapshot_with(world: &World, working: &WorkingMemory, at: Instant) -> Arc<Self> {
-        Self::build(world, WorkingSnapshot::capture(Some(working), world), at)
+        Self::build(
+            world,
+            WorkingSnapshot::capture(Some(working), world, at),
+            at,
+        )
     }
 
     fn build(world: &World, working: WorkingSnapshot, at: Instant) -> Arc<Self> {
@@ -132,10 +136,28 @@ impl WorldView {
     }
 
     /// The person we believe is currently talking, if any: the most
-    /// confident of those speaking.
+    /// confident of those speaking, or -- when the microphone could not
+    /// say whose the voice is -- the one person the camera confirms is
+    /// talking to us. The camera fallback needs positive evidence
+    /// (`WorkingSnapshot::engaged`), never the no-camera default, so a
+    /// microphone-only build still says "unclear".
     pub fn speaker(&self) -> Option<&ViewEntity> {
         // `people` is sorted by confidence desc, so the first hit wins.
-        self.people.iter().find(|p| p.is_speaking)
+        self.people.iter().find(|p| p.is_speaking).or_else(|| {
+            let id = self.working.engaged.as_ref()?;
+            self.people.iter().find(|p| p.id == *id)
+        })
+    }
+
+    /// Whether `id` is talking to us as far as the senses can tell
+    /// (`Entity::engaged` at the snapshot). `true` for anyone the camera
+    /// has no facing data for, and for anyone not in the snapshot: the
+    /// default is "addressed", so nothing downstream goes quiet on a
+    /// missing sense. Lives on the snapshot's working half rather than as
+    /// a `ViewEntity` field so consumers that build views by hand keep
+    /// compiling.
+    pub fn engaged(&self, id: &EntityId) -> bool {
+        self.working.beliefs_of(id).is_none_or(|b| b.engaged)
     }
 
     /// Render the `[room]` note for the model. `facts` supplies what memory

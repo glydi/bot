@@ -20,6 +20,25 @@
 //! {"decision":"ask_name",                                        "entity":"track:3", "goal":"ask_name"}
 //! ```
 //!
+//! Two more shapes share the target and kind but come from reflex rules
+//! rather than the planner, and carry no `goal`:
+//!
+//! ```json
+//! {"decision":"small_talk",       "name":"John", "entity":"john", "goal":"small_talk"}
+//! {"decision":"ignore_utterance", "entity":"john", "reason":"not_addressed"}
+//! ```
+//!
+//! `ignore_utterance` (from [`AddressedGate`](crate::rules::AddressedGate))
+//! is advice about the utterance *observation* the deliberate path has just
+//! been forwarded from the same entity: the camera saw that person looking
+//! away for the last second and nobody in the room is engaged with us, so
+//! they were talking to someone else. The intent is emitted synchronously
+//! by the reflex on that observation, so it lands in the command queue
+//! within a millisecond of the observation copy. The deliberate path
+//! should drop that turn -- not build a prompt, not speak -- and keep the
+//! text only as context. `reason` is `not_addressed` today; other reasons
+//! may follow and should be treated the same way.
+//!
 //! * `decision`: `ask` | `recall` | `say` | `greet` | `ask_name`. `wait`
 //!   is never emitted — no command *is* the wait.
 //! * `text`: present for `ask` and `say`; what to say, verbatim.

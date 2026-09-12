@@ -13,7 +13,8 @@ use common::{EntityHint, EntityId, Observation, Payload};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use crate::belief::BeliefSet;
+use crate::belief::{BeliefSet, ENGAGED_WITH_BOT};
+use crate::engage::{AWAY_FOR, COINCIDENCE, Engagement};
 use crate::event::{Event, EventKind};
 
 /// A presence older than this has left the room -- the person walked off.
@@ -77,6 +78,10 @@ pub struct Entity {
     /// (Phase 8). Fed by every observation about them in [`World::fold`],
     /// decayed in [`World::tick`].
     pub beliefs: BeliefSet,
+    /// Camera-side talking-to-us evidence and the gated verdict. Fed by
+    /// `facing` / `lip_motion` levels in [`World::fold`]; settled room-wide
+    /// in [`World::refresh_engagement`].
+    pub engagement: Engagement,
 }
 
 impl Entity {
@@ -95,7 +100,17 @@ impl Entity {
             spoke_at: None,
             speaking_since: None,
             beliefs: BeliefSet::default(),
+            engagement: Engagement::default(),
         }
+    }
+
+    /// Whether this person is talking to *us*, as far as the senses can
+    /// tell. Defaults to `true` when no facing data has ever arrived: with
+    /// no camera to contradict it, a voice is addressed to us, exactly as
+    /// before the gate existed. With a camera, it is the gated verdict on
+    /// fresh evidence (see [`Engagement::confirmed`]).
+    pub fn engaged(&self, now: Instant) -> bool {
+        !self.engagement.has_facing() || self.engagement.confirmed(now)
     }
 
     /// Whether this is a recognised person rather than a track.
@@ -133,6 +148,10 @@ pub struct World {
     /// resolved). Enough for barge-in; not enough to attend to anyone.
     unattributed_speaking: bool,
     unattributed_spoke_at: Option<Instant>,
+    /// The last `voice_activity` edge from anyone, either direction. A
+    /// stop edge means a voice was live until that instant, which is what
+    /// the coincidence window in [`World::refresh_engagement`] asks.
+    last_voice_at: Option<Instant>,
     /// Names given by `set_name` for entities that do not exist yet.
     pending_names: HashMap<EntityId, SmolStr>,
 }
@@ -156,6 +175,77 @@ impl World {
     /// Whether anyone — attributed or not — is talking.
     pub fn anyone_speaking(&self) -> bool {
         self.unattributed_speaking || self.entities.values().any(|e| e.is_speaking)
+    }
+
+    /// Whether a voice was live within [`COINCIDENCE`] of `now`.
+    fn voice_recent(&self, now: Instant) -> bool {
+        self.anyone_speaking()
+            || self
+                .last_voice_at
+                .is_some_and(|t| now.saturating_duration_since(t) <= COINCIDENCE)
+    }
+
+    /// Settle everyone's engagement against the room as it is at `now`.
+    ///
+    /// The winner is the *one* present face whose lips are moving, if it
+    /// is also looking at the device while a voice is live. Two faces with
+    /// moving lips is ambiguity, and ambiguity elects nobody: the Python
+    /// worker's `_active_speaker` made the same refusal because a wrong
+    /// speaker binding is permanent and self-reinforcing. Everyone else's
+    /// target is "not engaged"; each verdict then moves under its own
+    /// hysteresis. Called at the end of every fold and every tick so the
+    /// falling edge lands without an observation.
+    pub fn refresh_engagement(&mut self, now: Instant) {
+        let voice = self.voice_recent(now);
+        let mut talking: Option<Option<EntityId>> = None;
+        for e in self.present().filter(|e| e.engagement.lips_moving(now)) {
+            talking = Some(match talking {
+                None => Some(e.id.clone()),
+                Some(_) => None,
+            });
+        }
+        let winner = match talking {
+            Some(Some(id)) if voice => Some(id),
+            _ => None,
+        };
+        for e in self.entities.values_mut() {
+            let target = e.status == Status::Present
+                && winner.as_ref() == Some(&e.id)
+                && e.engagement.looking(now);
+            if e.engagement.settle(target, now)
+                && let Some(b) = e.beliefs.get_mut(ENGAGED_WITH_BOT)
+            {
+                // The three senses agreeing is stronger evidence than any
+                // one of them, and it is the one place lip motion counts.
+                b.weigh(&[0.85, 0.15]);
+            }
+        }
+    }
+
+    /// The one present person the camera confirms is talking to us, if
+    /// any. At most one by construction of [`World::refresh_engagement`].
+    pub fn engaged_speaker(&self, now: Instant) -> Option<&Entity> {
+        self.present().find(|e| e.engagement.confirmed(now))
+    }
+
+    /// Whether an utterance from `id` at `now` was meant for us. `false`
+    /// only when the camera has watched them look away ([`AWAY_FOR`],
+    /// below `engage::AWAY_MAX`) *and* nobody in the room is engaged --
+    /// if someone is, the conversation is with us and this may be part of
+    /// it. Anyone without facing data counts as engaged (see
+    /// [`Entity::engaged`]), so a room the camera cannot see never gates.
+    pub fn is_addressed(&self, id: &EntityId, now: Instant) -> bool {
+        let Some(e) = self
+            .entities
+            .get(id)
+            .filter(|e| e.status == Status::Present)
+        else {
+            return true;
+        };
+        if !e.engagement.looked_away_for(now, AWAY_FOR) {
+            return true;
+        }
+        self.present().any(|p| p.engaged(now))
     }
 
     /// Look up an entity.
@@ -232,11 +322,13 @@ impl World {
         // modality-blind.
         if let Some(e) = id.as_ref().and_then(|id| self.entities.get_mut(id)) {
             e.beliefs.observe(o);
+            e.engagement.observe(o);
         }
 
         match o.modality.as_str() {
             "voice_activity" => {
                 let started = o.payload.as_bool().unwrap_or(true);
+                self.last_voice_at = Some(now);
                 if let Some(id) = id {
                     self.set_speaking(&id, started, now, &mut out);
                 } else {
@@ -271,6 +363,7 @@ impl World {
             }
             _ => {}
         }
+        self.refresh_engagement(now);
         out
     }
 
@@ -316,6 +409,7 @@ impl World {
                 .get(id)
                 .is_some_and(|e| e.status == Status::Present || e.is_known())
         });
+        self.refresh_engagement(now);
         out
     }
 

@@ -105,6 +105,22 @@ pub enum Pattern {
         /// Facing the device or not.
         toward: bool,
     },
+    /// This modality carrying `Level(v)` with `v >= threshold`. A NaN
+    /// level matches neither this nor [`Pattern::LevelBelow`]: a broken
+    /// sense is not evidence of anything.
+    LevelAtLeast {
+        /// Modality name.
+        modality: SmolStr,
+        /// Inclusive lower bound.
+        threshold: f32,
+    },
+    /// This modality carrying `Level(v)` with `v < threshold`.
+    LevelBelow {
+        /// Modality name.
+        modality: SmolStr,
+        /// Exclusive upper bound.
+        threshold: f32,
+    },
 }
 
 impl Pattern {
@@ -125,6 +141,14 @@ impl Pattern {
                 Payload::Direction { azimuth_deg } => (azimuth_deg.abs() <= FACING_DEG) == *toward,
                 _ => false,
             },
+            Self::LevelAtLeast {
+                modality,
+                threshold,
+            } => o.modality == *modality && o.payload.as_level().is_some_and(|l| l >= *threshold),
+            Self::LevelBelow {
+                modality,
+                threshold,
+            } => o.modality == *modality && o.payload.as_level().is_some_and(|l| l < *threshold),
         }
     }
 }
@@ -395,6 +419,27 @@ impl BeliefSet {
             Likelihood::new()
                 .with(Pattern::Facing { toward: true }, &[0.8, 0.2])
                 .with(Pattern::Facing { toward: false }, &[0.3, 0.7])
+                // The vision sense's per-track `facing` level. Weaker than
+                // a bearing: a face turned to the camera may be listening
+                // to the person beside it, which is why the hard gate in
+                // `engage` also wants lips and a voice. Lip motion on its
+                // own is left out of the table on purpose -- a television
+                // has moving lips -- and enters only through the gate's
+                // rising edge (`World::refresh_engagement`).
+                .with(
+                    Pattern::LevelAtLeast {
+                        modality: SmolStr::new_static(crate::engage::FACING),
+                        threshold: crate::engage::FACING_GATE,
+                    },
+                    &[0.7, 0.3],
+                )
+                .with(
+                    Pattern::LevelBelow {
+                        modality: SmolStr::new_static(crate::engage::FACING),
+                        threshold: crate::engage::AWAY_MAX,
+                    },
+                    &[0.3, 0.7],
+                )
                 .with(
                     Pattern::Flag {
                         modality: SmolStr::new_static("voice_activity"),
@@ -554,6 +599,25 @@ mod tests {
         );
         assert!(contains_ignore_ascii_case("Done!", "done"));
         assert!(!contains_ignore_ascii_case("do", "done"));
+        let level = |v: f32| Observation::new("cam0", "facing", t).with_payload(Payload::Level(v));
+        let at_least = Pattern::LevelAtLeast {
+            modality: "facing".into(),
+            threshold: 0.6,
+        };
+        let below = Pattern::LevelBelow {
+            modality: "facing".into(),
+            threshold: 0.3,
+        };
+        assert!(at_least.matches(&level(0.6)));
+        assert!(!at_least.matches(&level(0.59)));
+        assert!(below.matches(&level(0.29)));
+        assert!(!below.matches(&level(0.3)));
+        assert!(!at_least.matches(&level(f32::NAN)));
+        assert!(!below.matches(&level(f32::NAN)));
+        assert!(
+            !at_least.matches(&facing(t, 0.0)),
+            "a bearing is not a level"
+        );
     }
 
     #[test]

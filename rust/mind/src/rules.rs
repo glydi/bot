@@ -286,12 +286,75 @@ impl Rule for Lull {
     }
 }
 
+/// An utterance from someone who has been looking away from the camera
+/// for the last second, while nobody in the room is engaged with us, was
+/// said to someone else. The observation still reaches the deliberate
+/// path (the reflex forwards every observation before the rules run); this
+/// rule sends the flag that tells it to drop that turn:
+///
+/// ```json
+/// {"decision":"ignore_utterance","entity":"john","reason":"not_addressed"}
+/// ```
+///
+/// as a `deliberate/intent` (see `plan.rs`). It is a flag rather than a
+/// filter because the mind never swallows what a person said -- the log,
+/// memory and the UI still see the SAID -- it only advises against
+/// answering it. Never fires without facing data (`World::is_addressed`),
+/// so a microphone-only build is unchanged.
+#[derive(Debug, Default)]
+pub struct AddressedGate;
+
+impl AddressedGate {
+    /// The `decision` value the deliberate path drops a turn on.
+    pub const DECISION: &'static str = "ignore_utterance";
+    /// The `reason` value this rule gives.
+    pub const REASON: &'static str = "not_addressed";
+}
+
+impl Rule for AddressedGate {
+    fn name(&self) -> &'static str {
+        "addressed_gate"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        if o.modality != "utterance" {
+            return;
+        }
+        let Some(e) = o.entity.as_ref().and_then(|h| w.resolve(h)) else {
+            return;
+        };
+        if w.is_addressed(&e.id, o.at) {
+            return;
+        }
+        // Fixed shape, hand-escaped like the planner's intents: an
+        // EntityId is a person id or `track:n`, so only a quote could
+        // break it, and one in an id would be a bug upstream.
+        let json = format!(
+            "{{\"decision\":\"{}\",\"entity\":\"{}\",\"reason\":\"{}\"}}",
+            Self::DECISION,
+            e.id.as_str().replace('"', ""),
+            Self::REASON
+        );
+        out.push(
+            Command::new(
+                crate::plan::INTENT_TARGET,
+                crate::plan::INTENT_KIND,
+                Priority::Reflex,
+            )
+            .with_payload(Payload::Text(json)),
+        );
+    }
+}
+
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
     v.push(Box::new(BargeInStop::default()));
     v.push(Box::new(AttendToSpeaker));
     v.push(Box::new(BackchannelAfterLongSpeech::new()));
+    // Default, not opt-in: it emits nothing without facing data, so every
+    // consumer counting commands sees exactly what it did before.
+    v.push(Box::new(AddressedGate));
     v
 }
 

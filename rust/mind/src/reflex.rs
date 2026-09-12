@@ -189,6 +189,14 @@ impl Reflex {
         // Working memory first: the goal heuristics read the thread a
         // SAID just stored.
         self.working.on_events(events);
+        // The person the camera confirms is talking to us is who we are
+        // oriented toward, even when the microphone could not attribute
+        // the voice and so no SPEAKING_STARTED moved attention.
+        if let Some(e) = self.world.engaged_speaker(now)
+            && self.working.attention.as_ref() != Some(&e.id)
+        {
+            self.working.attention = Some(e.id.clone());
+        }
         self.goals.from_events(events, &self.world, &self.working);
         let mut cx = Cognition {
             now,

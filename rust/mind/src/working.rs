@@ -284,14 +284,19 @@ pub struct EntityBeliefs {
     pub name: Option<SmolStr>,
     /// Every belief, summarised.
     pub beliefs: SmallVec<[BeliefSummary; 4]>,
+    /// [`Entity::engaged`](crate::Entity::engaged) at the snapshot: talking
+    /// to us as far as the senses can tell, `true` without a camera.
+    pub engaged: bool,
 }
 
 impl EntityBeliefs {
-    /// Summarise a set.
+    /// Summarise a set. `engaged` is `true` here; `WorkingSnapshot::capture`
+    /// fills in the gated verdict.
     pub fn from_set(entity: EntityId, name: Option<SmolStr>, set: &BeliefSet) -> Self {
         Self {
             entity,
             name,
+            engaged: true,
             beliefs: set
                 .iter()
                 .map(|b| {
@@ -326,18 +331,28 @@ pub struct WorkingSnapshot {
     /// Beliefs about everyone present, most confident-of-anything first
     /// is not attempted: room order (see `WorldView::people`) is enough.
     pub beliefs: Vec<EntityBeliefs>,
+    /// The one person the camera confirms is talking to us
+    /// (`World::engaged_speaker`), if any. `None` without a camera: this
+    /// carries positive evidence only, unlike the per-person `engaged`
+    /// flag, so the `[room]` speaker line never names someone on a default.
+    pub engaged: Option<EntityId>,
 }
 
 impl WorkingSnapshot {
-    /// Capture. `working` may be `None` (a bare `WorldView::snapshot`):
-    /// beliefs are still taken from the world so the `[room]` extra line
-    /// works without a `Reflex`.
-    pub fn capture(working: Option<&WorkingMemory>, world: &World) -> Self {
+    /// Capture at `now`. `working` may be `None` (a bare
+    /// `WorldView::snapshot`): beliefs are still taken from the world so
+    /// the `[room]` extra line works without a `Reflex`.
+    pub fn capture(working: Option<&WorkingMemory>, world: &World, now: Instant) -> Self {
         let beliefs = world
             .entities()
             .filter(|e| e.status == Status::Present)
-            .map(|e| EntityBeliefs::from_set(e.id.clone(), e.name.clone(), &e.beliefs))
+            .map(|e| {
+                let mut b = EntityBeliefs::from_set(e.id.clone(), e.name.clone(), &e.beliefs);
+                b.engaged = e.engaged(now);
+                b
+            })
             .collect();
+        let engaged = world.engaged_speaker(now).map(|e| e.id.clone());
         match working {
             Some(w) => Self {
                 topic: w.topic.clone(),
@@ -346,9 +361,11 @@ impl WorkingSnapshot {
                 current_speaker: w.current_speaker.clone(),
                 attention: w.attention.clone(),
                 beliefs,
+                engaged,
             },
             None => Self {
                 beliefs,
+                engaged,
                 ..Self::default()
             },
         }
@@ -406,7 +423,8 @@ mod tests {
     #[test]
     fn describe_is_none_when_empty() {
         let w = WorkingMemory::new();
-        let s = WorkingSnapshot::capture(Some(&w), &World::new());
+        let s = WorkingSnapshot::capture(Some(&w), &World::new(), Instant::now());
         assert_eq!(s.describe(), None);
+        assert_eq!(s.engaged, None);
     }
 }
