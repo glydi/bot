@@ -15,6 +15,9 @@ use crate::align::norm_crop;
 use crate::arcface::{CROP_SIZE, FaceEmbedder, normalize};
 use crate::attention::FaceAttention;
 use crate::gallery::FaceGallery;
+use crate::gesture::{GestureBank, MODALITY_GESTURE};
+use crate::objects::{ObjectDetector, ObjectStats, ObjectWorker};
+use crate::scene::{MODALITY_SCENE, SceneState};
 use crate::scrfd::FaceDetector;
 use crate::source::{Frame, FrameSource};
 use crate::tracker::Tracker;
@@ -34,8 +37,8 @@ pub const MODALITY_FACING: &str = "facing";
 /// `Payload::Level(lips)`: 1 = the jaw is clearly moving, 0 = still.
 pub const MODALITY_LIP_MOTION: &str = "lip_motion";
 
-/// The three replaceable stages, so tests can run the loop with fakes and
-/// the binary can run it with the ONNX models and the camera.
+/// The replaceable stages, so tests can run the loop with fakes and the
+/// binary can run it with the ONNX models and the camera.
 pub struct Parts {
     /// Where frames come from.
     pub source: Box<dyn FrameSource>,
@@ -43,6 +46,8 @@ pub struct Parts {
     pub detector: Box<dyn FaceDetector>,
     /// Embeds aligned crops.
     pub embedder: Box<dyn FaceEmbedder>,
+    /// Finds objects; `None` runs without the object path.
+    pub objects: Option<Box<dyn ObjectDetector>>,
 }
 
 /// Requests from the handle to the loop thread.
@@ -71,6 +76,14 @@ pub struct Stats {
     pub errors: AtomicU64,
     /// Detect + align + embed time for the last frame, microseconds.
     pub last_frame_us: AtomicU64,
+    /// Grey shrink + gesture + scene time for the last frame, microseconds.
+    pub last_heuristics_us: AtomicU64,
+    /// Gestures emitted.
+    pub gestures: AtomicU64,
+    /// `scene` transitions emitted (not the periodic levels).
+    pub scene_changes: AtomicU64,
+    /// The object thread's counters.
+    pub objects: Arc<ObjectStats>,
 }
 
 fn bump(c: &AtomicU64, by: u64) {
@@ -82,7 +95,7 @@ fn bump(c: &AtomicU64, by: u64) {
 #[allow(clippy::too_many_arguments)] // one call site, in `VisionSense::spawn`
 pub(crate) fn run(
     cfg: &VisionConfig,
-    clock: &dyn Clock,
+    clock: &Arc<dyn Clock>,
     tx: &RingSender,
     gallery: &dyn FaceGallery,
     mut parts: Parts,
@@ -91,6 +104,23 @@ pub(crate) fn run(
     stats: &Stats,
 ) {
     let mut tracker = Tracker::new(cfg.track_iou_threshold, cfg.track_max_age_frames);
+    let mut side = Side {
+        gestures: cfg.gestures.map(GestureBank::new),
+        scene: cfg.scene.map(SceneState::new),
+        objects: parts.objects.take().and_then(|det| {
+            ObjectWorker::spawn(
+                det,
+                &cfg.objects,
+                cfg.source_name.clone(),
+                cfg.horizontal_fov_deg,
+                Arc::clone(clock),
+                tx.clone(),
+                Arc::clone(&stats.objects),
+            )
+            .map_err(|e| warn!("object thread not started: {e}"))
+            .ok()
+        }),
+    };
     // Short poll so a stop request is honoured promptly even when the
     // camera has gone quiet.
     let poll = Duration::from_millis(50);
@@ -104,7 +134,7 @@ pub(crate) fn run(
                 bump(&stats.frames, 1);
                 process_frame(
                     cfg,
-                    clock,
+                    clock.as_ref(),
                     tx,
                     gallery,
                     &mut parts,
@@ -112,6 +142,7 @@ pub(crate) fn run(
                     stats,
                     &frame,
                 );
+                heuristics(cfg, clock.as_ref(), tx, &tracker, stats, &mut side, &frame);
             }
             Ok(None) => {}
             Err(Error::SourceExhausted) => {
@@ -132,6 +163,93 @@ pub(crate) fn run(
             }
         }
     }
+    // The object thread is joined here, before the ring sender goes away,
+    // so nothing is emitted after the handle reports the loop stopped.
+    drop(side);
+}
+
+/// The non-face state the loop carries: gestures, lighting, and the
+/// object thread. All optional, all fed after the face stages so they
+/// never delay a `face` observation.
+struct Side {
+    gestures: Option<GestureBank>,
+    scene: Option<SceneState>,
+    objects: Option<ObjectWorker>,
+}
+
+/// The cheap per-frame heuristics and the hand-off to the object thread.
+/// Time for the state machines is the frame's `captured_at`: the source's
+/// clock is the time base of the motion being measured, and the injected
+/// `Clock` (a frozen `FakeClock` in tests) only stamps the observations.
+fn heuristics(
+    cfg: &VisionConfig,
+    clock: &dyn Clock,
+    tx: &RingSender,
+    tracker: &Tracker,
+    stats: &Stats,
+    side: &mut Side,
+    frame: &Frame,
+) {
+    if let Some(w) = side.objects.as_mut() {
+        w.offer(frame.captured_at, &frame.image, &stats.objects);
+    }
+    if side.gestures.is_none() && side.scene.is_none() {
+        return;
+    }
+    let started = Instant::now();
+    let gray = frame
+        .image
+        .downscale_gray(frame.image.gray_factor(cfg.gray_width));
+    let now = clock.now();
+
+    if let Some(scene) = side.scene.as_mut() {
+        let up = scene.push(gray.mean_luminance(), frame.captured_at);
+        if let Some(state) = up.transition {
+            let obs = Observation::new(cfg.source_name.clone(), MODALITY_SCENE, now)
+                .with_payload(Payload::Text(state.to_string()));
+            bump(&stats.evicted, tx.send(obs) as u64);
+            bump(&stats.observations, 1);
+            bump(&stats.scene_changes, 1);
+            info!(state, "scene changed");
+        }
+        if let Some(level) = up.level {
+            let obs = Observation::new(cfg.source_name.clone(), MODALITY_SCENE, now)
+                .with_payload(Payload::Level(level));
+            bump(&stats.evicted, tx.send(obs) as u64);
+            bump(&stats.observations, 1);
+        }
+    }
+
+    if let Some(bank) = side.gestures.as_mut() {
+        let faces: Vec<(u32, [f32; 4])> = tracker
+            .tracks()
+            .into_iter()
+            .filter(|t| t.is_live())
+            .map(|t| (t.id, t.bbox))
+            .collect();
+        for g in bank.push_frame(gray, frame.captured_at, &faces) {
+            let entity = match tracker.get(g.track).and_then(|t| t.person.clone()) {
+                Some(id) => EntityHint::KnownOnTrack(id, g.track),
+                None => EntityHint::Track(g.track),
+            };
+            info!(
+                track = g.track,
+                kind = g.kind,
+                confidence = g.confidence,
+                "gesture"
+            );
+            let obs = Observation::new(cfg.source_name.clone(), MODALITY_GESTURE, now)
+                .with_confidence(g.confidence)
+                .with_entity(entity)
+                .with_payload(Payload::Text(g.kind.to_string()));
+            bump(&stats.evicted, tx.send(obs) as u64);
+            bump(&stats.observations, 1);
+            bump(&stats.gestures, 1);
+        }
+    }
+    stats
+        .last_heuristics_us
+        .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 fn handle_control(c: Control, tracker: &mut Tracker, gallery: &dyn FaceGallery, samples: usize) {

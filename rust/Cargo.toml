@@ -47,6 +47,9 @@ futures-util = "0.3"
 cpal = "0.18"
 hound = "3.5"
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+# sense-vision: the YOLOv5 release asset is an fp16 export, so its input
+# and output tensors are `half::f16` (ort's `half` feature).
+half = { version = "2", default-features = false }
 whisper-rs = "0.16"
 
 # act-speaker: espeak-ng for the Kokoro phonemizer is dlopen'd (no build-time

@@ -6,6 +6,17 @@
 //! payload: Direction }` (plus `face_attention` / `facing` / `lip_motion`
 //! alongside it) and nothing in `mind` knows a camera exists.
 //!
+//! Three more modalities ride on the same loop, all new observations and
+//! zero edits to `mind`:
+//!
+//! - `object` / `object_gone` / `object_seen` ([`objects`]): what is in the
+//!   room, from a nano YOLO on its own thread at ~2 fps, deduplicated to
+//!   appear / heartbeat / gone.
+//! - `gesture` ([`gesture`]): wave, nod, shake, from the face track and
+//!   frame differencing beside it. No hand model.
+//! - `scene` ([`scene`]): dark / bright on change and the luminance level
+//!   every 10 s.
+//!
 //! Ports `go/internal/vision/*` (detector, alignment, embedding, camera) and
 //! the tracking/voting half of `src/glydi_bot/identity/vision.py`.
 //!
@@ -18,6 +29,9 @@
 //!   five landmarks, so the mind can tell who is addressing the bot.
 //! - [`gallery`]: the [`FaceGallery`] trait and an in-memory one.
 //! - [`source`]: the [`FrameSource`] trait; `MockFrames` under `mock`.
+//! - [`coco`], [`objects`]: the COCO labels, the YOLO decode + NMS, the
+//!   per-class presence dedup and the object thread.
+//! - [`gesture`], [`scene`]: the motion and lighting state machines.
 //! - `camera`: `AVFoundation` capture. The only `unsafe` in the crate.
 //! - [`pipeline`]: the loop; [`VisionSense`] spawns it on its own thread.
 
@@ -28,9 +42,13 @@ pub mod arcface;
 pub mod attention;
 #[cfg(target_os = "macos")]
 pub mod camera;
+pub mod coco;
 pub mod gallery;
+pub mod gesture;
 pub mod image;
+pub mod objects;
 pub mod pipeline;
+pub mod scene;
 pub mod scrfd;
 pub mod source;
 pub mod tracker;
@@ -48,11 +66,17 @@ use tracing::{info, warn};
 
 pub use crate::attention::FaceAttention;
 pub use crate::gallery::{FaceGallery, InMemoryFaceGallery};
-pub use crate::image::Rgb;
+pub use crate::gesture::{GestureConfig, MODALITY_GESTURE, NOD, SHAKE, WAVE};
+pub use crate::image::{Gray, Rgb};
+pub use crate::objects::{
+    MODALITY_OBJECT, MODALITY_OBJECT_GONE, MODALITY_OBJECT_SEEN, ObjectConfig, ObjectDetection,
+    ObjectDetector, ObjectSeen, ObjectStats,
+};
 pub use crate::pipeline::{
     MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_EMBEDDING, MODALITY_FACING,
     MODALITY_LIP_MOTION, Parts, Stats,
 };
+pub use crate::scene::{BRIGHT, DARK, MODALITY_SCENE, SceneConfig};
 pub use crate::scrfd::Detection;
 #[cfg(feature = "mock")]
 pub use crate::source::MockFrames;
@@ -204,6 +228,19 @@ pub struct VisionConfig {
     /// azimuth. 60 degrees is a typical laptop webcam; the `FaceTime` HD
     /// camera is documented at ~57.
     pub horizontal_fov_deg: f32,
+    /// The object detector: model location, cadence, dedup timing.
+    /// `model_dir: None` turns the object path off; a missing model file
+    /// only logs a warning, because a vision sense without objects is
+    /// still a vision sense.
+    pub objects: ObjectConfig,
+    /// Gesture thresholds; `None` turns gestures off.
+    pub gestures: Option<GestureConfig>,
+    /// Lighting thresholds; `None` turns `scene` observations off.
+    pub scene: Option<SceneConfig>,
+    /// Width the frame is shrunk to (by an integer factor) for the motion
+    /// and lighting heuristics: 160 px. A hand beside a face is still tens
+    /// of pixels wide at that size and the whole frame costs ~0.3 ms.
+    pub gray_width: usize,
 }
 
 impl Default for VisionConfig {
@@ -228,6 +265,10 @@ impl Default for VisionConfig {
             capture_fps: 15,
             emit_interval: Duration::from_millis(100),
             horizontal_fov_deg: 60.0,
+            objects: ObjectConfig::default(),
+            gestures: Some(GestureConfig::default()),
+            scene: Some(SceneConfig::default()),
+            gray_width: 160,
         }
     }
 }
@@ -257,6 +298,15 @@ impl VisionConfig {
         self.detector_path().is_file() && self.recogniser_path().is_file()
     }
 
+    /// The object model file that would be used, if the directory holds
+    /// one.
+    pub fn object_model_path(&self) -> Option<PathBuf> {
+        self.objects
+            .model_dir
+            .as_deref()
+            .and_then(objects::find_model)
+    }
+
     fn build_parts(&self) -> Result<Parts, Error> {
         let source = self.open_source()?;
         let detector = scrfd::Scrfd::open(
@@ -267,11 +317,39 @@ impl VisionConfig {
             self.nms_threshold,
         )?;
         let embedder = arcface::ArcFace::open(&self.recogniser_path(), &self.ort_lib)?;
+        let objects = self.open_objects();
         Ok(Parts {
             source,
             detector: Box::new(detector),
             embedder: Box::new(embedder),
+            objects,
         })
+    }
+
+    /// The YOLO detector, or `None` (with a warning) when it is disabled,
+    /// missing or fails to load. Never an error: faces work without it.
+    fn open_objects(&self) -> Option<Box<dyn ObjectDetector>> {
+        let dir = self.objects.model_dir.as_deref()?;
+        let Some(path) = objects::find_model(dir) else {
+            warn!(
+                dir = %dir.display(),
+                "no YOLO model ({}) found; objects disabled -- run sense-vision/scripts/download_yolo.sh",
+                objects::MODEL_FILES.join(" or ")
+            );
+            return None;
+        };
+        match objects::Yolo::open(
+            &path,
+            &self.ort_lib,
+            self.objects.score_threshold,
+            self.objects.nms_threshold,
+        ) {
+            Ok(y) => Some(Box::new(y)),
+            Err(e) => {
+                warn!(model = %path.display(), "object detector failed to load; objects disabled: {e}");
+                None
+            }
+        }
     }
 
     fn open_source(&self) -> Result<Box<dyn FrameSource>, Error> {
@@ -386,7 +464,7 @@ impl VisionSense {
                 info!(source = %config.source_name, det_size = config.det_size, "vision sense running");
                 pipeline::run(
                     &config,
-                    &*clock,
+                    &clock,
                     &tx,
                     &*gallery,
                     parts,

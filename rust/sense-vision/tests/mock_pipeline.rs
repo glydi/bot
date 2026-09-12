@@ -82,6 +82,14 @@ fn config(frames: usize) -> VisionConfig {
         },
         // Rate limit off unless a test turns it on.
         emit_interval: Duration::ZERO,
+        // The face path alone: the object, gesture and scene modalities
+        // have their own tests (tests/heuristics.rs).
+        objects: sense_vision::ObjectConfig {
+            model_dir: None,
+            ..sense_vision::ObjectConfig::default()
+        },
+        gestures: None,
+        scene: None,
         ..VisionConfig::default()
     }
 }
@@ -91,6 +99,7 @@ fn parts(frames: usize, detector: Box<dyn FaceDetector>) -> Parts {
         source: Box::new(MockFrames::new(vec![Rgb::new(640, 480); frames])),
         detector,
         embedder: Box::new(ConstantEmbedder),
+        objects: None,
     }
 }
 
@@ -229,6 +238,7 @@ fn enrolling_a_track_turns_it_into_a_known_person() {
         ),
         detector: Box::new(det),
         embedder: Box::new(ConstantEmbedder),
+        objects: None,
     };
     let shared: Arc<dyn sense_vision::FaceGallery> = gallery.clone();
     let handle = VisionSense::spawn_with(cfg, clock.clone(), tx, shared, parts)

@@ -35,6 +35,7 @@ pub struct MockFrames {
     looping: bool,
     interval: Duration,
     last_at: Option<Instant>,
+    stamp: Option<(Instant, Duration)>,
 }
 
 #[cfg(feature = "mock")]
@@ -47,6 +48,7 @@ impl MockFrames {
             looping: false,
             interval: Duration::ZERO,
             last_at: None,
+            stamp: None,
         }
     }
 
@@ -72,6 +74,16 @@ impl MockFrames {
         self.interval = interval;
         self
     }
+
+    /// Stamp `captured_at` as `now + i * step` for the i-th frame instead
+    /// of the wall clock, without sleeping. The motion heuristics measure
+    /// frequency in the source's time base, so a test can play a "15 fps"
+    /// sequence in a few milliseconds and still get the same decisions.
+    #[must_use]
+    pub fn stamped(mut self, step: Duration) -> Self {
+        self.stamp = Some((Instant::now(), step));
+        self
+    }
 }
 
 #[cfg(feature = "mock")]
@@ -93,9 +105,12 @@ impl FrameSource for MockFrames {
             }
         }
         let image = self.frames[self.next % self.frames.len()].clone();
+        let captured_at = match self.stamp {
+            Some((base, step)) => base + step * (self.next as u32),
+            None => Instant::now(),
+        };
         self.next += 1;
-        let captured_at = Instant::now();
-        self.last_at = Some(captured_at);
+        self.last_at = Some(Instant::now());
         Ok(Some(Frame { image, captured_at }))
     }
 }
@@ -125,6 +140,27 @@ mod tests {
             m.next_frame(Duration::ZERO),
             Err(Error::SourceExhausted)
         ));
+    }
+
+    #[test]
+    fn stamped_frames_advance_by_the_step_without_waiting() {
+        let mut m = MockFrames::new(vec![Rgb::new(2, 2); 3]).stamped(Duration::from_millis(100));
+        let started = Instant::now();
+        let a = m
+            .next_frame(Duration::ZERO)
+            .ok()
+            .flatten()
+            .map(|f| f.captured_at);
+        let b = m
+            .next_frame(Duration::ZERO)
+            .ok()
+            .flatten()
+            .map(|f| f.captured_at);
+        let (Some(a), Some(b)) = (a, b) else {
+            panic!("no frames")
+        };
+        assert_eq!(b - a, Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 
     #[test]

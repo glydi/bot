@@ -102,6 +102,87 @@ impl Rgb {
     }
 }
 
+/// A small 8-bit grey image: the working format of the motion and lighting
+/// heuristics, which need neither colour nor resolution. Built once per
+/// frame by [`Rgb::downscale_gray`] and shared by the gesture detector and
+/// the scene state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gray {
+    /// Width in pixels.
+    pub w: usize,
+    /// Height in pixels.
+    pub h: usize,
+    /// `w * h` bytes.
+    pub pix: Vec<u8>,
+    /// How many source pixels one of ours spans on each axis, so callers
+    /// can map frame coordinates in with a division.
+    pub factor: usize,
+}
+
+impl Gray {
+    /// Mean luminance in `0..1`; 0 for an empty image.
+    pub fn mean_luminance(&self) -> f32 {
+        if self.pix.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.pix.iter().map(|&v| u64::from(v)).sum();
+        (sum as f64 / (self.pix.len() as f64 * 255.0)) as f32
+    }
+
+    /// Whether the image has no pixels.
+    pub fn is_empty(&self) -> bool {
+        self.pix.is_empty()
+    }
+}
+
+impl Rgb {
+    /// The integer shrink factor that brings this frame to at most
+    /// `target_w` wide (at least 1).
+    pub fn gray_factor(&self, target_w: usize) -> usize {
+        self.w.div_ceil(target_w.max(1)).max(1)
+    }
+
+    /// Box-average `factor` x `factor` blocks into one grey pixel
+    /// (`(r + g + b) / 3`). Trailing partial blocks are dropped. Plain
+    /// integer sums: at 1280x720 with factor 8 this touches every source
+    /// byte once and takes well under a millisecond, and the heuristics
+    /// downstream do not care about sub-pixel fidelity the way the face
+    /// models do.
+    pub fn downscale_gray(&self, factor: usize) -> Gray {
+        let factor = factor.max(1);
+        let (gw, gh) = (self.w / factor, self.h / factor);
+        let mut pix = vec![0u8; gw * gh];
+        let norm = (factor * factor * 3) as u64;
+        if norm == 0 || gw == 0 || gh == 0 {
+            return Gray {
+                w: gw,
+                h: gh,
+                pix,
+                factor,
+            };
+        }
+        let mut sums = vec![0u64; gw];
+        for gy in 0..gh {
+            sums.fill(0);
+            for y in gy * factor..(gy + 1) * factor {
+                let row = &self.pix[y * self.w * 3..(y * self.w + gw * factor) * 3];
+                for (gx, block) in row.chunks_exact(factor * 3).enumerate() {
+                    sums[gx] += block.iter().map(|&v| u64::from(v)).sum::<u64>();
+                }
+            }
+            for (gx, s) in sums.iter().enumerate() {
+                pix[gy * gw + gx] = (s / norm) as u8;
+            }
+        }
+        Gray {
+            w: gw,
+            h: gh,
+            pix,
+            factor,
+        }
+    }
+}
+
 /// Round-to-nearest, saturating, as `OpenCV`'s `saturate_cast<uchar>` does.
 pub(crate) fn clamp_u8(v: f64) -> u8 {
     let r = v.round();
@@ -202,6 +283,21 @@ mod tests {
         let half = resize_bilinear(&img, 2, 2);
         assert_eq!(half.pix[0], clamp_u8(f64::midpoint(0.0, 30.0)));
         assert_eq!(half.pix[3], clamp_u8(f64::midpoint(60.0, 90.0)));
+    }
+
+    #[test]
+    fn gray_downscale_averages_blocks_and_drops_partials() {
+        // 5x3 RGB, factor 2 -> 2x1: the last column and row are dropped.
+        let mut img = Rgb::new(5, 3);
+        img.fill_rect(0, 0, 2, 2, [255, 255, 255]); // block (0,0) fully white
+        img.fill_rect(2, 0, 3, 2, [255, 255, 255]); // half of block (1,0)
+        let g = img.downscale_gray(2);
+        assert_eq!((g.w, g.h, g.factor), (2, 1, 2));
+        assert_eq!(g.pix, vec![255, 127]);
+        assert!((g.mean_luminance() - (255.0 + 127.0) / 510.0).abs() < 1e-6);
+        assert_eq!(img.gray_factor(2), 3);
+        assert_eq!(Rgb::new(1280, 720).gray_factor(160), 8);
+        assert!(Rgb::new(1, 1).downscale_gray(2).is_empty());
     }
 
     #[test]

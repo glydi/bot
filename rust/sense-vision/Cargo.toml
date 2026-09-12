@@ -22,7 +22,8 @@ parking_lot = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-ort = { workspace = true }
+ort = { workspace = true, features = ["half"] }
+half = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
