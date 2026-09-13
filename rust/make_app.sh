@@ -82,7 +82,9 @@ if [ -f "\$GLYDI_ROOT/.env" ]; then
     set -a; . "\$GLYDI_ROOT/.env"; set +a
 fi
 
+echo "launcher: \$(date '+%FT%T') starting from \$HERE" >>"\$LOG"
 if pgrep -x glydi-bin >/dev/null 2>&1 || pgrep -f "GLYDI.app/Contents/MacOS/glydi-bin run" >/dev/null 2>&1; then
+    echo "launcher: already running (pid \$(pgrep -x glydi-bin | head -1)); not starting a second one" >>"\$LOG"
     osascript -e 'display notification "Already running." with title "GLYDI"' >/dev/null 2>&1 || true
     exit 0
 fi
@@ -96,10 +98,12 @@ if ! curl -s -m 2 "\${GLYDI_LOCAL_LLM_URL:-http://localhost:11434/v1}/models" >/
             sleep 1
         done
     else
+        echo "launcher: ollama not installed" >>"\$LOG"
         fail "Ollama is not installed. Run: brew install ollama && ollama pull qwen2.5:3b"
     fi
 fi
 
+echo "launcher: \$(date '+%FT%T') exec glydi-bin run" >>"\$LOG"
 exec "\$HERE/glydi-bin" run >>"\$LOG" 2>&1
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/GLYDI" "$APP/Contents/MacOS/glydi-bin"
