@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use act_speaker::synth::mock::MS_PER_CHAR;
 use act_speaker::{
-    Backend, MockSynth, NullOutput, SAMPLE_RATE, Speaker, SpeakerConfig, SpeakerHandle,
+    Backend, MockSynth, NullOutput, Output, SAMPLE_RATE, Speaker, SpeakerConfig, SpeakerHandle,
 };
 use common::{Command, ObservationRing, Payload, Priority, RealClock, RingReceiver};
 use crossbeam_channel::Sender;
@@ -569,5 +569,128 @@ fn far_end_tap_carries_every_block_and_a_cut_on_stop() {
     assert!(blocks[..cut].iter().all(|b| !b.samples.is_empty()));
     let (at, rate, samples) = blocks[0].clone().into_parts();
     assert!(at <= blocks[cut].at && rate == SAMPLE_RATE && samples.len() == block_len);
+    handle.stop();
+}
+
+/// A device with a 500 ms ring, as `CpalOutput` behaves: `write` returns
+/// as soon as the block is queued (blocking only while the ring is
+/// full), and `pending` reports what is queued ahead in *source* samples.
+/// Playback is a cursor on the wall clock, so the instant each block
+/// starts playing is known exactly.
+struct QueuedOutput {
+    rate: u32,
+    /// When the last queued sample finishes playing.
+    end: Arc<parking_lot::Mutex<Instant>>,
+    /// The instant each written block starts playing, in order.
+    starts: Arc<parking_lot::Mutex<Vec<Instant>>>,
+}
+
+impl Output for QueuedOutput {
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn write(&mut self, pcm: &[i16], cancel: &dyn Fn() -> bool) {
+        let ring = Duration::from_millis(500);
+        let len = Duration::from_secs_f64(pcm.len() as f64 / f64::from(self.rate));
+        loop {
+            if cancel() {
+                return;
+            }
+            let now = Instant::now();
+            let mut end = self.end.lock();
+            if end.saturating_duration_since(now) + len <= ring {
+                let start = (*end).max(now);
+                *end = start + len;
+                self.starts.lock().push(start);
+                return;
+            }
+            drop(end);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn clear(&mut self) {
+        *self.end.lock() = Instant::now();
+    }
+
+    fn pending(&self) -> usize {
+        let left = self.end.lock().saturating_duration_since(Instant::now());
+        (left.as_secs_f64() * f64::from(self.rate)).round() as usize
+    }
+}
+
+/// Through a device queue the far-end stamps must say when each block
+/// is *heard*, not when it was written: half a second apart at a full
+/// ring. The canceller searches for the echo within -64..512 ms of the
+/// stamp, so a stamp off by the ring depth (what a `pending` in device
+/// samples on a 44.1 kHz device produced) never locks.
+#[test]
+fn far_end_stamps_follow_playback_through_a_device_queue() {
+    let config = SpeakerConfig {
+        backend: Backend::Mock,
+        silent: true,
+        source: "speaker".into(),
+    };
+    let synth = MockSynth::with_tone(16_000);
+    let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let output = QueuedOutput {
+        rate: SAMPLE_RATE,
+        end: Arc::new(parking_lot::Mutex::new(Instant::now())),
+        starts: Arc::clone(&starts),
+    };
+    let (cmd, rx) = crossbeam_channel::unbounded();
+    let (obs_tx, _obs) = ObservationRing::bounded(1024);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut handle = Speaker::spawn_with(
+        &config,
+        Box::new(synth),
+        Box::new(output),
+        rx,
+        obs_tx,
+        Arc::clone(&flag),
+        Arc::new(RealClock),
+    )
+    .unwrap_or_else(|e| panic!("spawn: {e}"));
+    let far = handle.far_end();
+
+    // 40 chars = 1.2 s of tone: the ring fills and the writer blocks.
+    cmd.send(say(&"y".repeat(40))).ok();
+    wait_until("up", Duration::from_secs(2), || {
+        flag.load(Ordering::Acquire)
+    });
+    // Drain as the sense would, every 32 ms, so the ring never evicts.
+    let mut blocks = Vec::new();
+    let t0 = Instant::now();
+    while flag.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(5) {
+        blocks.extend(std::iter::from_fn(|| far.pull()));
+        std::thread::sleep(Duration::from_millis(32));
+    }
+    blocks.extend(std::iter::from_fn(|| far.pull()));
+    let starts = starts.lock().clone();
+    assert_eq!(blocks.len(), starts.len(), "one far block per write");
+    assert!(blocks.len() >= 50, "{} blocks", blocks.len());
+    let mut worst = Duration::ZERO;
+    for (b, start) in blocks.iter().zip(&starts) {
+        let off = if b.at >= *start {
+            b.at - *start
+        } else {
+            *start - b.at
+        };
+        worst = worst.max(off);
+    }
+    eprintln!("worst stamp error {worst:?} over {} blocks", blocks.len());
+    assert!(
+        worst <= Duration::from_millis(10),
+        "far-end stamps are {worst:?} from where the audio plays"
+    );
+    // And they read as one continuous stream, 20 ms apart.
+    for w in blocks.windows(2) {
+        let gap = w[1].at.saturating_duration_since(w[0].at);
+        assert!(
+            gap >= Duration::from_millis(15) && gap <= Duration::from_millis(25),
+            "{gap:?} between blocks"
+        );
+    }
     handle.stop();
 }

@@ -1465,6 +1465,11 @@ impl Session {
                 json_object: false,
             });
             let mut splitter = SentenceSplitter::new();
+            // The reply so far, raw: a tool call written as words is
+            // caught here, before any of it is spoken (see
+            // `voice::might_be_tool_call`).
+            let mut raw = String::new();
+            let mut held: Vec<String> = Vec::new();
             let mut spoken = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut cancelled = false;
@@ -1539,11 +1544,18 @@ impl Session {
                             Some(Err(e)) => return Err(e),
                             Some(Ok(ChatEvent::Call(c))) => calls.push(c),
                             Some(Ok(ChatEvent::Text(t))) => {
+                                raw.push_str(&t);
                                 // Flush at sentence boundaries so synthesis
                                 // of sentence one overlaps generation of
-                                // sentence two.
+                                // sentence two -- unless this may be a tool
+                                // call in words, which is never spoken.
                                 if let Some(s) = splitter.push(&t) {
-                                    self.emit(s, &mut spoken, &mut dropped);
+                                    held.push(s);
+                                }
+                                if !crate::voice::might_be_tool_call(&raw) {
+                                    for s in held.drain(..) {
+                                        self.emit(s, &mut spoken, &mut dropped);
+                                    }
                                 }
                             }
                         }
@@ -1573,6 +1585,20 @@ impl Session {
                 return Ok(TurnEnd::Cancelled);
             }
             if let Some(s) = splitter.finish() {
+                held.push(s);
+            }
+            if crate::voice::might_be_tool_call(&raw) {
+                // Written as words: make it a real call (the tool round
+                // below runs it), or drop it if it never became one.
+                if let Some(c) = crate::voice::textual_tool_call(&raw) {
+                    tracing::info!(name = %c.name, "tool call written as text: calling it");
+                    calls.push(c);
+                } else {
+                    tracing::info!(raw, "tool-call-like text dropped");
+                }
+                held.clear();
+            }
+            for s in held.drain(..) {
                 self.emit(s, &mut spoken, &mut dropped);
             }
             let said = spoken.trim().to_owned();
@@ -3996,6 +4022,40 @@ mod tests {
         r.session
             .handle_intent(&intent(r#"{"decision":"greet_pair","goal":"greet_pair"}"#));
         assert!(drain(&r.commands).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_written_as_words_is_run_not_spoken() {
+        let mut r = rig(
+            vec![
+                Script::text(&[r#"recall_person {"name": "Bob"}"#]),
+                Script::text(&["Bob likes chess, last I heard."]),
+            ],
+            vec![person("john", true)],
+        );
+        r.facts.remember(&EntityId::new("bob"), "Bob likes chess.");
+        r.session
+            .handle_utterance(
+                "who is Bob?",
+                Some(&EntityId::new("john")),
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let said = says(&drain(&r.commands));
+        assert_eq!(said, ["Bob likes chess, last I heard."], "{said:?}");
+        let reqs = r.llm.requests();
+        assert_eq!(reqs.len(), 2);
+        // The second request carried the real tool result.
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("chess")),
+            "{:?}",
+            reqs[1].messages.last()
+        );
     }
 
     #[test]

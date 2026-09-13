@@ -909,3 +909,108 @@ mod tests {
         assert_eq!(same_words_streak("", earlier.into_iter()), 0);
     }
 }
+
+/// Every tool the model may name. A reply that starts with one of these
+/// is a call written as words, not speech.
+pub const TOOL_NAMES: [&str; 10] = [
+    crate::tools::RECALL_PERSON,
+    crate::tools::REMEMBER,
+    crate::tools::REMEMBER_NAME,
+    crate::tools::REMEMBER_FACT,
+    crate::tools::FORGET_PERSON,
+    crate::tools::REMEMBER_REMINDER,
+    crate::tools::LIST_REMINDERS,
+    crate::tools::RUN_SHORTCUT,
+    crate::tools::OPEN_FACETIME,
+    crate::tools::SEND_MESSAGE,
+];
+
+fn strip_call_prefix(raw: &str) -> &str {
+    raw.trim_start()
+        .trim_start_matches(['`', '"', '\'', '*', '('])
+        .trim_start()
+}
+
+/// Whether the reply so far could still turn out to be a tool call
+/// written as text (`recall_person {"name": "Bob"}`). True while the
+/// text is a prefix of a tool name or starts with one; sentences are held
+/// back until this is false, since the splitter would otherwise speak
+/// half a JSON object. Measured live: the 3B model did exactly that
+/// (`said: recall_person {"name":` … `"someone whose name you do not know
+/// yet"}`), read aloud, with nothing looked up.
+pub fn might_be_tool_call(raw: &str) -> bool {
+    let head = strip_call_prefix(raw);
+    if head.is_empty() {
+        return true;
+    }
+    let ident: String = head
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        return false;
+    }
+    TOOL_NAMES.iter().any(|t| {
+        if ident.len() < t.len() {
+            t.starts_with(ident.as_str()) && head.len() == ident.len()
+        } else {
+            ident == *t
+        }
+    })
+}
+
+/// A tool call the model wrote as words, turned into a real one:
+/// `name {json}`, `name({json})`, `name: {json}` or just `name` with an
+/// empty argument object. `None` if it is not one after all.
+pub fn textual_tool_call(raw: &str) -> Option<crate::prompt::ToolCall> {
+    let head = strip_call_prefix(raw);
+    let ident: String = head
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let name = TOOL_NAMES.iter().find(|t| **t == ident)?;
+    let rest = head[ident.len()..].trim();
+    let arguments = match (rest.find('{'), rest.rfind('}')) {
+        (Some(a), Some(b)) if b > a => rest[a..=b].to_owned(),
+        // An opening brace and no closing one: the call was cut off.
+        (Some(_), _) => return None,
+        _ => "{}".to_owned(),
+    };
+    // It has to parse, or the tool would reject it and the model would
+    // be asked again anyway.
+    serde_json::from_str::<serde_json::Value>(&arguments).ok()?;
+    Some(crate::prompt::ToolCall {
+        id: String::new(),
+        name: (*name).to_owned(),
+        arguments,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod textual_call_tests {
+    use super::*;
+
+    #[test]
+    fn a_call_written_as_words_becomes_a_call() {
+        let c = textual_tool_call(r#"recall_person {"name": "Bob"}"#).unwrap();
+        assert_eq!(c.name, "recall_person");
+        assert_eq!(c.arguments, r#"{"name": "Bob"}"#);
+        let c = textual_tool_call(r#" `remember_name({"name":"Ada"})`"#).unwrap();
+        assert_eq!(c.name, "remember_name");
+        let c = textual_tool_call("list_reminders").unwrap();
+        assert_eq!(c.arguments, "{}");
+        assert!(textual_tool_call("Hi Bob, nice to see you.").is_none());
+        assert!(textual_tool_call(r#"recall_person {"name": "#).is_none());
+    }
+
+    #[test]
+    fn holding_stops_as_soon_as_the_text_cannot_be_a_call() {
+        assert!(might_be_tool_call(""));
+        assert!(might_be_tool_call("rec"));
+        assert!(might_be_tool_call("recall_person {"));
+        assert!(!might_be_tool_call("Hi"));
+        assert!(!might_be_tool_call("recall the time we met"));
+        assert!(!might_be_tool_call("Remember me?"));
+    }
+}

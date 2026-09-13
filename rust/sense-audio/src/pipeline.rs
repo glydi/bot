@@ -117,6 +117,10 @@ pub struct Stats {
     pub aec_erle_db_x10: AtomicU64,
     /// The locked speaker-to-mic delay in ms; 0 until measured.
     pub aec_delay_ms: AtomicU64,
+    /// A canceller exists: the config carried a far end and `aec` was on.
+    /// Set once at start, so a test (and the debug panel) can tell "the
+    /// far end never reached this sense" from "it is not locked yet".
+    pub aec_active: AtomicBool,
     /// Turns the analyzer deferred (held for more speech).
     pub deferrals: AtomicU64,
     /// Utterances handed to the worker.

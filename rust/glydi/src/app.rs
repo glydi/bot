@@ -505,6 +505,18 @@ impl App {
             .is_some_and(AudioSenseHandle::is_listening)
     }
 
+    /// Whether the audio sense owns an echo canceller: the speaker's far
+    /// end reached it (through `Parts::speaker` or the real backend) and
+    /// `GLYDI_AEC` did not turn it off. Independent of whether a
+    /// microphone is attached yet.
+    pub fn audio_cancels_echo(&self) -> bool {
+        self.audio.as_ref().is_some_and(|h| {
+            h.stats()
+                .aec_active
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
     /// Take the window's inputs. `None` when headless or already taken.
     pub fn take_ui(&mut self) -> Option<UiParts> {
         self.ui.take()

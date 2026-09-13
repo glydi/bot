@@ -45,7 +45,13 @@ pub trait Output: Send {
     /// Drop everything queued and not yet played.
     fn clear(&mut self);
 
-    /// Samples queued but not yet played.
+    /// Samples queued but not yet played, in [`sample_rate`](Self::sample_rate)
+    /// samples -- the rate the caller writes in, whatever the device runs
+    /// at. The engine turns this into the instant a block will be heard
+    /// (`pending / sample_rate` ahead of now) for the `audio_level` and
+    /// far-end stamps; counted in device samples it was 1.84x too long
+    /// on a 44.1 kHz device and the echo canceller searched for the
+    /// echo 400 ms from where it was.
     fn pending(&self) -> usize;
 }
 
@@ -61,8 +67,20 @@ struct Chunk {
 struct Shared {
     /// Bumped by `clear`; the callback drops any chunk stamped older.
     generation: AtomicU64,
-    /// Samples written minus samples played or dropped.
+    /// Samples written minus samples played or dropped, in *device*
+    /// samples (the callback consumes those); see [`at_rate`] for what
+    /// `pending` reports.
     pending: AtomicUsize,
+}
+
+/// `n` samples at `from` Hz expressed at `to` Hz, rounded up so one
+/// unplayed device sample still reads as pending.
+fn at_rate(n: usize, from: u32, to: u32) -> usize {
+    if from == to || from == 0 {
+        return n;
+    }
+    let scaled = n as u64 * u64::from(to);
+    ((scaled + u64::from(from) - 1) / u64::from(from)) as usize
 }
 
 /// The default output device via cpal.
@@ -255,7 +273,11 @@ impl Output for CpalOutput {
     }
 
     fn pending(&self) -> usize {
-        self.shared.pending.load(Ordering::Acquire)
+        at_rate(
+            self.shared.pending.load(Ordering::Acquire),
+            self.device_rate,
+            self.source_rate,
+        )
     }
 }
 
@@ -379,5 +401,24 @@ impl FarEnd {
     /// Whether nothing is waiting.
     pub fn is_empty(&self) -> bool {
         self.rx.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device ring is counted in device samples; `pending` must come
+    /// back in the writer's rate or every stamp derived from it is off by
+    /// the resampling ratio (the live bug: 44.1 kHz device, 24 kHz voice).
+    #[test]
+    fn pending_is_reported_at_the_source_rate() {
+        // 500 ms of ring at 44.1 kHz is 500 ms at 24 kHz.
+        assert_eq!(at_rate(22_050, 44_100, 24_000), 12_000);
+        assert_eq!(at_rate(24_000, 48_000, 24_000), 12_000);
+        assert_eq!(at_rate(12_000, 24_000, 24_000), 12_000);
+        // Rounded up: a lone device sample is still pending.
+        assert_eq!(at_rate(1, 44_100, 24_000), 1);
+        assert_eq!(at_rate(0, 44_100, 24_000), 0);
     }
 }

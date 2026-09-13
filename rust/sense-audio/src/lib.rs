@@ -718,6 +718,7 @@ impl AudioSense {
             }
             (None, _) => None,
         };
+        stats.aec_active.store(aec.is_some(), Ordering::Release);
         let pipeline = Pipeline {
             source,
             aec,
@@ -799,6 +800,33 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         cond()
+    }
+
+    /// The app retries a sense that failed to load its models with
+    /// `without_models()`, and the far end must ride along: without it
+    /// the retried sense mutes while the bot speaks and never says why.
+    #[test]
+    fn without_models_keeps_the_far_end_and_the_canceller() {
+        let queue = Arc::new(aec::FarEndQueue::new());
+        let mut cfg = AudioConfig::default();
+        cfg.far_end = Some(queue);
+        let cfg = cfg.without_models();
+        assert!(cfg.far_end.is_some() && cfg.aec);
+        cfg.warm_up = false;
+        let (tx, _rx) = ObservationRing::bounded(16);
+        let mut h = AudioSense::spawn_deferred(
+            cfg,
+            Arc::new(RealClock),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("no models, nothing to fail");
+        assert!(
+            h.stats().aec_active.load(Ordering::Acquire),
+            "a deferred sense builds its canceller before the mic arrives"
+        );
+        h.stop();
+        h.join();
     }
 
     fn deferred() -> (AudioSenseHandle, common::RingReceiver) {
