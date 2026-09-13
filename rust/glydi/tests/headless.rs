@@ -60,6 +60,7 @@ fn utterance_is_answered_and_remembered() {
             Box::new(NullOutput::new(SAMPLE_RATE)),
         )),
         backend: Some(llm.clone() as Arc<dyn deliberate::ChatBackend>),
+        canned_proactive: true,
         ..Parts::default()
     };
     let app = App::build(&config, parts).expect("app builds without hardware");

@@ -86,6 +86,7 @@ impl Rig {
                 Box::new(NullOutput::new(SAMPLE_RATE)),
             )),
             backend: Some(llm.clone() as Arc<dyn deliberate::ChatBackend>),
+            canned_proactive: true,
             ..Parts::default()
         };
         let app = App::build(&config, parts).expect("app builds without hardware");
@@ -422,8 +423,12 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     // Five sentences, one every 250 ms: the turn streams for ~1.25 s, long
     // enough for a blip and a barge-in to land mid-reply.
     let sentences = ["One.", "Two.", "Three.", "Four.", "Five."];
+    // A different second story: the deliberate path drops a line it has
+    // said before (the repeat guard), so the same five would be silent.
+    let second_story = ["Red.", "Green.", "Blue.", "Gold.", "Grey."];
     let reply = || Script::text(&sentences).with_delay(Duration::from_millis(250));
-    let rig = Rig::build(temp_db("bargein"), vec![reply(), reply()]);
+    let reply2 = || Script::text(&second_story).with_delay(Duration::from_millis(250));
+    let rig = Rig::build(temp_db("bargein"), vec![reply(), reply2()]);
     let john = EntityHint::Known(EntityId::new("john"));
 
     // Turn 1: a blip during the stream.
@@ -457,7 +462,7 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     std::thread::sleep(Duration::from_millis(1200));
     let second: Vec<String> = rig.spoken()[before..].to_vec();
     assert!(
-        second.len() < sentences.len(),
+        second.len() < second_story.len(),
         "600 ms of voice did not cancel the reply: {second:?}"
     );
     assert_eq!(rig.llm.requests().len(), 2);

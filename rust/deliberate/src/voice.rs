@@ -401,6 +401,10 @@ pub enum Moment {
     LightsOut,
     /// Two known people walked in together.
     Pair,
+    /// Three or more people arrived at once (a school crowd).
+    Group,
+    /// One person has held the floor a long while and others are waiting.
+    WrapUp,
 }
 
 impl Moment {
@@ -410,14 +414,15 @@ impl Moment {
     fn question_allowed(&self) -> bool {
         !matches!(
             self,
-            Self::Arrival | Self::Return | Self::Pair | Self::LightsOut
+            Self::Arrival | Self::Return | Self::Pair | Self::Group | Self::LightsOut
         )
     }
 
     /// Short tag for logs and the say-gap key.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Arrival | Self::Return | Self::Pair => "greet",
+            Self::Arrival | Self::Return | Self::Pair | Self::Group => "greet",
+            Self::WrapUp => "wrap_up",
             Self::StrangerSettled => "ask_name",
             Self::Reminder => "remind",
             Self::Novelty => "curious",
@@ -530,6 +535,26 @@ impl Proactive {
                 let names = self.names.join(" and ");
                 let _ = write!(s, "{names} just walked in together.");
             }
+            Moment::Group => {
+                if self.names.is_empty() {
+                    s.push_str("a whole group just walked in; you know none of their names.");
+                } else {
+                    let names = self.names.join(", ");
+                    let _ = write!(s, "a whole group just walked in, {names} among them.");
+                }
+            }
+            Moment::WrapUp => {
+                let waiting = if self.names.is_empty() {
+                    "someone else".to_owned()
+                } else {
+                    self.names.join(" and ")
+                };
+                let _ = write!(
+                    s,
+                    "{} has been talking for a long while and {waiting} has been waiting to speak.",
+                    self.name.as_deref().unwrap_or("this person")
+                );
+            }
         }
         let _ = write!(s, "\nTime: {}.", time_of_day(cx.time.0, cx.time.1));
         if let Some(ctx) = &cx.returned_context {
@@ -585,6 +610,12 @@ impl Proactive {
             ),
             Moment::Arrival => s.push_str("Greet them by name and add one small thing. No question. "),
             Moment::Pair => s.push_str("One hello for both, by name. No question. "),
+            Moment::Group => s.push_str(
+                "One hello for everyone at once, names woven in if you know any. Never one per person. No question. ",
+            ),
+            Moment::WrapUp => s.push_str(
+                "Kindly hand the floor over: tell the talker you'll come back to them, then invite the one waiting, by name if known. ",
+            ),
             Moment::StrangerSettled => s.push_str(
                 "Ask their name, plainly, without a hello in front of it. Nothing else. ",
             ),

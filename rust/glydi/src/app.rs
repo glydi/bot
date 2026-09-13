@@ -126,6 +126,9 @@ pub struct Parts {
     /// A chat backend for both the conversation and fact extraction,
     /// instead of the `OpenAI`-compatible client.
     pub backend: Option<Arc<dyn ChatBackend>>,
+    /// Speak proactive moments as their canned line instead of asking the
+    /// model (tests). `false` here means "canned"; see `Parts::default`.
+    pub canned_proactive: bool,
 }
 
 /// The window's inputs, handed to the main thread because eframe insists
@@ -286,6 +289,7 @@ impl App {
                     model: config.local_model.clone(),
                     max_tokens: config.max_tokens,
                     request_timeout: config.llm_timeout,
+                    proactive_via_model: !parts.canned_proactive,
                     ..deliberate::Config::default()
                 };
                 let facts: Arc<dyn deliberate::FactSource> = store.clone();
@@ -1106,6 +1110,12 @@ fn spawn_audio(
     } else {
         cfg.turn_model = present("turn", &config.turn_model);
         cfg.whisper_model = present("whisper", &config.whisper_model);
+        // None = detect per utterance (needs a multilingual whisper
+        // model, e.g. "base"; a ".en" model always reports English).
+        cfg.language = std::env::var("GLYDI_LANGUAGE")
+            .ok()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty() && l != "auto");
         cfg.voiceid_model = if config.identity {
             present("voice-id", &config.voice_model)
         } else {

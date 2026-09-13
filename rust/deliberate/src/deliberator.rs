@@ -122,6 +122,12 @@ struct Intent {
     /// How long the one talking has been going, in seconds.
     #[serde(default)]
     talker_seconds: Option<u64>,
+    /// `greet_group`: the known names in the group.
+    #[serde(default)]
+    names: Option<Vec<String>>,
+    /// `greet_group`: how many arrived.
+    #[serde(default)]
+    count: Option<usize>,
 }
 
 impl Intent {
@@ -371,6 +377,11 @@ pub struct Config {
     /// `max_tokens`. On by default; the live test turns it off to
     /// measure it.
     pub adaptive_brevity: bool,
+    /// Proactive moments (a greeting, a reminder, a group hello) are
+    /// phrased by the model from a note; off, the canned line is spoken
+    /// as it is. On by default; the end-to-end tests turn it off so a
+    /// greeting costs no model request and stays deterministic.
+    pub proactive_via_model: bool,
 }
 
 impl Default for Config {
@@ -385,6 +396,7 @@ impl Default for Config {
             system_prompt: LOCAL_SYSTEM_PROMPT.to_owned(),
             max_tool_rounds: MAX_TOOL_ROUNDS,
             adaptive_brevity: true,
+            proactive_via_model: true,
         }
     }
 }
@@ -464,6 +476,8 @@ pub struct Session {
     turn_budget: u32,
     /// See [`Config::adaptive_brevity`].
     adaptive_brevity: bool,
+    /// See [`Config::proactive_via_model`].
+    proactive_via_model: bool,
     /// How many times in a row the person has just said these same
     /// words ("Hello." for the fourth time is 4); 1 for anything new.
     streak: usize,
@@ -518,6 +532,7 @@ impl Session {
             said: Said::default(),
             turn_budget: config.max_tokens,
             adaptive_brevity: config.adaptive_brevity,
+            proactive_via_model: config.proactive_via_model,
             streak: 1,
             crowd: None,
             greeted_at: HashMap::new(),
@@ -735,6 +750,56 @@ impl Session {
                     return None;
                 }
                 self.greet_pair(&ids).map(Planned::Turn)
+            }
+            "greet_group" => {
+                if self.holding() {
+                    tracing::info!("greet_group intent suppressed: holding");
+                    return None;
+                }
+                let names = intent.names.unwrap_or_default();
+                let count = intent.count.unwrap_or(names.len().max(3));
+                self.gate(entity.clone(), "greet")?;
+                let line = if names.is_empty() {
+                    "Hi everyone!".to_owned()
+                } else {
+                    format!("Hi {}, and hello to the rest of you!", names.join(", "))
+                };
+                tracing::info!(count, ?names, "group arrived");
+                let mut p = Proactive::new(Moment::Group, line);
+                p.entity = entity;
+                p.names = names;
+                p.mood = mood;
+                Some(Planned::Turn(p))
+            }
+            "wrap_up" => {
+                let Some(id) = entity else {
+                    tracing::warn!("wrap_up intent without an entity");
+                    return None;
+                };
+                if self.holding() {
+                    return None;
+                }
+                self.gate(Some(id.clone()), "wrap_up")?;
+                let waiting: Vec<String> = intent
+                    .waiting
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|w| w != "someone")
+                    .collect();
+                let talker = self.name_of(Some(&id)).unwrap_or_else(|| "hey".to_owned());
+                let line = match waiting.first() {
+                    Some(w) => format!(
+                        "{talker}, hold that thought, I'll come back to you. {w}, did you want to say something?"
+                    ),
+                    None => format!(
+                        "{talker}, hold that thought, I'll come back to you. Someone else here has been waiting."
+                    ),
+                };
+                let mut p = Proactive::new(Moment::WrapUp, line);
+                p.name = self.name_of(Some(&id));
+                p.entity = Some(id);
+                p.names = waiting;
+                Some(Planned::Turn(p))
             }
             "remind" => {
                 let Some(text) = intent.text.filter(|t| !t.trim().is_empty()) else {
@@ -1898,6 +1963,10 @@ impl Session {
         let Some(turn) = turn_intent(&cmd) else {
             match self.plan_intent(&cmd) {
                 Some(Planned::Line(line)) => self.speak_line(line),
+                Some(Planned::Turn(p)) if !self.proactive_via_model => {
+                    let line = p.canned.clone();
+                    self.spoke_moment(&p, line);
+                }
                 Some(Planned::Turn(p)) => {
                     let token = shutdown.child_token();
                     *current.lock() = Some(token.clone());
@@ -3927,6 +3996,44 @@ mod tests {
         r.session
             .handle_intent(&intent(r#"{"decision":"greet_pair","goal":"greet_pair"}"#));
         assert!(drain(&r.commands).is_empty());
+    }
+
+    #[test]
+    fn a_group_gets_one_hello_and_a_long_talker_is_handed_over() {
+        let mut r = rig(vec![], vec![person("ada", false), person("bob", false)]);
+        r.session.handle_intent(&intent(
+            r#"{"decision":"greet_group","count":4,"names":["Ada","Bob"],"entity":"ada","goal":"greet_group"}"#,
+        ));
+        let said = says(&drain(&r.commands));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("Ada") && said[0].contains("Bob"),
+            "{}",
+            said[0]
+        );
+        // No second hello for the first arrival inside the gap.
+        r.session.handle_intent(&intent(
+            r#"{"decision":"greet","name":"ada","entity":"ada","goal":"greet"}"#,
+        ));
+        assert!(says(&drain(&r.commands)).is_empty());
+        // Wrap-up names the one waiting.
+        r.session.handle_intent(&intent(
+            r#"{"decision":"wrap_up","entity":"ada","waiting":["Bob"]}"#,
+        ));
+        let said = says(&drain(&r.commands));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("Bob") && said[0].contains("hold that thought"),
+            "{}",
+            said[0]
+        );
+        // A stranger waiting is "someone else".
+        r.session.handle_intent(&intent(
+            r#"{"decision":"wrap_up","entity":"bob","waiting":["someone"]}"#,
+        ));
+        let said = says(&drain(&r.commands));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("Someone else"), "{}", said[0]);
     }
 
     #[test]

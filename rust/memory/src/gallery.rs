@@ -78,6 +78,12 @@ impl VoiceGallery for Store {
 /// call happens mid-turn, and the model can talk around an empty answer
 /// but not around a panic.
 impl FactSource for Store {
+    /// What to pick back up on when they return: the last episode's
+    /// summary, else the last thing they said, with how long ago.
+    fn returned_context(&self, entity: &EntityId) -> Option<String> {
+        Store::returned_context(self, entity)
+    }
+
     /// Relations first, as sentences ("Ada is often here with Bob."),
     /// then the facts oldest-first: the deliberate path takes the *last*
     /// entry as the thing to pick back up on, and that should be what
