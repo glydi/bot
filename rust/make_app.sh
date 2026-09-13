@@ -69,6 +69,12 @@ export PATH="/opt/homebrew/bin:\$PATH"
 HERE="\$(cd "\$(dirname "\$0")" && pwd)"
 LOG="\$GLYDI_ROOT/data/launch.log"
 mkdir -p "\$GLYDI_ROOT/data"
+# The log collects Ollama's server output too; rotate it past 20 MB so it
+# can never fill the disk (a full disk is what "not listening, not
+# speaking" looked like once).
+if [ -f "\$LOG" ] && [ "\$(stat -f %z "\$LOG")" -gt 20000000 ]; then
+    mv "\$LOG" "\$LOG.1"
+fi
 
 fail() {
     osascript -e "display alert \"GLYDI\" message \"\$1\" as critical" >/dev/null 2>&1 || true
