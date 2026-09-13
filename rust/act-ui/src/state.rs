@@ -5,10 +5,11 @@
 //! show -- is testable with no display, and so [`Headless`](crate::Headless)
 //! and the real window cannot drift apart.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Command, Observation, Payload};
+use common::{Command, MODALITY_CAMERA_PREVIEW, Observation, Payload, Preview};
 use smol_str::SmolStr;
 
 use crate::behaviour::{Behaviour, Overlay, Reaction};
@@ -80,6 +81,38 @@ impl Attend {
     }
 }
 
+/// What the Faces tab shows: the latest camera preview and, per track,
+/// when it was first seen in a preview, so the list can say "seen since".
+#[derive(Default)]
+pub struct Faces {
+    /// The newest `camera_preview`, or `None` before the camera is up.
+    pub preview: Option<Arc<Preview>>,
+    /// Bumped on every new preview, so the window re-uploads its texture
+    /// only when there is a new picture (at 5 fps, not 60).
+    pub seq: u64,
+    /// First preview each current track appeared in. Tracks absent from
+    /// the newest preview are dropped: an id is never reused, so a face
+    /// that comes back is a new row.
+    pub since: HashMap<u32, Instant>,
+}
+
+impl Faces {
+    fn update(&mut self, preview: Arc<Preview>, now: Instant) {
+        let mut since = HashMap::with_capacity(preview.faces.len());
+        for f in &preview.faces {
+            since.insert(f.track, self.since.get(&f.track).copied().unwrap_or(now));
+        }
+        self.since = since;
+        self.preview = Some(preview);
+        self.seq += 1;
+    }
+
+    /// When `track` first appeared, if it is in the latest preview.
+    pub fn seen_since(&self, track: u32) -> Option<Instant> {
+        self.since.get(&track).copied()
+    }
+}
+
 /// Everything the UI derives from the loop.
 pub struct UiState {
     /// The expression state machine.
@@ -95,6 +128,8 @@ pub struct UiState {
     pub seen: u64,
     /// The companion layer: idle repertoire, reactions, the music sway.
     pub behaviour: Behaviour,
+    /// The camera's preview frames, for the Faces tab.
+    pub faces: Faces,
     /// Speaker levels waiting out the output latency, with when each is due.
     pending_levels: VecDeque<(Instant, f32)>,
     /// See [`lip_sync_delay`].
@@ -122,6 +157,7 @@ impl UiState {
             attends: 0,
             seen: 0,
             behaviour,
+            faces: Faces::default(),
             pending_levels: VecDeque::with_capacity(16),
             lip_sync: lip_sync_delay(),
         }
@@ -245,6 +281,15 @@ impl UiState {
             "face" => {
                 self.face.touch(now);
                 self.behaviour.presence(now);
+            }
+            // The camera's picture, for the Faces tab. Anything else
+            // riding on the modality (a foreign `Opaque`) is ignored.
+            MODALITY_CAMERA_PREVIEW => {
+                if let Payload::Opaque(p) = &o.payload
+                    && let Ok(preview) = Arc::clone(p).downcast::<Preview>()
+                {
+                    self.faces.update(preview, now);
+                }
             }
             // Music heard (see the crate docs for the contract): sway.
             AUDIO_EVENT
@@ -508,6 +553,59 @@ mod tests {
         s.tick(stop);
         assert!(!s.behaviour.swaying(stop));
         assert!(s.overlay(stop).is_none());
+    }
+
+    #[test]
+    fn a_camera_preview_updates_the_faces_list_and_keeps_seen_since() {
+        use common::PreviewFace;
+        let now = Instant::now();
+        let mut s = UiState::new(now);
+        assert!(s.faces.preview.is_none());
+        let face = |track: u32, label: &str| PreviewFace {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+            label: label.to_owned(),
+            score: 0.8,
+            track,
+            engaged: true,
+        };
+        let preview = |faces: Vec<PreviewFace>| {
+            Observation::new("cam0", MODALITY_CAMERA_PREVIEW, now).with_payload(Payload::Opaque(
+                Arc::new(Preview {
+                    width: 2,
+                    height: 1,
+                    rgb: vec![0; 6],
+                    faces,
+                }),
+            ))
+        };
+        s.on_observation(&preview(vec![face(1, "unknown_1")]), now);
+        assert_eq!(s.faces.seq, 1);
+        assert_eq!(s.faces.seen_since(1), Some(now));
+        let later = now + Duration::from_secs(5);
+        s.on_observation(&preview(vec![face(1, "ana"), face(2, "unknown_2")]), later);
+        assert_eq!(s.faces.seq, 2);
+        let p = s
+            .faces
+            .preview
+            .clone()
+            .unwrap_or_else(|| panic!("no preview"));
+        assert_eq!(p.faces.len(), 2);
+        assert_eq!(p.faces[0].label, "ana");
+        assert!(p.faces[0].is_known() && !p.faces[1].is_known());
+        // Track 1 has been in view since the first preview; 2 is new.
+        assert_eq!(s.faces.seen_since(1), Some(now));
+        assert_eq!(s.faces.seen_since(2), Some(later));
+        // A track that leaves is forgotten.
+        s.on_observation(&preview(vec![face(2, "unknown_2")]), later);
+        assert_eq!(s.faces.seen_since(1), None);
+        // A foreign opaque payload on the modality changes nothing.
+        let foreign = Observation::new("cam0", MODALITY_CAMERA_PREVIEW, now)
+            .with_payload(Payload::Opaque(Arc::new(7u8)));
+        s.on_observation(&foreign, later);
+        assert_eq!(s.faces.seq, 3);
     }
 
     #[test]

@@ -16,6 +16,10 @@
 //!   frame differencing beside it. No hand model.
 //! - `scene` ([`scene`]): dark / bright on change and the luminance level
 //!   every 10 s.
+//! - `camera_preview` ([`build_preview`]): every third frame, shrunk to
+//!   320 wide with the tracked faces boxed and labelled, as
+//!   `Payload::Opaque(Arc<common::Preview>)`, for the debug panel's Faces
+//!   tab. Nothing in `mind` reads it.
 //!
 //! Ports `go/internal/vision/*` (detector, alignment, embedding, camera) and
 //! the tracking/voting half of `src/glydi_bot/identity/vision.py`.
@@ -74,13 +78,16 @@ pub use crate::objects::{
 };
 pub use crate::pipeline::{
     MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_EMBEDDING, MODALITY_FACING,
-    MODALITY_LIP_MOTION, Parts, Stats,
+    MODALITY_LIP_MOTION, PREVIEW_ENGAGED_FACING, PREVIEW_EVERY, Parts, Stats, build_preview,
 };
+// The preview type is `common`'s (so the UI can draw it without this
+// crate's model dependencies); re-exported for readers of this crate.
 pub use crate::scene::{BRIGHT, DARK, MODALITY_SCENE, SceneConfig};
 pub use crate::scrfd::Detection;
 #[cfg(feature = "mock")]
 pub use crate::source::MockFrames;
 pub use crate::source::{Frame, FrameSource};
+pub use common::{MODALITY_CAMERA_PREVIEW, PREVIEW_MAX_WIDTH, Preview, PreviewFace};
 
 /// Everything that can go wrong in this crate.
 #[derive(Debug, thiserror::Error)]

@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{Clock, EntityHint, EntityId, Observation, Payload, RingSender};
+use common::{
+    Clock, EntityHint, EntityId, MODALITY_CAMERA_PREVIEW, Observation, PREVIEW_MAX_WIDTH, Payload,
+    Preview, PreviewFace, RingSender,
+};
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{debug, info, info_span, warn};
 
@@ -16,6 +19,7 @@ use crate::arcface::{CROP_SIZE, FaceEmbedder, normalize};
 use crate::attention::FaceAttention;
 use crate::gallery::FaceGallery;
 use crate::gesture::{GestureBank, MODALITY_GESTURE};
+use crate::image::{Rgb, resize_bilinear};
 use crate::objects::{ObjectDetector, ObjectStats, ObjectWorker};
 use crate::scene::{MODALITY_SCENE, SceneState};
 use crate::scrfd::FaceDetector;
@@ -52,6 +56,14 @@ pub const MIN_EMIT_FACE_PX: f32 = 60.0;
 /// [`crowded_interval`]: eight faces at 10 Hz is 320 observations a
 /// second on a ring of 64, and the mind's presence TTL is 3 s anyway.
 pub const CROWD_EMIT_ABOVE: usize = 4;
+
+/// Every `PREVIEW_EVERY`th processed frame goes out as a `camera_preview`
+/// (see [`build_preview`]): 5 fps at the 15 fps capture, which is plenty
+/// for a debug view and keeps the cost at a third of a resize per frame.
+pub const PREVIEW_EVERY: u64 = 3;
+/// Facing score (`FaceAttention::facing`) at or above which a preview
+/// face is marked engaged: half way between full profile and straight on.
+pub const PREVIEW_ENGAGED_FACING: f32 = 0.5;
 
 /// The per-track emit interval in a crowd: two and a half times the
 /// configured one (100 ms -> 250 ms). Zero stays zero, so a test that
@@ -111,6 +123,8 @@ pub struct Stats {
     pub gestures: AtomicU64,
     /// `scene` transitions emitted (not the periodic levels).
     pub scene_changes: AtomicU64,
+    /// `camera_preview` frames emitted.
+    pub previews: AtomicU64,
     /// The object thread's counters.
     pub objects: Arc<ObjectStats>,
 }
@@ -162,6 +176,7 @@ pub(crate) fn run(
         match parts.source.next_frame(poll) {
             Ok(Some(frame)) => {
                 bump(&stats.frames, 1);
+                let frames = stats.frames.load(Ordering::Relaxed);
                 process_frame(
                     cfg,
                     clock.as_ref(),
@@ -174,6 +189,20 @@ pub(crate) fn run(
                     &frame,
                 );
                 heuristics(cfg, clock.as_ref(), tx, &tracker, stats, &mut side, &frame);
+                // After the faces and the heuristics: the preview is the
+                // least urgent thing the frame produces.
+                if frames % PREVIEW_EVERY == 1 {
+                    let preview = build_preview(&frame.image, &tracker);
+                    let obs = Observation::new(
+                        cfg.source_name.clone(),
+                        MODALITY_CAMERA_PREVIEW,
+                        clock.now(),
+                    )
+                    .with_payload(Payload::Opaque(Arc::new(preview)));
+                    bump(&stats.evicted, tx.send(obs) as u64);
+                    bump(&stats.observations, 1);
+                    bump(&stats.previews, 1);
+                }
             }
             Ok(None) => {}
             Err(Error::SourceExhausted) => {
@@ -197,6 +226,54 @@ pub(crate) fn run(
     // The object thread is joined here, before the ring sender goes away,
     // so nothing is emitted after the handle reports the loop stopped.
     drop(side);
+}
+
+/// The frame shrunk to at most [`PREVIEW_MAX_WIDTH`] wide (never
+/// enlarged) with every live track as a [`PreviewFace`]: the gallery's
+/// name where the vote has settled, `unknown_<track>` otherwise, and the
+/// match score (the detector's score for a stranger). Boxes are fractions
+/// of the frame so the UI never needs the capture size.
+///
+/// Cost: one bilinear resize of a 1280x720 frame to 320x180 is ~0.4 ms on
+/// an M-series core (`image::resize_bilinear` computes the column taps
+/// once), and the face list is a dozen small allocations at most.
+pub fn build_preview(image: &Rgb, tracker: &Tracker) -> Preview {
+    let (fw, fh) = (image.w.max(1) as f32, image.h.max(1) as f32);
+    let (pw, ph) = if image.w > PREVIEW_MAX_WIDTH {
+        let ph = (image.h * PREVIEW_MAX_WIDTH / image.w.max(1)).max(1);
+        (PREVIEW_MAX_WIDTH, ph)
+    } else {
+        (image.w, image.h)
+    };
+    let small = resize_bilinear(image, pw, ph);
+    let faces = tracker
+        .tracks()
+        .into_iter()
+        .filter(|t| t.is_live())
+        .map(|t| {
+            let [x1, y1, x2, y2] = t.bbox;
+            let (label, score) = match &t.person {
+                Some(id) => (id.to_string(), t.confidence),
+                None => (format!("unknown_{}", t.id), t.score),
+            };
+            PreviewFace {
+                x: (x1 / fw).clamp(0.0, 1.0),
+                y: (y1 / fh).clamp(0.0, 1.0),
+                w: ((x2 - x1) / fw).clamp(0.0, 1.0),
+                h: ((y2 - y1) / fh).clamp(0.0, 1.0),
+                label,
+                score,
+                track: t.id,
+                engaged: t.attention.scores().facing >= PREVIEW_ENGAGED_FACING,
+            }
+        })
+        .collect();
+    Preview {
+        width: small.w,
+        height: small.h,
+        rgb: small.pix,
+        faces,
+    }
 }
 
 /// The non-face state the loop carries: gestures, lighting, and the

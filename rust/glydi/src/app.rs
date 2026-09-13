@@ -369,7 +369,7 @@ impl App {
         // loop. Everything below is either instant or deferred to a helper
         // thread, so a microphone stuck behind the permission prompt no
         // longer stands between the person and the window.
-        let sources = ui_sources(&reflex, &timeline, epoch);
+        let sources = ui_sources(&reflex, &timeline, Arc::clone(&store), epoch);
         let mut ui_tap = None;
         let (ui, headless) = if parts.headless {
             // Through a tap, so a test can see what the face was told
@@ -1306,10 +1306,16 @@ fn spawn_vision(
     Some(DeferredVision { slot })
 }
 
-/// The debug panel's readers, over the reflex's lock-free snapshots.
+/// How often the panel's "gallery: N known" row re-reads the store. The
+/// panel asks once per frame; a `SELECT COUNT` at 60 Hz would be silly.
+const KNOWN_COUNT_REFRESH: Duration = Duration::from_secs(2);
+
+/// The debug panel's readers, over the reflex's lock-free snapshots and,
+/// throttled, the store.
 fn ui_sources(
     reflex: &Arc<ReflexHandle>,
     timeline: &Arc<common::TurnTimeline>,
+    store: Arc<Store>,
     epoch: Instant,
 ) -> Sources {
     let view = reflex.view();
@@ -1320,6 +1326,21 @@ fn ui_sources(
     s.latency = Some(Box::new({
         let tl = Arc::clone(timeline);
         move || tl.recent()
+    }));
+    s.known_count = Some(Box::new({
+        let cached: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
+        move || {
+            let now = Instant::now();
+            let mut c = cached.lock();
+            match *c {
+                Some((at, n)) if now.saturating_duration_since(at) < KNOWN_COUNT_REFRESH => n,
+                _ => {
+                    let n = store.people().map_or(0, |p| p.len());
+                    *c = Some((now, n));
+                    n
+                }
+            }
+        }
     }));
     s
 }

@@ -14,6 +14,7 @@
 
 pub mod channel;
 pub mod clock;
+pub mod preview;
 pub mod recorded;
 pub mod router;
 pub mod timeline;
@@ -21,6 +22,7 @@ pub mod types;
 
 pub use channel::{CommandQueue, ObservationRing, RingReceiver, RingSender};
 pub use clock::{Clock, FakeClock, RealClock};
+pub use preview::{MODALITY_CAMERA_PREVIEW, PREVIEW_MAX_WIDTH, Preview, PreviewFace};
 pub use recorded::{Recorded, RecordedHint, RecordedPayload};
 pub use router::{CommandRouter, RouterHandle};
 pub use timeline::{Stage, TurnSummary, TurnTimeline, summary_line};

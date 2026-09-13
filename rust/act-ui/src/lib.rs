@@ -34,6 +34,10 @@
 //! * `face` (from the camera, any payload) and a true `voice_activity`
 //!   mean someone is here: the idle repertoire runs less often, the
 //!   sleep timer is held off, and a sleeping face wakes with a blink.
+//! * `camera_preview` (`Payload::Opaque(Arc<common::Preview>)`) -- the
+//!   camera's downscaled picture with the tracked faces, drawn by the
+//!   debug panel's Faces tab (see [`debug::Tab`]); nothing on the face
+//!   itself changes.
 //! * `audio_event` with `Payload::Text("music")` -- the contract for a
 //!   sense that does not exist yet (a music detector on the mic): send
 //!   one per detected beat, or at least one every 2 s while music is
@@ -91,10 +95,10 @@ use common::{Command, RingReceiver};
 use crossbeam_channel::Receiver;
 
 pub use behaviour::{Behaviour, Overlay, Reaction};
-pub use debug::Sources;
+pub use debug::{Panel, Sources, Tab};
 pub use expression::{Expression, FaceState};
 pub use router::{CommandRouter, RouterHandle};
-pub use state::{Attend, UiState};
+pub use state::{Attend, Faces, UiState};
 
 /// How long the consumer loops block before re-checking for shutdown.
 const POLL: Duration = Duration::from_millis(50);
@@ -114,6 +118,8 @@ pub struct UiConfig {
     pub size: (f32, f32),
     /// Whether the debug panel starts open.
     pub debug: bool,
+    /// Which tab the panel opens on.
+    pub tab: debug::Tab,
     /// Come to the front on launch. The Go face did this, then stopped
     /// being pushy after 600 ms; a window that stays always-on-top is
     /// obnoxious.
@@ -130,6 +136,7 @@ impl Default for UiConfig {
             title: "Glydi".to_owned(),
             size: (520.0, 494.0 + TOGGLE_BAR),
             debug: false,
+            tab: debug::Tab::default(),
             front_on_launch: true,
             quit: None,
         }
@@ -199,6 +206,7 @@ struct FaceApp {
     observations: Option<RingReceiver>,
     sources: Sources,
     debug: bool,
+    panel: debug::Panel,
     /// How many `attend`s have already been turned into a glance.
     attends_seen: u64,
     quit: Option<Arc<AtomicBool>>,
@@ -220,6 +228,7 @@ impl FaceApp {
             observations,
             sources,
             debug: config.debug,
+            panel: debug::Panel::on(config.tab),
             attends_seen: 0,
             quit: config.quit.clone(),
         }
@@ -307,7 +316,7 @@ impl eframe::App for FaceApp {
                 .default_size(340.0)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        debug::show(ui, &self.state, &self.sources, now);
+                        debug::show(ui, &mut self.panel, &self.state, &self.sources, now);
                     });
                 });
         }

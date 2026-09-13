@@ -7,6 +7,7 @@
 //!     cargo run -p act-ui --example face -- --level-demo    # talks
 //!     cargo run -p act-ui --example face -- --react laugh   # a reaction every 2.5 s
 //!     cargo run -p act-ui --example face -- --music         # sways to a 0.8 Hz beat
+//!     cargo run -p act-ui --example face -- --faces --debug # a synthetic camera preview
 //!
 //! Runs on the main thread, like the binary must. The screenshots in
 //! `docs/` come from `--state <name>`, captured a few seconds in; the
@@ -29,6 +30,7 @@ fn main() {
     let level_demo = args.iter().any(|a| a == "--level-demo");
     let debug = args.iter().any(|a| a == "--debug");
     let music = args.iter().any(|a| a == "--music");
+    let faces = args.iter().any(|a| a == "--faces");
     // `--react <name>`: play that reaction over the held state every
     // 2.5 s (the yawn is 1.6 s; the pause between lets it read as one).
     let react = args
@@ -57,7 +59,7 @@ fn main() {
             })
         })
         .map(String::as_str)
-        .or_else(|| (level_demo || react.is_some() || music).then_some("idle"))
+        .or_else(|| (level_demo || react.is_some() || music || faces).then_some("idle"))
         .and_then(|a| {
             let e = Expression::parse(a);
             if e.is_none() {
@@ -73,14 +75,20 @@ fn main() {
     let _router = router.spawn().unwrap_or_else(|e| panic!("router: {e}"));
     let (obs_tx, obs_rx) = ObservationRing::bounded(64);
 
-    std::thread::spawn(move || drive(hold, react, music, &queue, &obs_tx));
+    std::thread::spawn(move || drive(hold, react, music, faces, &queue, &obs_tx));
 
-    let sources = demo_sources();
+    let sources = demo_sources(faces);
 
     // The panel is off by default, as in the binary: the face is the
     // product and the panel is for whoever is debugging it.
+    // `--faces` opens the panel on its tab: that is what it is for.
     let config = UiConfig {
-        debug,
+        debug: debug || faces,
+        tab: if faces {
+            act_ui::Tab::Faces
+        } else {
+            act_ui::Tab::Face
+        },
         ..UiConfig::default()
     };
     if let Err(e) = run_ui(&config, ui_rx, Some(obs_rx), sources) {
@@ -97,6 +105,7 @@ fn drive(
     hold: Option<Expression>,
     react: Option<act_ui::Reaction>,
     music: bool,
+    faces: bool,
     queue: &CommandQueue,
     obs_tx: &common::RingSender,
 ) {
@@ -151,6 +160,16 @@ fn drive(
                                 .with_payload(Payload::Text(r.name().to_owned())),
                         );
                     }
+                }
+                // A preview at 5 fps, the camera's cadence, with two
+                // faces drifting so the boxes visibly follow.
+                if faces && tick % 10 == 0 {
+                    obs_tx.send(
+                        Observation::new("cam0", common::MODALITY_CAMERA_PREVIEW, Instant::now())
+                            .with_payload(Payload::Opaque(std::sync::Arc::new(synthetic_preview(
+                                t0.elapsed().as_secs_f32(),
+                            )))),
+                    );
                 }
                 if music && tick % 62 == 0 {
                     obs_tx.send(
@@ -252,8 +271,73 @@ fn speech_level(t: f32) -> (f32, usize) {
     (0.004 + 0.17 * level, phrase)
 }
 
+/// A 320x180 room: a grey wall, a darker floor, and two faces as skin
+/// coloured ovals -- one known and engaged, one stranger looking away --
+/// the first sliding gently with `t` so the boxes can be seen to track.
+fn synthetic_preview(t: f32) -> common::Preview {
+    let (w, h) = (320usize, 180usize);
+    let mut rgb = vec![0u8; w * h * 3];
+    for row in 0..h {
+        let colour: [u8; 3] = if row > h * 2 / 3 {
+            [0x6a, 0x5a, 0x4a]
+        } else {
+            [0xb8, 0xbc, 0xc4]
+        };
+        for col in 0..w {
+            let i = (row * w + col) * 3;
+            rgb[i..i + 3].copy_from_slice(&colour);
+        }
+    }
+    let ana_x = 0.22 + 0.04 * (t * 0.7).sin();
+    let faces = vec![
+        common::PreviewFace {
+            x: ana_x,
+            y: 0.18,
+            w: 0.2,
+            h: 0.36,
+            label: "ana".to_owned(),
+            score: 0.87,
+            track: 3,
+            engaged: true,
+        },
+        common::PreviewFace {
+            x: 0.62,
+            y: 0.28,
+            w: 0.14,
+            h: 0.26,
+            label: "unknown_4".to_owned(),
+            score: 0.71,
+            track: 4,
+            engaged: false,
+        },
+    ];
+    for face in &faces {
+        let centre = (
+            (face.x + face.w / 2.0) * w as f32,
+            (face.y + face.h / 2.0) * h as f32,
+        );
+        let radii = (face.w * w as f32 * 0.42, face.h * h as f32 * 0.46);
+        for row in 0..h {
+            for col in 0..w {
+                let dx = (col as f32 - centre.0) / radii.0;
+                let dy = (row as f32 - centre.1) / radii.1;
+                if dx * dx + dy * dy <= 1.0 {
+                    let i = (row * w + col) * 3;
+                    rgb[i..i + 3].copy_from_slice(&[0xd9, 0xa8, 0x8c]);
+                }
+            }
+        }
+    }
+    common::Preview {
+        width: w,
+        height: h,
+        rgb,
+        faces,
+    }
+}
+
 /// Fake debug sources so the panel has something in it.
-fn demo_sources() -> Sources {
+fn demo_sources(faces: bool) -> Sources {
     let started = Instant::now();
     Sources {
         view: Box::new(move || WorldView::empty(Instant::now())),
@@ -289,5 +373,6 @@ fn demo_sources() -> Sources {
                 turn(2, 290, 640, None, true),
             ]
         })),
+        known_count: faces.then(|| Box::new(|| 7usize) as Box<dyn Fn() -> usize + Send>),
     }
 }

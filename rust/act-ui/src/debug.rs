@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::{Stage, TurnSummary};
+use common::{Preview, PreviewFace, Stage, TurnSummary};
 use mind::{Event, EventKind, WorldView};
 
 use crate::state::UiState;
@@ -38,6 +38,10 @@ pub struct Sources {
     /// `None` hides the section: a bench or a speaker-only run has no
     /// timeline to read.
     pub latency: Option<Box<dyn Fn() -> Vec<TurnSummary> + Send>>,
+    /// How many people the face gallery knows, for the Faces tab's
+    /// "gallery: N known" row. `None` when there is no gallery (no store,
+    /// or the example).
+    pub known_count: Option<Box<dyn Fn() -> usize + Send>>,
 }
 
 impl Sources {
@@ -48,12 +52,222 @@ impl Sources {
             view: Box::new(move || WorldView::empty(now)),
             events: Box::new(|_| Vec::new()),
             latency: None,
+            known_count: None,
+        }
+    }
+}
+
+/// The panel's tabs. `Face` is what the panel always was; `Faces` is the
+/// camera view the Python and Go builds had; `Mind` is the working-memory
+/// snapshot as text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    /// Room, events, commands, latency.
+    #[default]
+    Face,
+    /// The camera preview with the tracked faces boxed.
+    Faces,
+    /// The `[room]` note and the working snapshot, as the model sees them.
+    Mind,
+}
+
+impl Tab {
+    /// Every tab, in display order.
+    pub const ALL: [Self; 3] = [Self::Face, Self::Faces, Self::Mind];
+
+    /// The tab's title.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Face => "Face",
+            Self::Faces => "Faces",
+            Self::Mind => "Mind",
+        }
+    }
+}
+
+/// The window's own panel state: which tab is open and the preview
+/// texture, which is re-uploaded only when a new preview has arrived
+/// (`Faces::seq`), not every frame.
+#[derive(Default)]
+pub struct Panel {
+    /// The open tab.
+    pub tab: Tab,
+    texture: Option<egui::TextureHandle>,
+    uploaded_seq: u64,
+}
+
+impl Panel {
+    /// A panel open on `tab`, with no texture yet.
+    pub fn on(tab: Tab) -> Self {
+        Self {
+            tab,
+            ..Self::default()
         }
     }
 }
 
 /// Draw the panel's contents into `ui`.
-pub fn show(ui: &mut egui::Ui, state: &UiState, src: &Sources, now: Instant) {
+pub fn show(ui: &mut egui::Ui, panel: &mut Panel, state: &UiState, src: &Sources, now: Instant) {
+    ui.horizontal(|ui| {
+        for t in Tab::ALL {
+            ui.selectable_value(&mut panel.tab, t, t.name());
+        }
+    });
+    ui.separator();
+    match panel.tab {
+        Tab::Face => face_tab(ui, state, src, now),
+        Tab::Faces => faces_tab(ui, panel, state, src, now),
+        Tab::Mind => mind_tab(ui, &(src.view)()),
+    }
+}
+
+/// The working-memory snapshot as text: the note the model gets (with
+/// beliefs, without facts -- the panel has no store), then the
+/// `[working]` block, then the crowd and beliefs in full.
+fn mind_tab(ui: &mut egui::Ui, view: &WorldView) {
+    ui.monospace(view.describe_with_beliefs(&|_| Vec::new()));
+    if let Some(w) = view.working.describe() {
+        ui.separator();
+        ui.monospace(w);
+    }
+    ui.separator();
+    ui.monospace(mind_text(view));
+}
+
+/// The rest of the snapshot, as `Debug` text. Verbose by design: this
+/// tab exists to see what the mind holds, not to be pretty.
+pub fn mind_text(view: &WorldView) -> String {
+    use std::fmt::Write;
+    let w = &view.working;
+    let mut s = String::new();
+    let _ = writeln!(s, "engaged: {:?}", w.engaged);
+    let _ = writeln!(s, "speaker: {:?}", w.current_speaker);
+    let _ = writeln!(s, "attention: {:?}", w.attention);
+    let _ = writeln!(s, "beliefs: {:#?}", w.beliefs);
+    let _ = writeln!(s, "outcomes: {:#?}", w.outcomes);
+    let _ = writeln!(s, "rates: {:#?}", w.rates);
+    let _ = write!(s, "self: {:#?}", w.self_model);
+    s
+}
+
+/// The Faces tab: the preview as a texture with a box per face, the
+/// label and score under each, and the list.
+fn faces_tab(ui: &mut egui::Ui, panel: &mut Panel, state: &UiState, src: &Sources, now: Instant) {
+    if let Some(known) = &src.known_count {
+        ui.weak(format!("gallery: {} known", known()));
+    }
+    let Some(preview) = &state.faces.preview else {
+        ui.weak("no camera preview yet");
+        return;
+    };
+    if panel.texture.is_none() || panel.uploaded_seq != state.faces.seq {
+        let image = egui::ColorImage::from_rgb([preview.width, preview.height], &preview.rgb);
+        match panel.texture.as_mut() {
+            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                panel.texture = Some(ui.ctx().load_texture(
+                    "camera_preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        panel.uploaded_seq = state.faces.seq;
+    }
+    if let Some(tex) = &panel.texture {
+        let aspect = preview.width as f32 / preview.height.max(1) as f32;
+        let w = ui.available_width().min(preview.width as f32 * 2.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w / aspect), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        for f in &preview.faces {
+            let colour = face_colour(f);
+            let stroke = egui::Stroke::new(if f.engaged { 3.0 } else { 1.5 }, colour);
+            let box_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(f.x * rect.width(), f.y * rect.height()),
+                egui::vec2(f.w * rect.width(), f.h * rect.height()),
+            );
+            painter.rect_stroke(box_rect, 2, stroke, egui::StrokeKind::Outside);
+            painter.text(
+                box_rect.left_bottom() + egui::vec2(0.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{} {:.2}", f.label, f.score),
+                egui::FontId::proportional(12.0),
+                colour,
+            );
+        }
+    }
+    let rows = face_rows(preview, |t| state.faces.seen_since(t), now);
+    if rows.is_empty() {
+        ui.weak("no faces in view");
+    }
+    egui::Grid::new("faces_list").striped(true).show(ui, |ui| {
+        for r in &rows {
+            ui.label(&r.label);
+            ui.monospace(&r.score);
+            ui.weak(&r.track);
+            ui.weak(r.engaged);
+            ui.weak(&r.since);
+            ui.end_row();
+        }
+    });
+}
+
+/// Green for a gallery match, amber for a stranger.
+fn face_colour(f: &PreviewFace) -> egui::Color32 {
+    if f.is_known() {
+        egui::Color32::from_rgb(0x3f, 0x8e, 0x6a)
+    } else {
+        egui::Color32::from_rgb(0xe0, 0x9a, 0x2a)
+    }
+}
+
+/// One line of the Faces list, ready to draw. Computed apart from egui so
+/// the wording is testable without a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaceRow {
+    /// The name, or `unknown_n`.
+    pub label: String,
+    /// `0.87`.
+    pub score: String,
+    /// `track 3`.
+    pub track: String,
+    /// `engaged` or `looking away`.
+    pub engaged: &'static str,
+    /// `seen 12s`.
+    pub since: String,
+}
+
+/// The rows of the Faces list, in preview order. `since` says when each
+/// track first appeared in a preview.
+pub fn face_rows(
+    preview: &Preview,
+    since: impl Fn(u32) -> Option<Instant>,
+    now: Instant,
+) -> Vec<FaceRow> {
+    preview
+        .faces
+        .iter()
+        .map(|f| FaceRow {
+            label: f.label.clone(),
+            score: format!("{:.2}", f.score),
+            track: format!("track {}", f.track),
+            engaged: if f.engaged { "engaged" } else { "looking away" },
+            since: since(f.track).map_or_else(
+                || "seen now".to_owned(),
+                |t| format!("seen {}", ago(now, t)),
+            ),
+        })
+        .collect()
+}
+
+/// The original panel: room, events, commands, latency.
+fn face_tab(ui: &mut egui::Ui, state: &UiState, src: &Sources, now: Instant) {
     let view = (src.view)();
     egui::CollapsingHeader::new(format!("room — {} present", view.people.len()))
         .default_open(true)
@@ -254,7 +468,9 @@ mod tests {
             view: Box::new(move || WorldView::empty(now)),
             events: Box::new(|_| Vec::new()),
             latency: Some(Box::new(|| vec![turn(1, Some(310), Some(1420), Some(180))])),
+            known_count: Some(Box::new(|| 4)),
         };
+        assert_eq!(full.known_count.as_ref().map(|f| f()), Some(4));
         let got = full.latency.as_ref().map(|f| f());
         assert_eq!(got.as_ref().map(Vec::len), Some(1));
         assert_eq!(latency_rows(&[]), Vec::new());
@@ -277,6 +493,39 @@ mod tests {
         assert_eq!(rows[0].cells, ["900", "200", "-", "-"]);
         assert_eq!(rows[0].slowest, Some(Stage::Stt));
         assert!(rows[0].cancelled);
+    }
+
+    #[test]
+    fn face_rows_say_who_how_sure_and_since_when() {
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(12)).unwrap_or(now);
+        let face = |track, label: &str, engaged| PreviewFace {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+            label: label.to_owned(),
+            score: 0.871,
+            track,
+            engaged,
+        };
+        let preview = Preview {
+            width: 1,
+            height: 1,
+            rgb: vec![0; 3],
+            faces: vec![face(3, "ana", true), face(4, "unknown_4", false)],
+        };
+        let rows = face_rows(&preview, |t| (t == 3).then_some(earlier), now);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "ana");
+        assert_eq!(rows[0].score, "0.87");
+        assert_eq!(rows[0].track, "track 3");
+        assert_eq!(rows[0].engaged, "engaged");
+        assert_eq!(rows[0].since, "seen 12s");
+        assert_eq!(rows[1].engaged, "looking away");
+        assert_eq!(rows[1].since, "seen now");
+        assert_eq!(Tab::default(), Tab::Face);
+        assert_eq!(Tab::ALL.map(Tab::name), ["Face", "Faces", "Mind"]);
     }
 
     #[test]

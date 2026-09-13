@@ -112,7 +112,9 @@ fn parts(frames: usize, detector: Box<dyn FaceDetector>) -> Parts {
 fn drain(rx: &common::RingReceiver) -> Vec<Observation> {
     drain_all(rx)
         .into_iter()
-        .filter(|o| o.modality != MODALITY_CROWD)
+        // The crowd count and the camera preview ride beside the faces;
+        // the face-level assertions here are about the faces.
+        .filter(|o| o.modality != MODALITY_CROWD && o.modality != common::MODALITY_CAMERA_PREVIEW)
         .collect()
 }
 
@@ -253,7 +255,10 @@ fn blank_frames_produce_no_observations() {
             .unwrap_or_else(|e| panic!("spawn: {e}"));
     wait_finished(&handle);
     assert_eq!(handle.stats().frames.load(Ordering::SeqCst), 5);
-    assert_eq!(handle.stats().observations.load(Ordering::SeqCst), 0);
+    // The camera preview goes out even with nobody in shot (the Faces tab
+    // shows the room); nothing about a face does.
+    let previews = handle.stats().previews.load(Ordering::SeqCst);
+    assert_eq!(handle.stats().observations.load(Ordering::SeqCst), previews);
     assert!(drain(&rx).is_empty());
     handle.stop();
 }
@@ -552,4 +557,60 @@ fn spawn_reports_a_missing_model_instead_of_hanging() {
         panic!("spawn succeeded without models")
     };
     assert!(matches!(err, Error::MissingModel { .. }), "{err}");
+}
+
+#[test]
+fn a_preview_goes_out_every_third_frame_with_the_faces_boxed_and_labelled() {
+    use sense_vision::{MODALITY_CAMERA_PREVIEW, PREVIEW_EVERY, PREVIEW_MAX_WIDTH, Preview};
+    let (tx, rx) = ObservationRing::bounded(128);
+    let clock = Arc::new(FakeClock::new());
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    // A 640x480 frame with a face at (64,48)-(192,144): a tenth in, a
+    // fifth wide.
+    let det = OneFace {
+        bbox: [64.0, 48.0, 192.0, 144.0],
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let handle = VisionSense::spawn_with(config(7), clock, tx, gallery, parts(7, Box::new(det)))
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    let obs = drain_all(&rx);
+    let previews: Vec<Arc<Preview>> = obs
+        .iter()
+        .filter(|o| o.modality == MODALITY_CAMERA_PREVIEW)
+        .map(|o| match &o.payload {
+            Payload::Opaque(p) => Arc::clone(p)
+                .downcast::<Preview>()
+                .unwrap_or_else(|_| panic!("preview payload is not a Preview")),
+            p => panic!("unexpected payload {p:?}"),
+        })
+        .collect();
+    // Frames 1, 4 and 7 of 7: one in every `PREVIEW_EVERY`, the first
+    // frame included so the tab fills as soon as the camera is up.
+    assert_eq!(
+        previews.len(),
+        7usize.div_ceil(PREVIEW_EVERY as usize),
+        "{obs:#?}"
+    );
+    assert_eq!(handle.stats().previews.load(Ordering::SeqCst), 3);
+    for p in &previews {
+        assert_eq!((p.width, p.height), (PREVIEW_MAX_WIDTH, 240));
+        assert!(p.is_consistent());
+        assert_eq!(p.faces.len(), 1);
+        let f = &p.faces[0];
+        assert_eq!((f.label.as_str(), f.track), ("unknown_1", 1));
+        assert!(!f.is_known());
+        assert!((f.score - 0.93).abs() < 1e-6);
+        assert!(
+            (f.x - 0.1).abs() < 1e-6 && (f.y - 0.1).abs() < 1e-6,
+            "{f:?}"
+        );
+        assert!(
+            (f.w - 0.2).abs() < 1e-6 && (f.h - 0.2).abs() < 1e-6,
+            "{f:?}"
+        );
+        // The fake landmarks are symmetric about the box: straight on.
+        assert!(f.engaged);
+    }
+    handle.stop();
 }

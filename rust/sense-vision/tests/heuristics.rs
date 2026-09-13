@@ -235,8 +235,14 @@ fn scene_reports_dark_then_bright_and_a_level_every_interval() {
     assert!(levels[0].abs() < 1e-6 && levels[1].abs() < 1e-6);
     assert!((levels[2] - 110.0 / 255.0).abs() < 0.01, "{levels:?}");
     assert_eq!(stats.scene_changes.load(Ordering::SeqCst), 2);
-    // Nothing else came out: no faces, no gestures.
-    assert!(obs.iter().all(|o| o.modality == MODALITY_SCENE), "{obs:#?}");
+    // Nothing else came out: no faces, no gestures. The camera preview
+    // rides on every run (tests/mock_pipeline.rs covers it).
+    assert!(
+        obs.iter()
+            .all(|o| o.modality == MODALITY_SCENE
+                || o.modality == sense_vision::MODALITY_CAMERA_PREVIEW),
+        "{obs:#?}"
+    );
 }
 
 #[test]
