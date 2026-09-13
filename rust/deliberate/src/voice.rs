@@ -1014,3 +1014,109 @@ mod textual_call_tests {
         assert!(!might_be_tool_call("Remember me?"));
     }
 }
+
+/// Leads of a self-introduction.
+const LEADS: [&str; 8] = [
+    "my name is ",
+    "my name's ",
+    "call me ",
+    "this is ",
+    "i am ",
+    "i'm ",
+    "im ",
+    "it's ",
+];
+
+/// "I'm fine", "I'm good", "I am here", "it's me": states, not names.
+const NOT_NAMES: [&str; 22] = [
+    "fine", "good", "ok", "okay", "great", "well", "here", "back", "me", "tired", "bored", "sorry",
+    "done", "ready", "busy", "not", "just", "so", "very", "really", "leaving", "going",
+];
+
+/// The name in a self-introduction: "I'm Kalyan", "I am Kalyan", "my
+/// name is Kalyan", "call me Kalyan", "this is Kalyan", "it's Kalyan
+/// actually", or a bare one-or-two-word answer when `after_name_question`
+/// (GLYDI just asked). `None` for anything else, including "I'm fine".
+///
+/// Measured live: told "I am Kalyan", the 3B model called
+/// `recall_person("Kalyan")` (the person is "not in the room") and then
+/// said it did not know anyone called Kalyan; told "I am Kriyan" it called
+/// `forget_person`. A name given is enrolled here, deterministically,
+/// before the model sees the turn.
+pub fn self_introduction(text: &str, after_name_question: bool) -> Option<String> {
+    let t = text.trim().trim_end_matches(['.', '!', '?', ',']).trim();
+    let lower = t.to_lowercase();
+    let rest = LEADS
+        .iter()
+        .find_map(|l| lower.strip_prefix(l).map(|_| &t[l.len()..]))
+        .map(str::trim);
+    let candidate = match rest {
+        Some(r) => r,
+        None if after_name_question => t,
+        None => return None,
+    };
+    let candidate = candidate
+        .trim_end_matches(" actually")
+        .trim_end_matches(" here")
+        .trim_end_matches(" by the way")
+        .trim();
+    let words: Vec<&str> = candidate.split_whitespace().collect();
+    if words.is_empty() || words.len() > 2 {
+        return None;
+    }
+    if NOT_NAMES.contains(&words[0].to_lowercase().as_str()) {
+        return None;
+    }
+    if !words.iter().all(|w| {
+        w.chars()
+            .all(|c| c.is_alphabetic() || c == '-' || c == '\'')
+    }) {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let mut cs = w.chars();
+        if let Some(f) = cs.next() {
+            out.extend(f.to_uppercase());
+            out.push_str(cs.as_str());
+        }
+    }
+    Some(out)
+}
+
+/// Whether one of GLYDI's own lines asked for a name, so the next short
+/// answer is one.
+pub fn asks_for_name(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("your name") || l.contains("who are you") || l.contains("what do i call you")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod self_intro_tests {
+    use super::*;
+
+    #[test]
+    fn introductions_yield_a_name_and_states_do_not() {
+        assert_eq!(self_introduction("I am Kalyan.", false).unwrap(), "Kalyan");
+        assert_eq!(self_introduction("i'm kalyan", false).unwrap(), "Kalyan");
+        assert_eq!(
+            self_introduction("My name is Ada Lovelace", false).unwrap(),
+            "Ada Lovelace"
+        );
+        assert_eq!(
+            self_introduction("it's Mukesh actually", false).unwrap(),
+            "Mukesh"
+        );
+        assert_eq!(self_introduction("Kalyan.", true).unwrap(), "Kalyan");
+        assert!(self_introduction("Kalyan.", false).is_none());
+        assert!(self_introduction("I'm fine", true).is_none());
+        assert!(self_introduction("I am going to Google it", false).is_none());
+        assert!(self_introduction("we don't know anyone", true).is_none());
+        assert!(asks_for_name("I don't know your name yet, what is it?"));
+        assert!(!asks_for_name("What do you do?"));
+    }
+}

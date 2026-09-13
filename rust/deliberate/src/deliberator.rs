@@ -445,6 +445,9 @@ pub struct Session {
     /// Who we asked for a name, and when; the next utterance within
     /// [`NAME_ANSWER_WINDOW`] is the answer.
     pending_name: Option<(Option<EntityId>, Instant)>,
+    /// GLYDI's last spoken line asked for a name, so a bare "Kalyan." next
+    /// is an answer, whichever path asked.
+    asked_name_last: bool,
     /// Who the mind said not to answer, and when it said so. An entry is
     /// good for [`IGNORE_TTL`]; see [`Session::run`].
     ignore: HashMap<EntityId, Instant>,
@@ -523,6 +526,7 @@ impl Session {
             last_intent_say: HashMap::new(),
             last_curious: HashMap::new(),
             pending_name: None,
+            asked_name_last: false,
             ignore: HashMap::new(),
             absent_hint: false,
             lull: false,
@@ -1159,6 +1163,39 @@ impl Session {
         );
     }
 
+    /// A name given ("I'm Kalyan", or "Kalyan." right after we asked) is
+    /// enrolled here, before the model sees the turn -- see
+    /// `voice::self_introduction` for what the model did when left to it.
+    /// Returns the name as enrolled.
+    fn enrol_introduction(&mut self, text: &str, after_name_question: bool) -> Option<String> {
+        crate::voice::self_introduction(text, after_name_question).map(|name| {
+            let view = (self.snapshot)();
+            let out = self
+                .tools
+                .invoke(REMEMBER_NAME, &serde_json::json!({ "name": name }), &view);
+            tracing::info!(name, %out, "self-introduction enrolled");
+            if let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) {
+                // Same shape as the model-path binding: the mind merges the
+                // track into the named entity.
+                let track = view
+                    .speaker()
+                    .map(|p| &p.id)
+                    .filter(|id| id.is_track())
+                    .and_then(|id| id.as_str().strip_prefix("track:"))
+                    .and_then(|n| n.parse::<u32>().ok());
+                let mut payload = serde_json::json!({ "entity": entity, "name": name });
+                if let Some(t) = track {
+                    payload["track"] = serde_json::json!(t);
+                }
+                self.commands.push(
+                    Command::new(SET_NAME_TARGET, SET_NAME_KIND, Priority::Deliberate)
+                        .with_payload(Payload::Text(payload.to_string())),
+                );
+            }
+            name
+        })
+    }
+
     /// The `[note]` line for a turn that asks what we can see, hear or
     /// do, built from the mind's [`SelfModel`](mind::SelfModel): which
     /// senses have actually delivered lately, and what the camera reports
@@ -1321,11 +1358,22 @@ impl Session {
                 NOTE_ALREADY_GREETED.replace("{name}", &name)
             })
         });
-        let mut content = match (answering_name, greeted_line) {
-            (true, _) => format!("{NAME_ANSWER_HINT}\n\n{text}"),
-            (false, Some(line)) => format!("{text}\n\n{line}"),
-            (false, None) => text.to_owned(),
+        // A name given is enrolled here, not left to the model (see
+        // `voice::self_introduction` for what the model did instead).
+        let introduced = self.enrol_introduction(text, answering_name || self.asked_name_last);
+        self.asked_name_last = false;
+        let introduced_some = introduced.is_some();
+        let mut content = match (introduced, answering_name, greeted_line) {
+            (Some(name), _, _) => format!(
+                "[note] They just told you their name: {name}. You have remembered it already. \
+                 Do not look them up and do not call any tool. Greet them by name once and \
+                 ask one small thing about them.\n\n{text}"
+            ),
+            (None, true, _) => format!("{NAME_ANSWER_HINT}\n\n{text}"),
+            (None, false, Some(line)) => format!("{text}\n\n{line}"),
+            (None, false, None) => text.to_owned(),
         };
+        let introduced = introduced_some;
         if asks_about_senses(text) {
             content.push_str("\n\n");
             content.push_str(&Self::self_note(&(self.snapshot)()));
@@ -1351,7 +1399,7 @@ impl Session {
             )
         };
         self.conversation.push(Message::user(content));
-        self.absent_hint = names_someone_absent(text, &(self.snapshot)());
+        self.absent_hint = !introduced && names_someone_absent(text, &(self.snapshot)());
         self.memory_request = asks_to_be_forgotten(text);
         let result = self.respond(speaker, obs, &cancel).await;
         self.absent_hint = false;
@@ -1680,6 +1728,9 @@ impl Session {
         spoken.push_str(&sentence);
         spoken.push(' ');
         self.said.push(&sentence);
+        if crate::voice::asks_for_name(&sentence) {
+            self.asked_name_last = true;
+        }
         self.say(sentence);
     }
 
@@ -3174,7 +3225,9 @@ mod tests {
         let cmds = drain(&commands);
         let set: Vec<&(String, String, String)> =
             cmds.iter().filter(|c| c.1 == SET_NAME_KIND).collect();
-        assert_eq!(set.len(), 1);
+        // One from the enrolment done before the model saw the turn, and
+        // possibly one more from the model's own remember_name call.
+        assert!(!set.is_empty());
         assert_eq!(set[0].0, SET_NAME_TARGET);
         let payload: serde_json::Value = serde_json::from_str(&set[0].2).unwrap();
         assert_eq!(
@@ -3183,7 +3236,12 @@ mod tests {
         );
         // It lands before the reply that follows the tool round.
         let kinds: Vec<&str> = cmds.iter().map(|c| c.1.as_str()).collect();
-        assert_eq!(kinds, ["thinking", SET_NAME_KIND, "say", "idle"]);
+        // One binding from the enrolment before the model saw the turn,
+        // one from the model's own remember_name call.
+        assert_eq!(
+            kinds,
+            ["thinking", SET_NAME_KIND, SET_NAME_KIND, "say", "idle"]
+        );
     }
 
     #[tokio::test]
@@ -3290,7 +3348,7 @@ mod tests {
             .find(|m| m.role == Role::User)
             .unwrap();
         assert!(
-            last_user.content.contains(NAME_ANSWER_HINT),
+            last_user.content.contains("their name:"),
             "{}",
             last_user.content
         );
@@ -4025,6 +4083,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_self_introduction_is_enrolled_before_the_model_sees_it() {
+        let mut r = rig(vec![Script::text(&["Nice to meet you, Kalyan."])], vec![]);
+        r.session
+            .handle_utterance(
+                "I am Kalyan.",
+                None,
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // Enrolled without a tool round: one request, the note in it.
+        let reqs = r.llm.requests();
+        assert_eq!(reqs.len(), 1);
+        let last = reqs[0]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(
+            last.content.contains("their name: Kalyan"),
+            "{}",
+            last.content
+        );
+        // (With nobody in the room the in-memory facts have no one to
+        // attach the name to; the store does. The note is what matters.)
+        let cmds = drain(&r.commands);
+        assert!(
+            cmds.iter().any(|c| c.2 == "Nice to meet you, Kalyan."),
+            "{cmds:?}"
+        );
+        // A bare name right after GLYDI asked for one is an answer too.
+        let mut r = rig(
+            vec![
+                Script::text(&["I don't know your name yet, what is it?"]),
+                Script::text(&["Hi Ravi."]),
+            ],
+            vec![],
+        );
+        r.session
+            .handle_utterance("Hello.", None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        r.session
+            .handle_utterance("Ravi.", None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        let reqs = r.llm.requests();
+        let last = reqs[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(
+            last.content.contains("their name: Ravi"),
+            "bare answer not enrolled: {}",
+            last.content
+        );
+    }
+
+    #[tokio::test]
     async fn a_tool_call_written_as_words_is_run_not_spoken() {
         let mut r = rig(
             vec![
@@ -4367,12 +4488,7 @@ mod tests {
         assert_eq!(says(&cmds)[0], "What should I call you?");
         let note = reqs[0].messages.last().unwrap().content.clone();
         assert!(note.contains("Ask their name"), "{note}");
-        assert!(
-            user_turns(&reqs[1])
-                .last()
-                .unwrap()
-                .contains(NAME_ANSWER_HINT)
-        );
+        assert!(user_turns(&reqs[1]).last().unwrap().contains("their name:"));
     }
 
     #[tokio::test]
