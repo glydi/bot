@@ -342,3 +342,160 @@ fn barge_in_over_the_bots_own_voice_reaches_the_vad() {
     );
     assert!(stats.aec_frames.load(std::sync::atomic::Ordering::Relaxed) > 0);
 }
+
+/// `x` (16 kHz) at 24 kHz, linear: what the synth hands the speaker
+/// looks like from the sense's side once the timeline resamples it back.
+fn to_24k(input: &[f32]) -> Vec<f32> {
+    let n = input.len() * 3 / 2;
+    let last = input.len() - 1;
+    (0..n)
+        .map(|i| {
+            let pos = i as f32 * 2.0 / 3.0;
+            let idx = pos as usize;
+            let frac = pos - idx as f32;
+            let lo = input[idx.min(last)];
+            let hi = input[(idx + 1).min(last)];
+            lo + (hi - lo) * frac
+        })
+        .collect()
+}
+
+/// The live path: Kokoro's 24 kHz blocks, 20 ms each, stamped by the
+/// engine with the instant they start *playing* (the write's return
+/// plus the device queue ahead of it, so the stamps run 20 ms apart and
+/// arrive up to 500 ms before they are heard), and a 16 kHz mic that
+/// hears the echo 60 ms after each stamp. It must lock on that 60 ms
+/// and cancel. The 2026-09-12 launch log had the engine's stamps 420 ms
+/// late (`pending` was counted in 44.1 kHz device samples and divided by
+/// 24 kHz), which put the echo outside the -64..512 ms search window:
+/// `erle_db=0.0 locked=false` after every reply.
+#[test]
+fn locks_on_24k_blocks_stamped_like_the_engine() {
+    let secs = 5.0;
+    let far = talker(secs, 130.0, 11, 0.35);
+    let mic = convolve(&far, &room_impulse(5));
+    let far24 = to_24k(&far);
+    let queue = Arc::new(FarEndQueue::new());
+    let mut aec = Aec::new(queue.clone());
+    let t0 = Instant::now();
+    // 20 ms at 24 kHz, stamped contiguously: block i plays at t0 + 20i ms.
+    let block = 480;
+    let mut pushed = 0;
+    let delay_ms = 60u64;
+    let mut reports = Vec::new();
+    let mut frame = vec![0.0f32; FRAMES_PER_BUFFER];
+    for (j, chunk) in mic.chunks(FRAMES_PER_BUFFER).enumerate() {
+        let now = t0
+            + Duration::from_millis(delay_ms)
+            + Duration::from_micros(((j + 1) * FRAMES_PER_BUFFER * 1_000_000 / FS) as u64);
+        // The engine's writer runs ~500 ms ahead of playback: push every
+        // block whose start is within 500 ms of now.
+        while pushed * block < far24.len()
+            && t0 + Duration::from_millis(20 * pushed as u64) <= now + Duration::from_millis(500)
+        {
+            let end = ((pushed + 1) * block).min(far24.len());
+            queue.push(FarBlock {
+                at: t0 + Duration::from_millis(20 * pushed as u64),
+                rate: 24_000,
+                samples: far24[pushed * block..end].to_vec(),
+            });
+            pushed += 1;
+        }
+        frame.fill(0.0);
+        frame[..chunk.len()].copy_from_slice(chunk);
+        reports.push(aec.process(&mut frame, now));
+    }
+    let locked = reports
+        .iter()
+        .position(|r| r.delay.is_some())
+        .map(|j| j as f32 * FRAMES_PER_BUFFER as f32 / FS as f32);
+    let delay = reports.last().and_then(|r| r.delay);
+    let erle = reports.last().map_or(0.0, |r| r.erle_db);
+    let audible_from = reports
+        .iter()
+        .position(|r| r.audible)
+        .map(|j| j as f32 * FRAMES_PER_BUFFER as f32 / FS as f32);
+    eprintln!(
+        "locked at {locked:?} s, delay {delay:?} samples, erle {erle:.1} dB, audible from {audible_from:?} s"
+    );
+    let delay = delay.unwrap_or_else(|| panic!("never locked (locked {locked:?})"));
+    let expect = (delay_ms as f64 * FS as f64 / 1000.0) as i64;
+    assert!(
+        (delay - expect).abs() <= 48,
+        "delay {delay} samples, expected {expect} (+-3 ms)"
+    );
+    assert!(erle >= UNMUTE_DB + 4.0, "erle {erle:.1} dB");
+    assert!(
+        audible_from.is_some_and(|t| t < 3.0),
+        "the mic never opened while the bot spoke: {audible_from:?}"
+    );
+}
+
+/// The hot-plugged microphone (the macOS permission prompt, or the log's
+/// "microphone attached" seconds after start-up): the sense is spawned
+/// without a source, the bot is already talking when the mic arrives,
+/// and `self_speaking` is true for every frame it ever sees. The
+/// canceller must still lock and open the mic -- adaptation runs on
+/// muted frames, or it never gets the chance.
+#[test]
+fn deferred_microphone_locks_while_the_bot_is_already_talking() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("sense_audio=debug")
+        .with_test_writer()
+        .try_init();
+    let secs = 4.5;
+    let far = talker(secs, 125.0, 21, 0.35);
+    let echo = convolve(&far, &room_impulse(9));
+    // The mic hears silence for the first 160 ms, then the echo: the
+    // far end is stamped to start 100 ms after the attach and the room
+    // adds 60.
+    let lead = 160 * FS / 1000;
+    let mut mic = vec![0.0f32; lead];
+    mic.extend_from_slice(&echo);
+    let far24 = to_24k(&far);
+
+    let queue = Arc::new(FarEndQueue::new());
+    let mut cfg = AudioConfig::default().without_models();
+    cfg.warm_up = false;
+    cfg.far_end = Some(queue.clone());
+    let (tx, _rx) = ObservationRing::bounded(4096);
+    let speaking = Arc::new(AtomicBool::new(true));
+    let mut h = AudioSense::spawn_deferred(cfg, Arc::new(RealClock), tx, speaking)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        h.stats()
+            .aec_active
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the canceller is built before the mic arrives"
+    );
+
+    let t0 = Instant::now() + Duration::from_millis(100);
+    for (i, block) in far24.chunks(480).enumerate() {
+        queue.push(FarBlock {
+            at: t0 + Duration::from_millis(20 * i as u64),
+            rate: 24_000,
+            samples: block.to_vec(),
+        });
+    }
+    let src = MockInput::from_samples(&mic, FS as u32, "late mic").realtime(true);
+    h.attach(Box::new(src))
+        .unwrap_or_else(|e| panic!("attach: {e}"));
+    h.join();
+    let stats = h.stats();
+    let delay = stats
+        .aec_delay_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let erle = stats
+        .aec_erle_db_x10
+        .load(std::sync::atomic::Ordering::Relaxed) as f32
+        / 10.0;
+    let heard = stats.aec_frames.load(std::sync::atomic::Ordering::Relaxed);
+    let muted = stats
+        .muted_frames
+        .load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("delay {delay} ms, erle {erle:.1} dB, frames heard {heard}, muted {muted}");
+    assert!((30..=200).contains(&delay), "delay {delay} ms: no lock");
+    assert!(erle >= UNMUTE_DB, "erle {erle:.1} dB");
+    assert!(muted > 0, "the first frames are muted until the lock");
+    assert!(heard > 0, "the mic never opened while the bot spoke");
+}

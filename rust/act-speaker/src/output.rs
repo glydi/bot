@@ -79,8 +79,7 @@ fn at_rate(n: usize, from: u32, to: u32) -> usize {
     if from == to || from == 0 {
         return n;
     }
-    let scaled = n as u64 * u64::from(to);
-    ((scaled + u64::from(from) - 1) / u64::from(from)) as usize
+    ((n as u64 * u64::from(to)).div_ceil(u64::from(from))) as usize
 }
 
 /// The default output device via cpal.

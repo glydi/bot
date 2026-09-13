@@ -17,6 +17,8 @@ use act_speaker::{MockSynth, NullOutput, SAMPLE_RATE};
 use common::{EntityHint, EntityId, Observation, Payload};
 use deliberate::mock::{MockLlm, Script};
 use glydi::{App, Config, Parts};
+use sense_audio::SourceOpener;
+use sense_audio::input::FrameSource;
 use sense_audio::mock::MockInput;
 
 /// Poll `cond` until it holds or `timeout` passes.
@@ -120,4 +122,49 @@ fn utterance_is_answered_and_remembered() {
         "took {:?}",
         started.elapsed()
     );
+}
+
+/// The far end must reach the audio sense on the path the real launch
+/// takes: no speech models (`without_models`), and the microphone opened
+/// later on the helper thread (the 2026-09-12 log: `audio echo control
+/// far_end=true`, then `microphone attached` 3 s after). The canceller
+/// exists from the start, and survives the attach.
+#[test]
+fn far_end_reaches_a_deferred_microphone_without_models() {
+    let config = Config::load(None).expect("defaults load");
+    let db = std::env::temp_dir().join(format!("glydi-farend-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let open: SourceOpener = Box::new(|| {
+        std::thread::sleep(Duration::from_millis(150));
+        Ok(Box::new(
+            MockInput::from_samples(&vec![0.0f32; 16_000], 16_000, "late silence").realtime(true),
+        ) as Box<dyn FrameSource>)
+    });
+    let parts = Parts {
+        headless: true,
+        no_camera: true,
+        no_models: true,
+        db: Some(db.clone()),
+        open_frames: Some(open),
+        speaker: Some((
+            Box::new(MockSynth::new()),
+            Box::new(NullOutput::new(SAMPLE_RATE)),
+        )),
+        backend: Some(MockLlm::new(vec![]) as Arc<dyn deliberate::ChatBackend>),
+        canned_proactive: true,
+        ..Parts::default()
+    };
+    let app = App::build(&config, parts).expect("app builds without hardware");
+    assert!(app.audio_running() && !app.audio_listening());
+    assert!(
+        app.audio_cancels_echo(),
+        "the canceller must exist before the microphone arrives"
+    );
+    assert!(
+        wait_for(Duration::from_secs(3), || app.audio_listening()),
+        "the late microphone never attached"
+    );
+    assert!(app.audio_cancels_echo(), "lost the canceller on attach");
+    app.stop();
+    let _ = std::fs::remove_file(&db);
 }

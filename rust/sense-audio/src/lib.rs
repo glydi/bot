@@ -808,9 +808,11 @@ mod tests {
     #[test]
     fn without_models_keeps_the_far_end_and_the_canceller() {
         let queue = Arc::new(aec::FarEndQueue::new());
-        let mut cfg = AudioConfig::default();
-        cfg.far_end = Some(queue);
-        let cfg = cfg.without_models();
+        let cfg = AudioConfig {
+            far_end: Some(queue),
+            ..AudioConfig::default()
+        };
+        let mut cfg = cfg.without_models();
         assert!(cfg.far_end.is_some() && cfg.aec);
         cfg.warm_up = false;
         let (tx, _rx) = ObservationRing::bounded(16);
