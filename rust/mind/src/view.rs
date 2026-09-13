@@ -237,7 +237,57 @@ impl WorldView {
         if let Some(inv) = self.working.inventory() {
             let _ = write!(s, "\nIn view: {inv}");
         }
+        if let Some(line) = self.crowd_line() {
+            s.push('\n');
+            s.push_str(&line);
+        }
         s
+    }
+
+    /// The crowd line, from [`CROWD`](crate::working::CROWD) people up:
+    ///
+    /// ```text
+    /// People here: 6 (Ada, Bob, 4 you don't know). Waiting: Cara. Ada has been talking for 50 s.
+    /// ```
+    ///
+    /// Measured wording like the rest of the note: names for the known,
+    /// a count for the strangers, no labels. "Waiting" and "talking for"
+    /// only when there is something to say; a stranger waiting is "one
+    /// you don't know". `None` below the crowd size: the name lines
+    /// already say who is here.
+    pub fn crowd_line(&self) -> Option<String> {
+        let c = &self.working.crowd;
+        if !c.is_crowd() {
+            return None;
+        }
+        let known: Vec<String> = self
+            .people
+            .iter()
+            .filter(|p| p.is_known())
+            .map(ViewEntity::label)
+            .collect();
+        let unknown = c.present.saturating_sub(known.len());
+        let mut who = known.join(", ");
+        if unknown > 0 {
+            if !who.is_empty() {
+                who.push_str(", ");
+            }
+            let _ = write!(who, "{unknown} you don't know");
+        }
+        let mut line = format!("People here: {} ({who}).", c.present);
+        if !c.waiting.is_empty() || c.waiting_unknown > 0 {
+            let mut w = c.waiting.iter().map(SmolStr::to_string).collect::<Vec<_>>();
+            if c.waiting_unknown > 0 {
+                w.push(format!("{} you don't know", c.waiting_unknown));
+            }
+            let _ = write!(line, " Waiting: {}.", w.join(", "));
+        }
+        if c.talker_seconds >= 10
+            && let Some(t) = c.talker.as_deref()
+        {
+            let _ = write!(line, " {t} has been talking for {} s.", c.talker_seconds);
+        }
+        Some(line)
     }
 
     /// "back after N min" for someone who recently came back from a real

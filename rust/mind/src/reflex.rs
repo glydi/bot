@@ -214,6 +214,9 @@ impl Reflex {
         {
             self.working.attention = Some(e.id.clone());
         }
+        // The crowd view every rule reads this pass: one walk of the
+        // room here rather than one per rule.
+        self.working.refresh_crowd(&self.world, now);
         self.goals.from_events(events, &self.world, &self.working);
         let mut cx = Cognition {
             now,

@@ -34,6 +34,50 @@ pub const DEFAULT_IOU_THRESHOLD: f32 = 0.3;
 pub const DEFAULT_MAX_AGE_FRAMES: u32 = 15;
 /// Python `VisionConfig.votes_to_confirm`.
 pub const DEFAULT_VOTES_TO_CONFIRM: usize = 5;
+/// The most faces followed at once. A school corridor can put twenty in
+/// frame; past a dozen the mind cannot hold a conversation with any of
+/// them anyway, and every extra track is an `ArcFace` crop per frame
+/// (~1 ms each) plus four observations per tick on the ring. The twelve
+/// kept are the largest and most central: the people who walked up.
+pub const MAX_LIVE_TRACKS: usize = 12;
+
+/// Keep the `cap` detections a crowd is about: the largest and most
+/// central faces. The score is face width weighted by how close the
+/// centre is to the frame's centre (a face at the edge of frame counts
+/// three quarters of the same face in the middle -- someone half out of
+/// shot is on their way past). Detections arrive in descending detector
+/// score; the ones kept are returned in that same order, so the
+/// tracker's tie-breaking is unchanged.
+///
+/// With `cap` or fewer detections this is a no-op, so a room with one or
+/// two people never pays for it.
+pub fn select_crowd(dets: &mut Vec<Detection>, frame_w: usize, frame_h: usize, cap: usize) {
+    if dets.len() <= cap {
+        return;
+    }
+    let (cx, cy) = (frame_w as f32 / 2.0, frame_h as f32 / 2.0);
+    let reach = cx.hypot(cy).max(1.0);
+    let score = |d: &Detection| {
+        let w = (d.bbox[2] - d.bbox[0]).max(0.0);
+        let fx = f32::midpoint(d.bbox[0], d.bbox[2]);
+        let fy = f32::midpoint(d.bbox[1], d.bbox[3]);
+        let off = (fx - cx).hypot(fy - cy) / reach;
+        w * (1.0 - 0.25 * off.clamp(0.0, 1.0))
+    };
+    let mut ranked: Vec<(usize, f32)> = dets.iter().map(score).enumerate().collect();
+    // Stable: equal scores keep detector order.
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut keep = vec![false; dets.len()];
+    for (i, _) in ranked.into_iter().take(cap) {
+        keep[i] = true;
+    }
+    let mut i = 0;
+    dets.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+}
 
 /// Intersection over union of two `[x1, y1, x2, y2]` boxes (no `+1` here:
 /// this is the tracker's `IoU`, not NMS's).
@@ -310,6 +354,15 @@ impl Tracker {
         self.tracks.len()
     }
 
+    /// Live tracks (matched this frame) whose face is at least `min_w`
+    /// pixels wide: the faces worth telling the mind about.
+    pub fn live_count(&self, min_w: f32) -> usize {
+        self.tracks
+            .values()
+            .filter(|t| t.is_live() && t.bbox[2] - t.bbox[0] >= min_w)
+            .count()
+    }
+
     /// Whether nothing is tracked.
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
@@ -449,6 +502,54 @@ mod tests {
             assert!(needed < 100);
         }
         assert!(needed <= VOTE_WINDOW / 2 + 1, "took {needed} frames");
+    }
+
+    #[test]
+    fn a_crowd_is_capped_to_the_largest_most_central_faces() {
+        // Twenty faces on a 640x480 frame: sizes 20..=58 px, the biggest
+        // at the edges, a mid-sized one dead centre.
+        let mut dets: Vec<Detection> = (0..20)
+            .map(|i| {
+                let w = 20.0 + 2.0 * i as f32;
+                let x = if i % 2 == 0 { 0.0 } else { 640.0 - w };
+                let y = if i < 10 { 0.0 } else { 480.0 - w };
+                Detection {
+                    bbox: [x, y, x + w, y + w],
+                    score: 0.9,
+                    landmarks: [[0.0; 2]; 5],
+                }
+            })
+            .collect();
+        dets.push(Detection {
+            bbox: [300.0, 220.0, 340.0, 260.0],
+            score: 0.5,
+            landmarks: [[0.0; 2]; 5],
+        });
+        select_crowd(&mut dets, 640, 480, MAX_LIVE_TRACKS);
+        assert_eq!(dets.len(), MAX_LIVE_TRACKS);
+        // The centre face (40 px, no penalty) beats a 44 px face in a
+        // corner (44 * 0.75 = 33) ...
+        assert!(
+            dets.iter().any(|d| (d.bbox[0] - 300.0).abs() < 1e-6),
+            "centre kept"
+        );
+        // ... the smallest edge faces are gone (edge faces score three
+        // quarters of their width: 38 px is the twelfth), the largest stay.
+        assert!(dets.iter().all(|d| d.bbox[2] - d.bbox[0] >= 38.0));
+        assert!(
+            dets.iter()
+                .any(|d| (d.bbox[2] - d.bbox[0] - 58.0).abs() < 1e-6)
+        );
+        // Under the cap: untouched, same order.
+        let mut few = vec![det(0.0, 0.0), det(100.0, 0.0)];
+        select_crowd(&mut few, 640, 480, MAX_LIVE_TRACKS);
+        assert_eq!(few.len(), 2);
+        assert!(few[0].bbox[0].abs() < 1e-6);
+        // Fed through the tracker, no more than the cap are ever live.
+        let mut t = Tracker::new(DEFAULT_IOU_THRESHOLD, DEFAULT_MAX_AGE_FRAMES);
+        t.update(&dets);
+        assert_eq!(t.live_count(0.0), MAX_LIVE_TRACKS);
+        assert_eq!(t.live_count(50.0), 5, "58, 56, 54, 52, 50");
     }
 
     #[test]

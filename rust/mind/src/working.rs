@@ -21,7 +21,34 @@ use crate::event::{Event, EventKind};
 use crate::goal::task_in;
 use crate::outcome::{EffectiveRates, Outcomes, Tally};
 use crate::selfmodel::SelfModel;
-use crate::world::{Status, World};
+use crate::world::{Speech, Status, World};
+
+/// From this many people present the room is a crowd: small talk and
+/// curiosity go quiet, name questions go only to whoever is engaged, and
+/// the room note carries a head-count line. Three: two people can still
+/// be one conversation; three in front of a bot in a school corridor is
+/// a queue, and each of them treated as a one-to-one partner is chaos.
+pub const CROWD: usize = 3;
+
+/// At or above this many present, a stranger is asked their name only
+/// once they have addressed the bot themselves.
+pub const BUSY: usize = 5;
+
+/// Someone facing the bot for this long without saying anything is
+/// waiting their turn. Three seconds: the same figure as the name
+/// question's settle time -- a glance across the room is shorter.
+pub const WAITING_AFTER: Duration = Duration::from_secs(3);
+
+/// Speech runs are summed over this window for "has been talking for".
+pub const TALKER_WINDOW: Duration = Duration::from_secs(120);
+
+/// Speech runs remembered for the talker sums. Thirty-two covers two
+/// minutes of turn-taking at one turn every four seconds.
+pub const MAX_SPEECH_RUNS: usize = 32;
+
+/// A run of speech that ended within this of now still names its
+/// speaker as the one holding the floor (a breath, not a hand-over).
+pub const FLOOR_GRACE: Duration = Duration::from_secs(5);
 
 /// Interests published per snapshot. A handful: the debug panel shows
 /// what we are curious about right now, not the whole LRU.
@@ -63,6 +90,35 @@ pub struct Question {
     /// Whether they have said anything since. Answered questions are kept
     /// (bounded) so the deliberate path can see what was already covered.
     pub answered: bool,
+}
+
+/// The room as a crowd: how many, who has the floor, who is waiting.
+/// Rebuilt every pass by [`WorkingMemory::refresh_crowd`] from the world,
+/// so the rules read it rather than each walking the entity table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Crowd {
+    /// People present.
+    pub present: usize,
+    /// The one person the camera confirms is talking to us, if any.
+    pub engaged: Option<EntityId>,
+    /// Present, facing the bot for [`WAITING_AFTER`], and silent since
+    /// they turned to it; never the talker or the engaged person.
+    pub waiting: SmallVec<[EntityId; 4]>,
+    /// Who holds the floor: the current speaker, or the last one within
+    /// [`FLOOR_GRACE`] of their run ending.
+    pub talker: Option<EntityId>,
+    /// The talker's current unbroken run.
+    pub talker_run: Duration,
+    /// The talker's speech in the last [`TALKER_WINDOW`], the current run
+    /// included.
+    pub talker_total: Duration,
+}
+
+impl Crowd {
+    /// Whether the room is a crowd (see [`CROWD`]).
+    pub fn is_crowd(&self) -> bool {
+        self.present >= CROWD
+    }
 }
 
 /// The mind's scratch space. Owned by [`Reflex`](crate::Reflex).
@@ -109,6 +165,14 @@ pub struct WorkingMemory {
     /// The room is dark (`scene` said so and has not said "bright" since):
     /// the camera cannot see anyone, and the room note says why.
     pub dark: bool,
+    /// The room as a crowd, as of the last [`WorkingMemory::refresh_crowd`].
+    pub crowd: Crowd,
+    /// Completed runs of attributed speech, oldest first, pruned to
+    /// [`TALKER_WINDOW`] and bounded by [`MAX_SPEECH_RUNS`].
+    speech_runs: VecDeque<Speech>,
+    /// When the group hello last went out, so a burst of arrivals is one
+    /// `greet_group`, not one per late-comer.
+    pub last_group_greet: Option<Instant>,
 }
 
 impl Default for WorkingMemory {
@@ -141,7 +205,97 @@ impl WorkingMemory {
             interests: Vec::new(),
             objects: Vec::new(),
             dark: false,
+            crowd: Crowd::default(),
+            speech_runs: VecDeque::new(),
+            last_group_greet: None,
         }
+    }
+
+    /// Rebuild [`WorkingMemory::crowd`] from the room at `now`. Called
+    /// once per pass by the reflex, after the fold and before the rules
+    /// plan. One walk of the present entities; no allocation beyond the
+    /// inline `waiting` vector unless more than four people are waiting.
+    pub fn refresh_crowd(&mut self, world: &World, now: Instant) {
+        // Runs that ended since the last pass. `World::last_speech` is
+        // set on the stop edge or the tick that aged the run out, so it
+        // is new exactly when it differs from the newest one held.
+        if let Some(s) = world.last_speech()
+            && s.who.is_some()
+            && self.speech_runs.back() != Some(s)
+        {
+            if self.speech_runs.len() >= MAX_SPEECH_RUNS {
+                self.speech_runs.pop_front();
+            }
+            self.speech_runs.push_back(s.clone());
+        }
+        while self
+            .speech_runs
+            .front()
+            .is_some_and(|s| now.saturating_duration_since(s.ended) > TALKER_WINDOW)
+        {
+            self.speech_runs.pop_front();
+        }
+
+        let engaged = world.engaged_speaker(now).map(|e| e.id.clone());
+        // The floor: whoever is speaking now (the camera's confirmed
+        // speaker first, so an unattributed voice still has a face), else
+        // whoever just stopped.
+        let (talker, run) = match world
+            .present()
+            .find(|e| e.is_speaking && engaged.as_ref() == Some(&e.id))
+            .or_else(|| world.present().find(|e| e.is_speaking))
+        {
+            Some(e) => (Some(e.id.clone()), e.speaking_for(now).unwrap_or_default()),
+            None => (
+                world
+                    .last_speech()
+                    .filter(|s| now.saturating_duration_since(s.ended) <= FLOOR_GRACE)
+                    .and_then(|s| s.who.clone())
+                    .filter(|id| world.get(id).is_some_and(|e| e.status == Status::Present)),
+                Duration::ZERO,
+            ),
+        };
+        let total = match &talker {
+            Some(id) => {
+                run + self
+                    .speech_runs
+                    .iter()
+                    .filter(|s| s.who.as_ref() == Some(id))
+                    .map(Speech::len)
+                    .sum::<Duration>()
+            }
+            None => Duration::ZERO,
+        };
+
+        let mut waiting: SmallVec<[EntityId; 4]> = SmallVec::new();
+        let mut present = 0;
+        for e in world.present() {
+            present += 1;
+            if Some(&e.id) == talker.as_ref() || Some(&e.id) == engaged.as_ref() {
+                continue;
+            }
+            let Some(facing) = e.engagement.facing_for(now) else {
+                continue;
+            };
+            if facing < WAITING_AFTER {
+                continue;
+            }
+            // Silent since they turned to us: a word after that and they
+            // are in the conversation, not queueing for it.
+            if e.last_spoke
+                .is_none_or(|t| now.saturating_duration_since(t) > facing)
+            {
+                waiting.push(e.id.clone());
+            }
+        }
+        self.crowd = Crowd {
+            present,
+            engaged,
+            waiting,
+            talker,
+            talker_run: run,
+            talker_total: total,
+        };
     }
 
     /// A camera reports `class` in view: move it to the newest slot (a
@@ -329,6 +483,11 @@ impl WorkingMemory {
                         }
                     }
                     self.name_asked.retain(|e| e != from);
+                    for s in &mut self.speech_runs {
+                        if s.who.as_ref() == Some(from) {
+                            s.who = Some(to.clone());
+                        }
+                    }
                     if self.attention.as_ref() == Some(from) {
                         self.attention = Some(to.clone());
                     }
@@ -396,6 +555,61 @@ impl EntityBeliefs {
     }
 }
 
+/// The crowd, rendered for a snapshot: names rather than ids, so the
+/// deliberate path can say them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrowdSnapshot {
+    /// People present.
+    pub present: usize,
+    /// Display names of the known people waiting their turn (see
+    /// [`Crowd::waiting`]); strangers waiting are counted in
+    /// [`CrowdSnapshot::waiting_unknown`] instead of labelled.
+    pub waiting: Vec<SmolStr>,
+    /// Strangers waiting their turn.
+    pub waiting_unknown: usize,
+    /// How long the talker has had the floor, in seconds, summed over the
+    /// last [`TALKER_WINDOW`] (the current run included). Zero when nobody
+    /// has it.
+    pub talker_seconds: u64,
+    /// The talker's display name, when they are a known person.
+    pub talker: Option<SmolStr>,
+    /// The engaged person's display name, when known; `None` for nobody
+    /// or a stranger.
+    pub engaged: Option<SmolStr>,
+}
+
+impl CrowdSnapshot {
+    fn capture(crowd: &Crowd, world: &World) -> Self {
+        let name = |id: &EntityId| {
+            world
+                .get(id)
+                .filter(|e| e.is_known())
+                .map(|e| SmolStr::new(e.display_name()))
+        };
+        let mut waiting = Vec::new();
+        let mut waiting_unknown = 0;
+        for id in &crowd.waiting {
+            match name(id) {
+                Some(n) => waiting.push(n),
+                None => waiting_unknown += 1,
+            }
+        }
+        Self {
+            present: crowd.present,
+            waiting,
+            waiting_unknown,
+            talker_seconds: crowd.talker_total.as_secs(),
+            talker: crowd.talker.as_ref().and_then(name),
+            engaged: crowd.engaged.as_ref().and_then(name),
+        }
+    }
+
+    /// Whether the room is a crowd (see [`CROWD`]).
+    pub fn is_crowd(&self) -> bool {
+        self.present >= CROWD
+    }
+}
+
 /// Immutable copy of working memory plus per-person beliefs, published on
 /// the [`WorldView`](crate::WorldView). Cloning cost is bounded by the
 /// window/queue caps above and the number of people present.
@@ -431,6 +645,8 @@ pub struct WorkingSnapshot {
     pub objects: Vec<SmolStr>,
     /// See [`WorkingMemory::dark`].
     pub dark: bool,
+    /// The room as a crowd. `Default` (nobody) for a bare snapshot.
+    pub crowd: CrowdSnapshot,
 }
 
 impl WorkingSnapshot {
@@ -466,6 +682,7 @@ impl WorkingSnapshot {
                 interests: w.interests.clone(),
                 objects: w.objects.clone(),
                 dark: w.dark,
+                crowd: CrowdSnapshot::capture(&w.crowd, world),
             },
             None => Self {
                 beliefs,

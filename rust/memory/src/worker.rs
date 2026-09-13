@@ -12,12 +12,23 @@
 //!   conversation, dedupes against what is already held).
 //! * LEFT by a known person -> an episode row: what they said this visit,
 //!   summarised to a sentence or two through the same model, so the next
-//!   room line can say "last visit 2 days ago: talked about X".
+//!   room line can say "last visit 2 days ago: talked about X". Not for
+//!   a visit in which they said nothing, nor one shorter than
+//!   [`MIN_VISIT_SECS`] with nothing but small talk in it: in a school
+//!   people walk past all day, and "Ada said hi and left" is a row per
+//!   passer-by. A short visit with something substantive said ("I'm
+//!   working on my Rust project", the john fixture's five seconds) is
+//!   still a visit. Their `last_seen_at` (the sighting) is touched on
+//!   ENTERED either way.
+//! * Anything about a stranger track -> nothing persisted at all. A
+//!   stranger who never gives a name leaves no row; the events table is
+//!   the known people's.
 //! * RETURNED -> nothing beyond the log; the deliberate path reads.
 //! * LEFT while another known person is still here -> a co-presence row
 //!   for the overlap (`Store::note_co_presence`), which becomes the
 //!   `often_with` relation after two long enough visits together.
-//! * Every event -> the `events` table, with the session id.
+//! * Every event about a known person -> the `events` table, with the
+//!   session id.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +44,11 @@ use smol_str::SmolStr;
 use crate::Error;
 use crate::extract::{extract_all, is_small_talk, summarise};
 use crate::store::{Store, now_secs};
+
+/// A visit shorter than this with nothing but small talk in it gets no
+/// episode: "hi, what's your name, bye" from someone passing the door is
+/// not a visit to remember.
+pub const MIN_VISIT_SECS: f64 = 20.0;
 
 /// Whether `said` is the bot's own last reply coming back through the
 /// microphone. Echo cancellation slips; the speaker's output is then
@@ -150,15 +166,20 @@ impl MemoryWorker {
             EventKind::Merged { from } => Some(from.as_str().to_owned()),
             _ => None,
         };
-        match self.store.record_event(
-            &self.session_id,
-            at,
-            &e.entity,
-            e.kind.tag(),
-            detail.as_deref(),
-        ) {
-            Ok(()) => self.stats.events += 1,
-            Err(err) => tracing::warn!(error = %err, kind = e.kind.tag(), "event not persisted"),
+        // Strangers are never persisted: the log is the known people's.
+        if !e.entity.is_track() {
+            match self.store.record_event(
+                &self.session_id,
+                at,
+                &e.entity,
+                e.kind.tag(),
+                detail.as_deref(),
+            ) {
+                Ok(()) => self.stats.events += 1,
+                Err(err) => {
+                    tracing::warn!(error = %err, kind = e.kind.tag(), "event not persisted");
+                }
+            }
         }
 
         let name = (!e.entity.is_track())
@@ -301,9 +322,21 @@ impl MemoryWorker {
     /// Summarise the visit that just ended: from their last ENTERED or
     /// RETURNED in this session to now, everything they SAID, through the
     /// summariser when they said anything. The model failing is a counter
-    /// and the plain list; the visit is recorded either way.
+    /// and the plain list; the visit is recorded either way -- unless it
+    /// was silent, or under [`MIN_VISIT_SECS`] with only small talk in
+    /// it, which is a passer-by, not a visit (see the module docs).
     fn episode(&mut self, entity: &common::EntityId, name: &str, ended_at: f64) {
         let (started_at, said) = self.visits.remove(entity).unwrap_or((ended_at, Vec::new()));
+        let only_small_talk = said.iter().all(|s| is_small_talk(s));
+        if said.is_empty() || (only_small_talk && ended_at - started_at < MIN_VISIT_SECS) {
+            tracing::debug!(
+                %entity,
+                secs = ended_at - started_at,
+                turns = said.len(),
+                "a passer-by, not a visit; no episode"
+            );
+            return;
+        }
         // A visit of "hey" alone is recorded but not summarised: there is
         // nothing in it for the model to find, and a model asked anyway
         // is a model tempted to invent.
@@ -461,10 +494,11 @@ mod tests {
         drop(tx);
         let stats = handle.join().unwrap();
 
+        // The stranger's two events are not persisted.
         assert_eq!(
             stats,
             Stats {
-                events: 8,
+                events: 6,
                 facts: 1,
                 relations: 1,
                 episodes: 1,
@@ -511,8 +545,9 @@ mod tests {
             Some("last visit just now: Ada talked about teaching maths.")
         );
 
-        // Every event, with the session, including the stranger's.
-        assert_eq!(store.event_count("s1").unwrap(), 8);
+        // Every event about her, with the session; none of the stranger's.
+        assert_eq!(store.event_count("s1").unwrap(), 6);
+        assert!(store.events_of("s1", &stranger).unwrap().is_empty());
         let kinds: Vec<String> = store
             .events_of("s1", &ada)
             .unwrap()
@@ -574,7 +609,59 @@ mod tests {
         // 138 s: too short. Not a visit.
         assert_eq!(w.stats().co_presence, 1);
         assert_eq!(store.co_presence_visits(&ada, &bob).unwrap(), 1);
-        assert_eq!(w.stats().episodes, 3);
+        // Nobody said anything: time together is social, not an episode.
+        assert_eq!(w.stats().episodes, 0);
+        assert!(store.episodes(&ada).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_short_small_talk_visit_leaves_no_episode_but_a_real_one_does() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let ada = store.enrol_name_only("Ada").unwrap();
+        // One extraction for the substantive line; "hi" and "bye" cost
+        // nothing, and the two-second visit made of them is not written.
+        let llm = MockLlm::new(vec![
+            Script::text(&["{\"facts\": [], \"relations\": []}"]),
+            Script::text(&["Ada said she got a bike."]),
+        ]);
+        let mut w = MemoryWorker::new(Arc::clone(&store), llm.clone(), "s4").unwrap();
+        let base = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        let t = |secs: f64| base + Duration::from_secs_f64(secs);
+        w.handle(&Event::new(t(0.0), ada.clone(), EventKind::Entered));
+        w.handle(&Event::new(
+            t(1.0),
+            ada.clone(),
+            EventKind::Said("hi".into()),
+        ));
+        w.handle(&Event::new(
+            t(2.0),
+            ada.clone(),
+            EventKind::Said("bye".into()),
+        ));
+        w.handle(&Event::new(t(2.5), ada.clone(), EventKind::Left));
+        assert_eq!(w.stats().episodes, 0);
+        assert!(store.episodes(&ada).unwrap().is_empty());
+        assert!(llm.requests().is_empty());
+        // Back, and something is said: a visit, however short.
+        w.handle(&Event::new(
+            t(100.0),
+            ada.clone(),
+            EventKind::Returned {
+                away_for: Duration::from_secs(97),
+            },
+        ));
+        w.handle(&Event::new(
+            t(103.0),
+            ada.clone(),
+            EventKind::Said("I got a bike".into()),
+        ));
+        w.handle(&Event::new(t(105.0), ada.clone(), EventKind::Left));
+        assert_eq!(w.stats().episodes, 1);
+        assert_eq!(store.episodes(&ada).unwrap()[0].said, ["I got a bike"]);
+        // The sighting itself was kept on both arrivals.
+        assert!(store.people().unwrap()[0].last_seen.is_some());
     }
 
     #[test]

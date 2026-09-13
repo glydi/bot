@@ -74,6 +74,10 @@ pub struct Engagement {
     first_facing_at: Option<Instant>,
     /// Last sample at or above [`AWAY_MAX`].
     last_facing_high_at: Option<Instant>,
+    /// Start of the current unbroken run of samples at or above
+    /// [`FACING_GATE`]; `None` while the latest sample is below it. What
+    /// "has been facing the bot for three seconds" is measured from.
+    facing_since: Option<Instant>,
     /// Latest `lip_motion` sample.
     lips: Option<(f32, Instant)>,
     /// The gated verdict.
@@ -98,6 +102,11 @@ impl Engagement {
                 if level >= AWAY_MAX {
                     self.last_facing_high_at = Some(o.at);
                 }
+                if level >= FACING_GATE {
+                    self.facing_since.get_or_insert(o.at);
+                } else {
+                    self.facing_since = None;
+                }
                 true
             }
             LIP_MOTION => {
@@ -119,6 +128,18 @@ impl Engagement {
     pub fn facing_fresh(&self, now: Instant) -> bool {
         self.facing
             .is_some_and(|(_, at)| now.saturating_duration_since(at) < FACING_STALE)
+    }
+
+    /// How long the current unbroken run of "looking at the device"
+    /// samples has lasted, or `None` when the latest sample is below
+    /// [`FACING_GATE`] or too stale ([`FACING_STALE`]) to describe now. A
+    /// person waiting their turn in a crowd reads as this run growing
+    /// while they say nothing.
+    pub fn facing_for(&self, now: Instant) -> Option<Duration> {
+        if !self.facing_fresh(now) {
+            return None;
+        }
+        self.facing_since.map(|t| now.saturating_duration_since(t))
     }
 
     /// Looking at the device within the coincidence window.
@@ -255,6 +276,21 @@ mod tests {
         assert!(!e.settle(true, at(300)), "lips still only proven to 200 ms");
         e.observe(&sample(LIP_MOTION, 300, 0.8));
         assert!(e.settle(true, at(300)));
+    }
+
+    #[test]
+    fn facing_for_measures_the_unbroken_run() {
+        let mut e = Engagement::default();
+        assert_eq!(e.facing_for(at(0)), None);
+        e.observe(&sample(FACING, 0, 0.9));
+        e.observe(&sample(FACING, 500, 0.8));
+        assert_eq!(e.facing_for(at(1000)), Some(Duration::from_millis(1000)));
+        // A glance away breaks the run; stale samples say nothing.
+        e.observe(&sample(FACING, 1200, 0.2));
+        assert_eq!(e.facing_for(at(1300)), None);
+        e.observe(&sample(FACING, 1400, 0.9));
+        assert_eq!(e.facing_for(at(2000)), Some(Duration::from_millis(600)));
+        assert_eq!(e.facing_for(at(5000)), None, "stale");
     }
 
     #[test]

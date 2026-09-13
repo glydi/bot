@@ -15,7 +15,7 @@ use common::EntityId;
 use smallvec::SmallVec;
 
 use crate::event::{Event, EventKind};
-use crate::working::WorkingMemory;
+use crate::working::{CROWD, WorkingMemory};
 use crate::world::{Status, World};
 
 /// Goals kept at once. The bottom is dropped when a ninth arrives: a goal
@@ -37,11 +37,24 @@ pub const RETURN_GREET_MIN_AWAY: Duration = Duration::from_secs(60);
 /// one holding the door for the other.
 pub const PAIR_WINDOW: Duration = Duration::from_secs(5);
 
+/// Arrivals within this of each other are one group (same figure as
+/// [`PAIR_WINDOW`]: the door held for three is the door held for two).
+pub const GROUP_WINDOW: Duration = PAIR_WINDOW;
+
+/// A group hello is not repeated within this: a class filing in over
+/// half a minute gets one "hi everyone", not one per late-comer.
+pub const GROUP_GREET_GAP: Duration = Duration::from_secs(30);
+
 /// Something the mind wants to achieve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Goal {
     /// Say hello to someone who just arrived.
     Greet(EntityId),
+    /// Say hello to a group that arrived together ([`CROWD`] or more
+    /// within [`GROUP_WINDOW`]): one "hi everyone" instead of a hello
+    /// each. Replaces every pending greeting and name question of its
+    /// members; the planner emits one `greet_group` intent.
+    GreetGroup(SmallVec<[EntityId; 4]>),
     /// Say hello to two people who arrived together. Replaces the
     /// [`Goal::Greet`] of the first when the second walks in within
     /// [`PAIR_WINDOW`]; the planner greets both in one intent.
@@ -75,14 +88,17 @@ impl Goal {
             | Self::AskName(e)
             | Self::HelpWith { entity: e, .. }
             | Self::ResolveUnknown { entity: e, .. } => Some(e),
+            Self::GreetGroup(ids) => ids.first(),
             Self::Idle => None,
         }
     }
 
-    /// Whether this goal is about `id` (either half of a pair counts).
+    /// Whether this goal is about `id` (either half of a pair counts, any
+    /// member of a group).
     pub fn is_about(&self, id: &EntityId) -> bool {
         match self {
             Self::GreetPair(a, b) => a == id || b == id,
+            Self::GreetGroup(ids) => ids.contains(id),
             g => g.entity() == Some(id),
         }
     }
@@ -92,6 +108,7 @@ impl Goal {
         match self {
             Self::Greet(_) => "greet",
             Self::GreetPair(..) => "greet_pair",
+            Self::GreetGroup(_) => "greet_group",
             Self::AskName(_) => "ask_name",
             Self::HelpWith { .. } => "help_with",
             Self::ResolveUnknown { .. } => "resolve_unknown",
@@ -169,7 +186,84 @@ impl GoalStack {
                 *g = Goal::Greet(stay);
             }
         }
+        // A group that loses a member is still a group (down to one: the
+        // hello is still owed to whoever stayed, and "hi everyone" to one
+        // person is the deliberate path's to phrase).
+        for g in &mut self.stack {
+            if let Goal::GreetGroup(ids) = g {
+                ids.retain(|e| e != entity);
+            }
+        }
+        self.stack
+            .retain(|g| !matches!(g, Goal::GreetGroup(ids) if ids.is_empty()));
         self.stack.retain(|g| !g.is_about(entity));
+    }
+
+    /// The arrivals of the last [`GROUP_WINDOW`] before `at`, `entity`
+    /// included, when there are [`CROWD`] or more of them and no group
+    /// hello went out within [`GROUP_GREET_GAP`]: fold them into one
+    /// [`Goal::GreetGroup`], dropping their individual greetings and name
+    /// questions. Strangers count as arrivals (a class is mostly
+    /// strangers). Returns whether `entity` is part of a group -- and so
+    /// gets no hello of their own.
+    fn group_arrival(
+        &mut self,
+        entity: &EntityId,
+        at: Instant,
+        world: &World,
+        working: &WorkingMemory,
+    ) -> bool {
+        if working
+            .last_group_greet
+            .is_some_and(|t| at.saturating_duration_since(t) < GROUP_GREET_GAP)
+        {
+            // The burst already had its hello: this late-comer is part of
+            // it, and gets no hello of their own either.
+            return true;
+        }
+        // Arrival order, not table order: the first in is the group's
+        // `entity` in the intent.
+        let mut arrivals: SmallVec<[(Instant, EntityId); 4]> = SmallVec::new();
+        for e in world.present() {
+            let arrived = e.returned.map_or(e.first_seen, |(w, _)| w);
+            if at.saturating_duration_since(arrived) < GROUP_WINDOW {
+                arrivals.push((arrived, e.id.clone()));
+            }
+        }
+        if !arrivals.iter().any(|(_, e)| e == entity) {
+            arrivals.push((at, entity.clone()));
+        }
+        if arrivals.len() < CROWD {
+            return false;
+        }
+        arrivals.sort_by_key(|(t, _)| *t);
+        let arrivals: SmallVec<[EntityId; 4]> = arrivals.into_iter().map(|(_, e)| e).collect();
+        // The members' own greetings are the group's now. A member
+        // already greeted alone (the first two, when the room was quiet)
+        // stays in the group: the count is the group's size, and the
+        // group hello is one line whoever it repeats. Their name
+        // questions stay: the planner holds those until one of them is
+        // engaged.
+        self.stack.retain(|g| match g {
+            Goal::Greet(e) => !arrivals.contains(e),
+            Goal::GreetPair(a, b) => !arrivals.contains(a) && !arrivals.contains(b),
+            _ => true,
+        });
+        let existing = self
+            .stack
+            .iter()
+            .position(|g| matches!(g, Goal::GreetGroup(_)));
+        let mut ids = match existing.map(|i| self.stack.remove(i)) {
+            Some(Goal::GreetGroup(ids)) => ids,
+            _ => SmallVec::new(),
+        };
+        for e in arrivals {
+            if !ids.contains(&e) {
+                ids.push(e);
+            }
+        }
+        self.push(Goal::GreetGroup(ids));
+        true
     }
 
     /// Raise a greeting for `entity`, or fold it into a pair when someone
@@ -229,7 +323,23 @@ impl GoalStack {
         for e in events {
             match &e.kind {
                 EventKind::Entered => {
-                    if e.entity.is_track() {
+                    if self.group_arrival(&e.entity, e.at, world, working) {
+                        // Part of a group: greeted as one, and a name
+                        // question to one face in a crowd of arrivals is
+                        // the planner's to hold until they are engaged.
+                        if e.entity.is_track() && !working.has_asked_name(&e.entity) {
+                            self.push(Goal::AskName(e.entity.clone()));
+                            // Keep the group hello on top.
+                            if let Some(i) = self
+                                .stack
+                                .iter()
+                                .position(|g| matches!(g, Goal::GreetGroup(_)))
+                            {
+                                let g = self.stack.remove(i);
+                                self.stack.push(g);
+                            }
+                        }
+                    } else if e.entity.is_track() {
                         if !working.has_asked_name(&e.entity) {
                             self.push(Goal::AskName(e.entity.clone()));
                         }
@@ -252,6 +362,13 @@ impl GoalStack {
                 }
                 EventKind::Said(text) => {
                     self.stack.retain(|g| !g.is_resolve_for(&e.entity));
+                    // A stranger who speaks to us is the one to ask next:
+                    // their name question moves to the top, above the
+                    // questions to the silent faces behind them.
+                    if e.entity.is_track() && self.stack.contains(&Goal::AskName(e.entity.clone()))
+                    {
+                        self.push(Goal::AskName(e.entity.clone()));
+                    }
                     if let Some(task) = task_in(text) {
                         self.push(Goal::HelpWith {
                             entity: e.entity.clone(),
@@ -270,7 +387,13 @@ impl GoalStack {
                     // stranger we were about to ask turns out to be someone
                     // we know, and they have not been greeted -- the ENTERED
                     // was theirs as a track, so no Greet was raised then.
-                    if !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
+                    // Unless they arrived with a group, whose hello is
+                    // theirs too.
+                    let in_group = self
+                        .stack
+                        .iter()
+                        .any(|g| matches!(g, Goal::GreetGroup(ids) if ids.contains(&e.entity)));
+                    if !in_group && !working.greeted_within(&e.entity, e.at, GREET_WINDOW) {
                         self.greet_or_pair(&e.entity, e.at, world);
                     }
                 }
@@ -288,6 +411,23 @@ fn rekey(g: &mut Goal, from: &EntityId, to: &EntityId) {
                     *e = to.clone();
                 }
             }
+        }
+        Goal::GreetGroup(ids) => {
+            for e in ids.iter_mut() {
+                if e == from {
+                    *e = to.clone();
+                }
+            }
+            // The stranger and the person were the same arrival.
+            let mut seen: SmallVec<[EntityId; 4]> = SmallVec::new();
+            ids.retain(|e| {
+                if seen.contains(e) {
+                    false
+                } else {
+                    seen.push(e.clone());
+                    true
+                }
+            });
         }
         Goal::Greet(e)
         | Goal::AskName(e)

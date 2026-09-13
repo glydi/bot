@@ -272,11 +272,49 @@ impl Index {
     }
 }
 
+/// Stranger tracks whose samples are held at once. A corridor produces a
+/// new track every few seconds and almost none of them ever gives a
+/// name; without a global bound the map grows all day. Thirty-two is
+/// more than are ever in frame together (the tracker caps live tracks at
+/// twelve), and the least recently fed is evicted -- a track that has not
+/// produced a sample in a while has walked off.
+pub const MAX_STASH_TRACKS: usize = 32;
+
 /// Embeddings seen on a stranger track, waiting for a name.
 #[derive(Debug, Default)]
 struct Stash {
     face: VecDeque<Vec<f32>>,
     voice: VecDeque<Vec<f32>>,
+    /// Sequence number of the last sample fed, for LRU eviction.
+    touched: u64,
+}
+
+/// Every track's stash, with the LRU counter.
+#[derive(Debug, Default)]
+struct Stashes {
+    seq: u64,
+    by_track: HashMap<u32, Stash>,
+}
+
+impl Stashes {
+    /// The stash for `track`, created if needed, evicting the least
+    /// recently fed track past [`MAX_STASH_TRACKS`].
+    fn touch(&mut self, track: u32) -> &mut Stash {
+        self.seq += 1;
+        if !self.by_track.contains_key(&track) && self.by_track.len() >= MAX_STASH_TRACKS {
+            let oldest = self
+                .by_track
+                .iter()
+                .min_by_key(|(_, s)| s.touched)
+                .map(|(t, _)| *t);
+            if let Some(t) = oldest {
+                self.by_track.remove(&t);
+            }
+        }
+        let s = self.by_track.entry(track).or_default();
+        s.touched = self.seq;
+        s
+    }
 }
 
 /// The person gallery + facts + episodic log.
@@ -291,7 +329,7 @@ pub struct Store {
     names: RwLock<HashMap<EntityId, String>>,
     face_gates: Gates,
     voice_gates: Gates,
-    stash: Mutex<HashMap<u32, Stash>>,
+    stash: Mutex<Stashes>,
     /// Ids forgotten in this process. A person deleted mid-conversation
     /// is still in the model's context by id, and its next `remember` or
     /// the worker's LEFT for the visit under way would quietly recreate
@@ -315,6 +353,7 @@ CREATE TABLE IF NOT EXISTS persons (
     last_seen_at  REAL,
     meta          TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS idx_persons_last_seen ON persons(last_seen_at);
 CREATE TABLE IF NOT EXISTS embeddings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     person_id   TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
@@ -447,7 +486,7 @@ impl Store {
             names: RwLock::new(HashMap::new()),
             face_gates: Gates::FACE,
             voice_gates: Gates::VOICE,
-            stash: Mutex::new(HashMap::new()),
+            stash: Mutex::new(Stashes::default()),
             forgotten: Mutex::new(HashSet::new()),
             utc_offset_secs: 0,
         };
@@ -784,6 +823,35 @@ impl Store {
             .collect::<Result<_, _>>()?)
     }
 
+    /// The `limit` people seen most recently, newest first (never-seen
+    /// last), as listing rows. Reads the `last_seen_at` index, so on a
+    /// gallery of hundreds it costs the rows returned, not the table.
+    pub fn recently_seen(&self, limit: usize) -> Result<Vec<PersonSummary>, Error> {
+        Ok(self
+            .db
+            .lock()
+            .prepare(
+                "SELECT p.person_id, p.name, p.last_seen_at,
+                        (SELECT COUNT(*) FROM facts f WHERE f.person_id = p.person_id),
+                        (SELECT COUNT(*) FROM embeddings e
+                          WHERE e.person_id = p.person_id AND e.modality = 'face'),
+                        (SELECT COUNT(*) FROM embeddings e
+                          WHERE e.person_id = p.person_id AND e.modality = 'voice')
+                 FROM persons p ORDER BY p.last_seen_at DESC NULLS LAST LIMIT ?",
+            )?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(PersonSummary {
+                    id: EntityId::new(r.get::<_, String>(0)?),
+                    name: r.get(1)?,
+                    last_seen: r.get(2)?,
+                    facts: count(r.get(3)?),
+                    faces: count(r.get(4)?),
+                    voices: count(r.get(5)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Mark `id` as seen now.
     pub fn touch(&self, id: &EntityId) -> Result<(), Error> {
         self.db.lock().execute(
@@ -1042,8 +1110,11 @@ impl Store {
     ///   never has to clear it.
     ///
     /// Bounded per track ([`STASH_FACE_SAMPLES`] faces, [`STASH_VOICE_SAMPLES`]
-    /// voices, newest kept), so a stranger who never gives a name costs a
-    /// few kilobytes at most. An embedding of the wrong width is logged and
+    /// voices, newest kept) and across tracks ([`MAX_STASH_TRACKS`], least
+    /// recently fed evicted), so a stranger who never gives a name costs
+    /// a few kilobytes at most and a corridor of them a bounded few
+    /// hundred. Nothing here reaches the database: a stranger who never
+    /// gives a name is never persisted. An embedding of the wrong width is logged and
     /// dropped here rather than failing `remember_name` minutes later, when
     /// the person is waiting to hear their name said back.
     pub fn stash(&self, track: u32, m: Modality, emb: &[f32]) {
@@ -1059,7 +1130,7 @@ impl Store {
             return;
         }
         let mut stash = self.stash.lock();
-        let s = stash.entry(track).or_default();
+        let s = stash.touch(track);
         let (q, cap) = match m {
             Modality::Face => (&mut s.face, STASH_FACE_SAMPLES),
             Modality::Voice => (&mut s.voice, STASH_VOICE_SAMPLES),
@@ -1074,13 +1145,19 @@ impl Store {
     pub fn stashed(&self, track: u32) -> (usize, usize) {
         self.stash
             .lock()
+            .by_track
             .get(&track)
             .map_or((0, 0), |s| (s.face.len(), s.voice.len()))
     }
 
     /// Drop what was stashed for `track` (it left, or was merged).
     pub fn drop_stash(&self, track: u32) {
-        self.stash.lock().remove(&track);
+        self.stash.lock().by_track.remove(&track);
+    }
+
+    /// How many stranger tracks have samples stashed.
+    pub fn stashed_tracks(&self) -> usize {
+        self.stash.lock().by_track.len()
     }
 
     /// Attach `name` to `speaker` (a stranger track, a known person, or
@@ -1115,12 +1192,12 @@ impl Store {
             }
             None => {
                 let stash = self.stash.lock();
-                (stash.len() == 1)
-                    .then(|| stash.keys().next().copied())
+                (stash.by_track.len() == 1)
+                    .then(|| stash.by_track.keys().next().copied())
                     .flatten()
             }
         };
-        let taken = track.and_then(|t| self.stash.lock().remove(&t));
+        let taken = track.and_then(|t| self.stash.lock().by_track.remove(&t));
         let Some(s) = taken else {
             return self.enrol_name_only(name);
         };
@@ -1521,6 +1598,8 @@ fn clip_words(s: &str, max: usize) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     /// A unit vector with a 1 at `i`, so cosines are exactly 0 or 1.
@@ -1822,7 +1901,7 @@ mod tests {
         assert_eq!(s.embedding_count(Modality::Face), STASH_FACE_SAMPLES);
         assert_eq!(s.embedding_count(Modality::Voice), 1);
         assert_eq!(s.name_of(&id).as_deref(), Some("Karyan"));
-        assert!(s.stash.lock().is_empty());
+        assert!(s.stash.lock().by_track.is_empty());
         assert_eq!(
             s.identify(&onehot(VOICE_DIM, 2), Modality::Voice)
                 .expect("id")
@@ -1853,6 +1932,95 @@ mod tests {
             s.remember_name(None, "  "),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn stash_is_bounded_across_tracks_least_recently_fed_first() {
+        let s = store();
+        for t in 0..MAX_STASH_TRACKS as u32 {
+            s.stash(t, Modality::Face, &onehot(FACE_DIM, 1));
+        }
+        assert_eq!(s.stashed_tracks(), MAX_STASH_TRACKS);
+        // Track 0 is fed again: it is the freshest, so the 33rd track
+        // evicts track 1 instead.
+        s.stash(0, Modality::Face, &onehot(FACE_DIM, 2));
+        s.stash(1000, Modality::Face, &onehot(FACE_DIM, 3));
+        assert_eq!(s.stashed_tracks(), MAX_STASH_TRACKS);
+        assert_eq!(s.stashed(0), (2, 0));
+        assert_eq!(s.stashed(1), (0, 0), "least recently fed went");
+        assert_eq!(s.stashed(1000), (1, 0));
+        // Nothing of any of them touched the database.
+        assert_eq!(s.embedding_count(Modality::Face), 0);
+        assert!(s.people().expect("people").is_empty());
+    }
+
+    /// The gallery at school scale: a hundred people with five faces
+    /// each. `identify` is one pass over the 500-row matrix (well under
+    /// 5 ms even unoptimised: 256k multiply-adds), and the listings read
+    /// their indexes rather than the blobs.
+    #[test]
+    fn identify_and_listings_stay_fast_at_five_hundred() {
+        let s = store();
+        let people = 100;
+        let per = 5;
+        let mut ids = Vec::with_capacity(people);
+        for p in 0..people {
+            let embs: Vec<Vec<f32>> = (0..per)
+                .map(|k| mix(FACE_DIM, p, (p + k + 1) % FACE_DIM, 0.05 * (k + 1) as f32))
+                .collect();
+            let refs: Vec<&[f32]> = embs.iter().map(Vec::as_slice).collect();
+            let id = s
+                .enrol(&format!("Person {p}"), None, Modality::Face, &refs)
+                .expect("enrol");
+            ids.push(id);
+        }
+        for _ in 0..400 {
+            s.enrol_name_only(&format!("Name only {}", s.people().expect("n").len()))
+                .expect("name only");
+        }
+        assert_eq!(s.embedding_count(Modality::Face), people * per);
+        assert_eq!(s.people().expect("people").len(), 500);
+
+        let probe = onehot(FACE_DIM, 42);
+        let started = Instant::now();
+        let rounds = 50;
+        for _ in 0..rounds {
+            let hit = s.identify(&probe, Modality::Face).expect("identify");
+            assert_eq!(hit.map(|(id, _)| id), Some(ids[42].clone()));
+        }
+        let per_call = started.elapsed() / rounds;
+        assert!(
+            per_call < Duration::from_millis(5),
+            "identify took {per_call:?}"
+        );
+
+        let started = Instant::now();
+        let all = s.people().expect("people");
+        let listed = started.elapsed();
+        assert_eq!(all.len(), 500);
+        assert!(
+            listed < Duration::from_millis(50),
+            "people() took {listed:?}"
+        );
+        s.touch(&ids[7]).expect("touch");
+        let started = Instant::now();
+        let recent = s.recently_seen(5).expect("recent");
+        let took = started.elapsed();
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0].id, ids[7]);
+        assert!(
+            took < Duration::from_millis(20),
+            "recently_seen took {took:?}"
+        );
+        // `recall` is bounded whatever is stored.
+        for i in 0..20 {
+            s.remember(
+                &ids[7],
+                &format!("Person 7 likes thing number {i} a great deal."),
+            )
+            .expect("fact");
+        }
+        assert!(s.recall(&ids[7]).expect("recall").len() <= RECALL_LIMIT);
     }
 
     #[test]

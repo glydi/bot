@@ -14,6 +14,7 @@ use crate::event::EventKind;
 use crate::goal::{GREET_WINDOW, RETURN_GREET_MIN_AWAY};
 use crate::outcome::{ack_factor, lull_factor};
 use crate::reflex::{Cognition, Commands, Rule};
+use crate::working::{CROWD, Crowd};
 use crate::world::{LONG_SPEECH, Status, World};
 
 /// Modality the audio sense uses for voice activity edges.
@@ -256,10 +257,16 @@ impl Rule for Acknowledge {
         let speech = w
             .last_speech()
             .filter(|s| now.saturating_duration_since(s.ended) <= Self::SAME_TURN);
+        // In a crowd the "okay" goes to the one speaker the camera
+        // confirms is talking to us, and to nobody on a default: eight
+        // people talking among themselves would otherwise each get one.
+        let crowd = w.people_present() >= CROWD;
         let addressed = match speech.and_then(|s| s.who.as_ref()) {
+            Some(id) if crowd => w.engaged_speaker(now).is_some_and(|e| e.id == *id),
             Some(id) => w
                 .get(id)
                 .is_some_and(|e| e.status == crate::world::Status::Present && e.engaged(now)),
+            None if crowd => false,
             None => w.room_addressed(now),
         };
         if !addressed {
@@ -392,8 +399,13 @@ impl BackchannelAfterLongSpeech {
         if recently || w.bot_speaking() {
             return;
         }
+        // In a crowd, only the speaker the camera confirms is addressing
+        // us gets a "go on"; a long run from someone talking to a friend
+        // is not ours to encourage.
+        let crowd = w.people_present() >= CROWD;
         let long = w
             .present()
+            .filter(|e| !crowd || e.engagement.confirmed(now))
             .filter_map(|e| e.speaking_for(now))
             .any(|d| d > LONG_SPEECH);
         if !long {
@@ -477,6 +489,11 @@ impl Lull {
     fn check(&self, cx: &Cognition<'_>, out: &mut Commands) {
         let (now, w) = (cx.now, cx.world);
         if w.bot_speaking() || w.anyone_speaking() {
+            return;
+        }
+        // Small talk is for company, not a crowd: an opening line to one
+        // of six people is a line to none of them.
+        if cx.working.crowd.is_crowd() {
             return;
         }
         let Some(quiet_since) = self.last_voice.get() else {
@@ -916,6 +933,125 @@ impl Rule for ReactToEvents {
     }
 }
 
+/// Attention in a crowd: the face turns to whoever is engaged, and a
+/// monologue with people waiting gets a nudge.
+///
+/// `attend` moves whenever working memory's attention lands on someone
+/// new -- the camera's confirmed speaker included, which
+/// [`AttendToSpeaker`] (voice edges only) never sees -- with their
+/// bearing when the room knows one. Once per change, so a long turn is
+/// one glance, not a stream.
+///
+/// When the same person has held the floor for
+/// [`AttentionRotation::FLOOR_LIMIT`] of the last two minutes
+/// (`Crowd::talker_total`) and someone else has been waiting their turn
+/// (`Crowd::waiting`), the deliberate path is told once per
+/// [`AttentionRotation::WRAP_UP_GAP`]:
+///
+/// ```json
+/// {"decision":"wrap_up","entity":"ada","waiting":["Cara"]}
+/// ```
+///
+/// `waiting` carries display names of the known people waiting (a
+/// stranger is described as `"someone"`). Never over the bot's own
+/// voice, never in the same pass as another intent.
+#[derive(Debug, Default)]
+pub struct AttentionRotation {
+    /// Whom the last `attend` went to.
+    last_attended: RefCell<Option<EntityId>>,
+    /// When the last `wrap_up` went out.
+    last_wrap_up: Cell<Option<Instant>>,
+}
+
+impl AttentionRotation {
+    /// Floor time in the talker window before a wrap-up is warranted.
+    pub const FLOOR_LIMIT: Duration = Duration::from_secs(45);
+    /// Minimum gap between two wrap-ups.
+    pub const WRAP_UP_GAP: Duration = Duration::from_secs(120);
+    /// The `decision` value.
+    pub const DECISION: &'static str = "wrap_up";
+
+    /// Whether a wrap-up is due at `now` for this crowd.
+    pub fn wrap_up_due(&self, crowd: &Crowd, now: Instant) -> bool {
+        crowd.talker.is_some()
+            && crowd.talker_total >= Self::FLOOR_LIMIT
+            && !crowd.waiting.is_empty()
+            && self
+                .last_wrap_up
+                .get()
+                .is_none_or(|t| now.saturating_duration_since(t) >= Self::WRAP_UP_GAP)
+    }
+}
+
+impl Rule for AttentionRotation {
+    fn name(&self) -> &'static str {
+        "attention_rotation"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        let _ = (o, w, out);
+    }
+
+    fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        let now = cx.now;
+        // Attention follows the engaged person first, then whoever
+        // working memory settled on (last to speak or arrive).
+        let target = cx
+            .working
+            .crowd
+            .engaged
+            .clone()
+            .or_else(|| cx.working.attention.clone());
+        if let Some(id) = target
+            && self.last_attended.borrow().as_ref() != Some(&id)
+        {
+            // Only when someone else is here to compete for it: alone
+            // with one person, the voice-edge rule already attends.
+            if cx.working.crowd.present >= 2
+                && let Some(e) = cx.world.get(&id)
+            {
+                let payload = match e.bearing_at(now) {
+                    Some(azimuth_deg) => Payload::Direction { azimuth_deg },
+                    None => Payload::Text(e.id.to_string()),
+                };
+                out.push(Command::new("ui", "attend", Priority::Reflex).with_payload(payload));
+            }
+            *self.last_attended.borrow_mut() = Some(id);
+        }
+
+        if cx.world.bot_speaking() || has_intent(out) {
+            return;
+        }
+        let crowd = &cx.working.crowd;
+        if !self.wrap_up_due(crowd, now) {
+            return;
+        }
+        let Some(talker) = crowd.talker.as_ref() else {
+            return;
+        };
+        self.last_wrap_up.set(Some(now));
+        let mut json = String::with_capacity(96);
+        json.push_str("{\"decision\":\"");
+        json.push_str(Self::DECISION);
+        json.push_str("\",\"entity\":\"");
+        json.push_str(&talker.as_str().replace('"', ""));
+        json.push_str("\",\"waiting\":[");
+        for (i, id) in crowd.waiting.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push('"');
+            match cx.world.get(id).filter(|e| e.is_known()) {
+                Some(e) => json.push_str(&e.display_name().replace('"', "")),
+                None => json.push_str("someone"),
+            }
+            json.push('"');
+        }
+        json.push_str("]}");
+        out.push(intent(json));
+    }
+}
+
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
@@ -940,7 +1076,9 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
 /// did before Phase 8; wire it in with `Reflex::with_rules`.
 ///
 /// Also here: the camera-fed rules ([`WaveHello`], [`RoomInventory`],
-/// [`ReactToEvents`]), which emit nothing without their modalities, and
+/// [`ReactToEvents`]), which emit nothing without their modalities, the
+/// crowd's [`AttentionRotation`] (after the planner, so a group hello
+/// comes before a wrap-up), and
 /// the [`CommitmentRule`](crate::plan::CommitmentRule) that delivers
 /// reminders and check-ins, after the planner and the lull (a hello
 /// before a reminder) and before curiosity.
@@ -950,6 +1088,7 @@ pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     v.push(Box::new(RoomInventory::default()));
     v.push(Box::<crate::plan::PlannerRule>::default());
     v.push(Box::new(WaveHello::default()));
+    v.push(Box::new(AttentionRotation::default()));
     v.push(Box::new(Lull::new()));
     v.push(Box::new(crate::plan::CommitmentRule::new()));
     v.push(Box::new(crate::curiosity::Curiosity::new()));

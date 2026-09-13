@@ -20,7 +20,7 @@ use crate::objects::{ObjectDetector, ObjectStats, ObjectWorker};
 use crate::scene::{MODALITY_SCENE, SceneState};
 use crate::scrfd::FaceDetector;
 use crate::source::{Frame, FrameSource};
-use crate::tracker::Tracker;
+use crate::tracker::{MAX_LIVE_TRACKS, Tracker, select_crowd};
 use crate::{Error, VisionConfig};
 
 /// Modality of a sighting.
@@ -36,6 +36,35 @@ pub const MODALITY_FACE_ATTENTION: &str = "face_attention";
 pub const MODALITY_FACING: &str = "facing";
 /// `Payload::Level(lips)`: 1 = the jaw is clearly moving, 0 = still.
 pub const MODALITY_LIP_MOTION: &str = "lip_motion";
+/// `Payload::Level(n)`: how many faces are being reported, no entity.
+/// Once per [`CROWD_INTERVAL`] while anyone is in frame, and at once when
+/// the count changes (including to zero, once). What lets the mind tell
+/// a corridor from a conversation without counting tracks itself.
+pub const MODALITY_CROWD: &str = "crowd";
+/// How often the `crowd` count is repeated while it is unchanged.
+pub const CROWD_INTERVAL: Duration = Duration::from_secs(1);
+/// Faces narrower than this are tracked (so they keep their id when
+/// they come closer) but not reported: at 1280 wide a 60 px face is
+/// four metres off, someone crossing the corridor behind the person we
+/// are talking to. The mind would otherwise greet them.
+pub const MIN_EMIT_FACE_PX: f32 = 60.0;
+/// With more live faces than this, per-track emission slows to
+/// [`crowded_interval`]: eight faces at 10 Hz is 320 observations a
+/// second on a ring of 64, and the mind's presence TTL is 3 s anyway.
+pub const CROWD_EMIT_ABOVE: usize = 4;
+
+/// The per-track emit interval in a crowd: two and a half times the
+/// configured one (100 ms -> 250 ms). Zero stays zero, so a test that
+/// switched rate limiting off still sees every frame.
+pub fn crowded_interval(emit_interval: Duration) -> Duration {
+    emit_interval.saturating_mul(5) / 2
+}
+
+/// When the `crowd` count last went out, and what it said.
+#[derive(Debug, Default)]
+pub(crate) struct CrowdClock {
+    last: Option<(Instant, usize)>,
+}
 
 /// The replaceable stages, so tests can run the loop with fakes and the
 /// binary can run it with the ONNX models and the camera.
@@ -104,6 +133,7 @@ pub(crate) fn run(
     stats: &Stats,
 ) {
     let mut tracker = Tracker::new(cfg.track_iou_threshold, cfg.track_max_age_frames);
+    let mut crowd = CrowdClock::default();
     let mut side = Side {
         gestures: cfg.gestures.map(GestureBank::new),
         scene: cfg.scene.map(SceneState::new),
@@ -139,6 +169,7 @@ pub(crate) fn run(
                     gallery,
                     &mut parts,
                     &mut tracker,
+                    &mut crowd,
                     stats,
                     &frame,
                 );
@@ -297,6 +328,7 @@ fn process_frame(
     gallery: &dyn FaceGallery,
     parts: &mut Parts,
     tracker: &mut Tracker,
+    crowd: &mut CrowdClock,
     stats: &Stats,
     frame: &Frame,
 ) {
@@ -314,6 +346,8 @@ fn process_frame(
     };
     // Drop faces too small to embed reliably (Python `min_face_pixels`).
     dets.retain(|d| d.width() >= cfg.min_face_pixels);
+    // A crowd: follow the dozen nearest and most central, not everyone.
+    select_crowd(&mut dets, frame.image.w, frame.image.h, MAX_LIVE_TRACKS);
     bump(&stats.detections, dets.len() as u64);
 
     let assignments = tracker.update(&dets);
@@ -352,7 +386,7 @@ fn process_frame(
         "frame"
     );
 
-    emit(cfg, clock, tx, tracker, stats, frame.image.w);
+    emit(cfg, clock, tx, tracker, crowd, stats, frame.image.w);
 }
 
 /// One `face` observation per live track, at most every `emit_interval`,
@@ -364,21 +398,33 @@ fn process_frame(
 /// `face_attention` (both, opaque), `facing` and `lip_motion` (one
 /// `Level` each). Three extra observations per track per 100 ms is cheap:
 /// the ring is lossy and none of them allocates beyond one `Arc`.
+///
+/// Crowd rules: faces under [`MIN_EMIT_FACE_PX`] are not reported; with
+/// more than [`CROWD_EMIT_ABOVE`] faces the per-track interval stretches
+/// to [`crowded_interval`]; and a `crowd` count follows the faces (see
+/// [`MODALITY_CROWD`]) so the mind can tell a corridor from a chat.
 fn emit(
     cfg: &VisionConfig,
     clock: &dyn Clock,
     tx: &RingSender,
     tracker: &mut Tracker,
+    crowd: &mut CrowdClock,
     stats: &Stats,
     frame_w: usize,
 ) {
     let now = clock.now();
+    let n = tracker.live_count(MIN_EMIT_FACE_PX);
+    let interval = if n > CROWD_EMIT_ABOVE {
+        crowded_interval(cfg.emit_interval)
+    } else {
+        cfg.emit_interval
+    };
     for t in tracker.tracks_mut() {
-        if !t.is_live() {
+        if !t.is_live() || t.bbox[2] - t.bbox[0] < MIN_EMIT_FACE_PX {
             continue;
         }
         if t.last_emitted
-            .is_some_and(|last| now.saturating_duration_since(last) < cfg.emit_interval)
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
         {
             continue;
         }
@@ -425,5 +471,20 @@ fn emit(
             bump(&stats.evicted, tx.send(obs) as u64);
             bump(&stats.observations, 1);
         }
+    }
+    // The head-count, after the faces it counts: a consumer reading the
+    // stream in order sees who before how many.
+    let due = match crowd.last {
+        None => n > 0,
+        Some((at, was)) => {
+            was != n || (n > 0 && now.saturating_duration_since(at) >= CROWD_INTERVAL)
+        }
+    };
+    if due {
+        crowd.last = Some((now, n));
+        let obs = Observation::new(cfg.source_name.clone(), MODALITY_CROWD, now)
+            .with_payload(Payload::Level(n as f32));
+        bump(&stats.evicted, tx.send(obs) as u64);
+        bump(&stats.observations, 1);
     }
 }

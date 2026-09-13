@@ -343,6 +343,13 @@ impl World {
         self.entities.values()
     }
 
+    /// How many people are in the room right now. Walks the table (a
+    /// few dozen entries at most, see [`STRANGER_TTL`]); called once per
+    /// pass by the crowd bookkeeping, not per rule.
+    pub fn people_present(&self) -> usize {
+        self.present().count()
+    }
+
     /// Everyone in the room right now.
     pub fn present(&self) -> impl Iterator<Item = &Entity> {
         self.entities

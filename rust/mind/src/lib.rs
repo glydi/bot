@@ -51,5 +51,5 @@ pub use reflex::{Cognition, RECENT_EVENTS, Reflex, ReflexHandle, Rule};
 pub use selfmodel::SelfModel;
 pub use stats::ReflexStats;
 pub use view::{NOBODY, ViewEntity, WorldView};
-pub use working::{Question, WorkingMemory, WorkingSnapshot};
+pub use working::{CROWD, Crowd, CrowdSnapshot, Question, WorkingMemory, WorkingSnapshot};
 pub use world::{Entity, PRESENCE_TTL, SPEAKING_TTL, STRANGER_TTL, Speech, Status, World};

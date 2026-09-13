@@ -19,12 +19,27 @@
 //! {"decision":"greet", "name":"John", "returned_after_secs":300, "entity":"john", "goal":"greet"}
 //! {"decision":"ask_name",                                        "entity":"track:3", "goal":"ask_name"}
 //! {"decision":"greet_pair", "entities":["ada","bob"],            "entity":"ada", "goal":"greet_pair"}
+//! {"decision":"greet_group", "count":4, "names":["Ada","Bob"],    "entity":"ada", "goal":"greet_group"}
 //! {"decision":"remind",   "text":"call mum", "id":7,             "entity":"ada", "goal":"remind"}
 //! {"decision":"check_in", "about":"he has an interview on Friday","entity":"john","goal":"check_in"}
 //! ```
 //!
 //! `greet_pair` is two known people who walked in together
 //! ([`Goal::GreetPair`]): one hello for both, names from the room note.
+//! `greet_group` is three or more who walked in together
+//! ([`Goal::GreetGroup`]), strangers included: `count` is how many,
+//! `names` the known ones (possibly empty), and the deliberate path says
+//! one "hi everyone" -- never a hello each, which with eight faces in
+//! frame is what made the crowd chaos.
+//!
+//! # Name questions in a crowd
+//!
+//! `ask_name` goes to one stranger at a time (one open name question in
+//! the room, [`ASK_NAME_GAP`] between them), only to someone who is
+//! engaged with the bot as far as the senses can tell, and with
+//! [`BUSY`](crate::working::BUSY) or more people present only once they
+//! have addressed it themselves. A stranger at the back of a group is
+//! never asked across the room.
 //!
 //! `remind` and `check_in` are *commitments* and come from outside the
 //! mind: memory holds the reminders and the visit summaries, and the mind
@@ -68,14 +83,16 @@
 //! may follow and should be treated the same way.
 //!
 //! * `decision`: `ask` | `recall` | `say` | `greet` | `ask_name` |
-//!   `greet_pair` | `remind` | `check_in`. `wait` is never emitted — no
-//!   command *is* the wait.
+//!   `greet_pair` | `greet_group` | `remind` | `check_in`. `wait` is never
+//!   emitted — no command *is* the wait.
 //! * `text`: present for `ask` and `say` (what to say, verbatim) and for
 //!   `remind` (what they asked to be reminded of, in their words: the
 //!   deliberate path phrases "you asked me to remind you to call mum").
 //! * `entity`: present when the goal is about someone; the `EntityId`.
 //!   For `greet_pair` it is the first of `entities`.
 //! * `entities`: `greet_pair` only; both ids, arrival order.
+//! * `count`, `names`: `greet_group` only; how many arrived together and
+//!   the display names of those the world knows.
 //! * `id`: `remind` only; the reminder row, for `Store::reminder_done`.
 //! * `about`: `check_in` only; the clause of their last visit's summary
 //!   that named the thing ("he has an interview on Friday"), for the
@@ -108,7 +125,7 @@ use smallvec::SmallVec;
 use crate::belief::{CONFIDENT, FINISHED_TASK, WANTS_RESPONSE, YES};
 use crate::goal::{Goal, GoalStack, RETURN_GREET_MIN_AWAY};
 use crate::reflex::{Cognition, Commands, Rule};
-use crate::working::WorkingMemory;
+use crate::working::{BUSY, WorkingMemory};
 use crate::world::{Status, World};
 
 /// Command target for intents.
@@ -133,6 +150,16 @@ pub const RETURN_GREET_TTL: Duration = Duration::from_secs(120);
 /// The name question as recorded in working memory, so the `[working]`
 /// block tells the model what was asked and of whom.
 pub const ASK_NAME_QUESTION: &str = "What's your name?";
+
+/// A group hello waits this long after its newest arrival, so a class
+/// filing in is counted (and greeted) as one group, not greeted at three
+/// with five more at the door.
+pub const GROUP_SETTLE: Duration = Duration::from_millis(1500);
+
+/// In a busy room ([`BUSY`] or more present) a stranger who spoke within
+/// this of now, while engaged, has addressed the bot and may be asked
+/// their name.
+pub const ADDRESSED_WITHIN: Duration = Duration::from_secs(10);
 
 /// Observation modality for a reminder that has fallen due. See the
 /// module docs for the payload.
@@ -241,6 +268,13 @@ pub enum Decision {
     /// Greet two people who arrived together; the deliberate path
     /// phrases it from the room note's names.
     GreetPair(EntityId, EntityId),
+    /// Greet a group that arrived together, once.
+    GreetGroup {
+        /// The members still present, arrival order.
+        entities: SmallVec<[EntityId; 4]>,
+        /// Display names of the known members.
+        names: Vec<String>,
+    },
     /// Deliver a reminder they asked for.
     Remind {
         /// The memory row, so the wiring can mark it done.
@@ -283,8 +317,15 @@ impl Planner {
     ///    what to call them; memory may); else `Say("Hi <name>.")`.
     ///    A `GreetPair` with both present → `GreetPair`; with one present
     ///    → that one's greeting as above (the other's was retired on LEFT).
+    ///    A `GreetGroup` with anyone present → `GreetGroup` for those
+    ///    present (the rest were retired on LEFT), once the newest of
+    ///    them has been here [`GROUP_SETTLE`].
     /// 7. `AskName`: the track has been present for [`ASK_NAME_AFTER`],
-    ///    was never asked, and nobody was asked within [`ASK_NAME_GAP`]
+    ///    was never asked, nobody was asked within [`ASK_NAME_GAP`] (so
+    ///    at most one name question is open at a time), they are engaged with the
+    ///    bot ([`Entity::engaged`](crate::Entity::engaged)), and -- with
+    ///    [`BUSY`] or more present -- they addressed it: the camera's
+    ///    confirmed speaker, or spoke within [`ADDRESSED_WITHIN`]
     ///    → `AskName`.
     /// 8. `HelpWith` and they seem to be waiting on us
     ///    (`wants_response` confident) → `Ask("How is <task> going?")`.
@@ -303,6 +344,28 @@ impl Planner {
             return Decision::Wait;
         }
         let goal = goals.current();
+        if let Goal::GreetGroup(ids) = goal {
+            let mut entities: SmallVec<[EntityId; 4]> = SmallVec::new();
+            let mut names = Vec::new();
+            for id in ids {
+                let Some(e) = world.get(id).filter(|e| e.status == Status::Present) else {
+                    continue;
+                };
+                let arrived = e.returned.map_or(e.first_seen, |(w, _)| w);
+                if now.saturating_duration_since(arrived) < GROUP_SETTLE {
+                    return Decision::Wait;
+                }
+                entities.push(id.clone());
+                if let Some(n) = e.name.as_deref().filter(|_| e.is_known()) {
+                    names.push(n.to_owned());
+                }
+            }
+            return if entities.is_empty() {
+                Decision::Wait
+            } else {
+                Decision::GreetGroup { entities, names }
+            };
+        }
         if let Goal::GreetPair(a, b) = goal {
             let present =
                 |id: &EntityId| world.get(id).is_some_and(|e| e.status == Status::Present);
@@ -336,7 +399,22 @@ impl Planner {
                 let recently_asked_anyone = working
                     .last_name_ask
                     .is_some_and(|t| now.saturating_duration_since(t) < ASK_NAME_GAP);
-                if settled && !recently_asked_anyone && !working.has_asked_name(id) {
+                // One name question in the room at a time: ASK_NAME_GAP
+                // holds the next one until the first has had a minute to
+                // be answered (or abandoned -- a stranger who never
+                // answers must not block the question for everyone).
+                let engaged = entity.engaged(now);
+                let addressed = working.crowd.present < BUSY
+                    || working.crowd.engaged.as_ref() == Some(id)
+                    || entity
+                        .last_spoke
+                        .is_some_and(|t| now.saturating_duration_since(t) <= ADDRESSED_WITHIN);
+                if settled
+                    && !recently_asked_anyone
+                    && engaged
+                    && addressed
+                    && !working.has_asked_name(id)
+                {
                     Decision::AskName(id.clone())
                 } else {
                     Decision::Wait
@@ -349,7 +427,8 @@ impl Planner {
                     Decision::Wait
                 }
             }
-            Goal::Idle => Decision::Wait,
+            // The group was handled above: it needs no single present entity.
+            Goal::Idle | Goal::GreetGroup(_) => Decision::Wait,
         }
     }
 
@@ -401,6 +480,7 @@ impl Planner {
             Decision::Greet { entity, .. } => ("greet", None, Some(entity)),
             Decision::AskName(e) => ("ask_name", None, Some(e)),
             Decision::GreetPair(a, _) => ("greet_pair", None, Some(a)),
+            Decision::GreetGroup { entities, .. } => ("greet_group", None, entities.first()),
             Decision::Remind { entity, text, .. } => ("remind", Some(text.as_str()), Some(entity)),
             Decision::CheckIn { entity, .. } => ("check_in", None, Some(entity)),
         };
@@ -409,6 +489,7 @@ impl Planner {
             Decision::Remind { .. } => "remind",
             Decision::CheckIn { .. } => "check_in",
             Decision::GreetPair(..) => "greet_pair",
+            Decision::GreetGroup { .. } => "greet_group",
             _ => goal.tag(),
         };
         // One String, sized once: the hot path allocates exactly this.
@@ -441,6 +522,18 @@ impl Planner {
                 json.push_str("\",\"");
                 escape_into(b.as_str(), &mut json);
                 json.push_str("\"]");
+            }
+            Decision::GreetGroup { entities, names } => {
+                let _ = write!(json, ",\"count\":{},\"names\":[", entities.len());
+                for (i, n) in names.iter().enumerate() {
+                    if i > 0 {
+                        json.push(',');
+                    }
+                    json.push('"');
+                    escape_into(n, &mut json);
+                    json.push('"');
+                }
+                json.push(']');
             }
             Decision::Remind { id, .. } => {
                 let _ = write!(json, ",\"id\":{id}");
@@ -638,6 +731,13 @@ impl PlannerRule {
             (Decision::GreetPair(a, b), Goal::GreetPair(..)) => {
                 cx.working.greeted(a.clone(), now);
                 cx.working.greeted(b.clone(), now);
+                cx.goals.pop();
+            }
+            (Decision::GreetGroup { entities, .. }, Goal::GreetGroup(_)) => {
+                for e in entities {
+                    cx.working.greeted(e.clone(), now);
+                }
+                cx.working.last_group_greet = Some(now);
                 cx.goals.pop();
             }
             // One of the pair left before the hello: the other is greeted

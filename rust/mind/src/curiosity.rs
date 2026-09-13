@@ -256,8 +256,11 @@ impl Rule for Curiosity {
                 i.belief.weigh(&[0.05, 0.95]);
             }
         }
+        // Curiosity is for a quiet room with company, not a crowd: "who's
+        // that?" about one of six strangers is a question to nobody.
         let quiet = !cx.world.bot_speaking()
             && !cx.world.anyone_speaking()
+            && !cx.working.crowd.is_crowd()
             && *cx.goals.current() == Goal::Idle;
         // One thing at a time: an intent already in this pass (a greeting,
         // a name question, an opening line) comes first.

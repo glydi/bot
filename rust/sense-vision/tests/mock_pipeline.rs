@@ -11,7 +11,11 @@ use std::time::Duration;
 
 use common::{Clock, EntityHint, EntityId, FakeClock, Observation, ObservationRing, Payload};
 use sense_vision::arcface::{EMBEDDING_DIM, FaceEmbedder};
+use sense_vision::pipeline::{
+    CROWD_EMIT_ABOVE, MIN_EMIT_FACE_PX, MODALITY_CROWD, crowded_interval,
+};
 use sense_vision::scrfd::FaceDetector;
+use sense_vision::tracker::MAX_LIVE_TRACKS;
 use sense_vision::{
     Detection, Error, FaceAttention, InMemoryFaceGallery, MODALITY_FACE, MODALITY_FACE_ATTENTION,
     MODALITY_FACE_EMBEDDING, MODALITY_FACING, MODALITY_LIP_MOTION, MockFrames, Parts, Rgb,
@@ -103,8 +107,132 @@ fn parts(frames: usize, detector: Box<dyn FaceDetector>) -> Parts {
     }
 }
 
+/// Everything on the ring but the `crowd` head-count, which has its own
+/// test below and would otherwise be one more in every count here.
 fn drain(rx: &common::RingReceiver) -> Vec<Observation> {
+    drain_all(rx)
+        .into_iter()
+        .filter(|o| o.modality != MODALITY_CROWD)
+        .collect()
+}
+
+fn drain_all(rx: &common::RingReceiver) -> Vec<Observation> {
     std::iter::from_fn(|| rx.try_recv()).collect()
+}
+
+/// A wall of faces: `big` of them 80 px wide on a grid, plus `tiny` of
+/// 45 px (over the detector's 40 px floor, under the 60 px emit floor).
+struct ManyFaces {
+    big: usize,
+    tiny: usize,
+}
+
+impl FaceDetector for ManyFaces {
+    fn detect(&mut self, _frame: &Rgb) -> Result<Vec<Detection>, Error> {
+        let mut out = Vec::new();
+        for i in 0..self.big {
+            let (x, y) = (20.0 + 100.0 * (i % 6) as f32, 20.0 + 100.0 * (i / 6) as f32);
+            out.push(Detection {
+                bbox: [x, y, x + 80.0, y + 80.0],
+                score: 0.9,
+                landmarks: [[x + 40.0, y + 40.0]; 5],
+            });
+        }
+        for i in 0..self.tiny {
+            let (x, y) = (20.0 + 60.0 * i as f32, 420.0);
+            out.push(Detection {
+                bbox: [x, y, x + 45.0, y + 45.0],
+                score: 0.8,
+                landmarks: [[x + 20.0, y + 20.0]; 5],
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Sixteen big faces and two tiny ones: only the cap's worth are
+/// tracked, the tiny ones are never reported, and a `crowd` count of the
+/// reported faces follows them, once while the count holds.
+#[test]
+fn a_crowd_is_capped_floored_and_counted() {
+    const { assert!(16 > MAX_LIVE_TRACKS && MAX_LIVE_TRACKS > CROWD_EMIT_ABOVE) };
+    let (tx, rx) = ObservationRing::bounded(512);
+    let clock = Arc::new(FakeClock::new());
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    let det = ManyFaces { big: 16, tiny: 2 };
+    let cfg = VisionConfig {
+        emit_interval: Duration::from_millis(100),
+        ..config(3)
+    };
+    let handle = VisionSense::spawn_with(cfg, clock, tx, gallery, parts(3, Box::new(det)))
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    let obs = drain_all(&rx);
+    let faces: Vec<&Observation> = obs.iter().filter(|o| o.modality == MODALITY_FACE).collect();
+    let mut tracks: Vec<u32> = faces
+        .iter()
+        .filter_map(|o| match o.entity {
+            Some(EntityHint::Track(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    tracks.sort_unstable();
+    tracks.dedup();
+    assert_eq!(tracks.len(), MAX_LIVE_TRACKS, "{tracks:?}");
+    // Frozen clock: one tick per track across the three frames.
+    assert_eq!(faces.len(), MAX_LIVE_TRACKS);
+    // The tiny faces got no track at all (the cap took the big ones), so
+    // nothing narrower than the emit floor was reported.
+    assert!(faces.iter().all(|o| o.confidence > 0.85));
+    let crowd: Vec<f32> = obs
+        .iter()
+        .filter(|o| o.modality == MODALITY_CROWD)
+        .map(|o| o.payload.as_level().unwrap_or(-1.0))
+        .collect();
+    assert_eq!(crowd, [MAX_LIVE_TRACKS as f32]);
+    assert!(
+        obs.iter()
+            .filter(|o| o.modality == MODALITY_CROWD)
+            .all(|o| o.entity.is_none())
+    );
+    // The face comes before the count.
+    let first_face = obs.iter().position(|o| o.modality == MODALITY_FACE);
+    let count_at = obs.iter().position(|o| o.modality == MODALITY_CROWD);
+    assert!(first_face < count_at);
+    handle.stop();
+
+    // A crowd stretches the per-track interval; "off" stays off.
+    assert_eq!(
+        crowded_interval(Duration::from_millis(100)),
+        Duration::from_millis(250)
+    );
+    assert_eq!(crowded_interval(Duration::ZERO), Duration::ZERO);
+
+    // Three big faces and two tiny: the tiny ones are tracked (they keep
+    // their id when they come closer) but not reported, and the count
+    // says three.
+    let (tx, rx) = ObservationRing::bounded(512);
+    let clock = Arc::new(FakeClock::new());
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    let det = ManyFaces { big: 3, tiny: 2 };
+    let handle = VisionSense::spawn_with(config(2), clock, tx, gallery, parts(2, Box::new(det)))
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    let obs = drain_all(&rx);
+    let faces: Vec<&Observation> = obs.iter().filter(|o| o.modality == MODALITY_FACE).collect();
+    assert_eq!(faces.len(), 2 * 3, "three faces, two frames, no rate limit");
+    assert!(
+        faces.iter().all(|o| o.confidence > 0.85),
+        "tiny never reported"
+    );
+    let crowd: Vec<f32> = obs
+        .iter()
+        .filter(|o| o.modality == MODALITY_CROWD)
+        .map(|o| o.payload.as_level().unwrap_or(-1.0))
+        .collect();
+    assert_eq!(crowd, [3.0], "once while unchanged");
+    const { assert!(MIN_EMIT_FACE_PX > 45.0) };
+    handle.stop();
 }
 
 fn wait_finished(handle: &sense_vision::VisionSenseHandle) {
