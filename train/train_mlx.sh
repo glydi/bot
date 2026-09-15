@@ -26,10 +26,17 @@ ADAPTERS=${ADAPTERS:-train/adapters-$TAG}
 EVAL_EVERY=${EVAL_EVERY:-50}
 mkdir -p train/logs
 # Ollama keeps the last model resident for minutes; on 8 GB that is the difference
-# between fitting and a Metal out-of-memory (measured: the pilot died with qwen2.5:3b
-# still loaded, 2.2 GB, and ran with it unloaded).
-ollama stop qwen2.5:3b >/dev/null 2>&1 || true
-ollama stop glydi-3b >/dev/null 2>&1 || true
+# between fitting and a Metal out-of-memory (measured twice: the pilot died with
+# qwen2.5:3b still loaded, and the first full run died at its first evaluate while
+# export.sh's fuse/convert and Ollama still held the GPU). So: unload every Ollama
+# model and refuse to start while any other Metal job of ours is alive.
+for m in $(ollama ps 2>/dev/null | awk 'NR>1 {print $1}'); do ollama stop "$m" >/dev/null 2>&1 || true; done
+if pgrep -f "mlx_lm.fuse|mlx_lm.lora|convert_hf_to_gguf|llama-quantize|mlx_lm.generate" >/dev/null; then
+  echo "another Metal job is running (mlx_lm / llama.cpp); refusing to start:" >&2
+  pgrep -fl "mlx_lm.fuse|mlx_lm.lora|convert_hf_to_gguf|llama-quantize|mlx_lm.generate" >&2
+  exit 2
+fi
+if [ -n "$(ollama ps 2>/dev/null | awk 'NR>1')" ]; then echo "ollama still holds a model" >&2; exit 2; fi
 echo "model=$MODEL iters=$ITERS layers=$LAYERS seq=$SEQ lr=$LR batch=$BATCH -> $ADAPTERS"
 # /usr/bin/time -l prints "maximum resident set size" (bytes) when it exits.
 /usr/bin/time -l $VENV/python -m mlx_lm.lora \

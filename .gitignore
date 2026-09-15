@@ -18,3 +18,4 @@ train/adapters-*/
 train/logs/
 train/export/
 train/*.gguf
+train/fused-*/

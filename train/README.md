@@ -117,31 +117,39 @@ epoch (3,059) ~ 5 h.
 
 ### Full run
 
-`train/chain_after_pilot.sh` (started in the background) waits for the pilot, exports it as
-`glydi-3b-pilot`, then launches `ITERS=1000 LR=5e-5 TAG=full train/train_mlx.sh` with nohup
+The full run was launched by hand after the pilot: `ITERS=1000 LR=5e-5 TAG=full
+train/train_mlx.sh` with nohup, log `train/logs/full.log`
 (lr raised from the pilot's 1e-5 because 1,000 examples is a third of an epoch; the pilot's
 loss fell fast enough at 1e-5 that 5e-5 is safe for rank-8 LoRA). Check it with:
 
-    tail -f train/logs/chain.log            # the chain: pilot -> export -> full run launch
+    tail -f train/logs/chain_full.log       # after training: exports, verify, quick eval
     grep -E "Iter|Traceback|WRAPPER" train/logs/full.log | tail
     ls train/adapters-full                  # adapters.safetensors appears every 100 iters
 
 ## Export
 
-    train/export.sh                    # adapters-full -> glydi-3b
+    train/export.sh                                            # adapters-full -> glydi-3b
     ADAPTERS=train/adapters-pilot NAME=glydi-3b-pilot train/export.sh
 
-`mlx_lm.fuse --export-gguf` only writes llama-architecture GGUF (see `mlx_lm/gguf.py`), so
-the fused, dequantised fp16 model goes through llama.cpp's `convert_hf_to_gguf.py`
-(`--outtype q8_0`) and `llama-quantize --allow-requantize ... q4_K_M`, deleting each
-intermediate first (peak ~9.5 GB on disk for a few minutes, ~2 GB at the end). The
-Modelfile copies qwen2.5:3b's TEMPLATE and PARAMETERs as Ollama ships them, so tool calls
-and tool results render exactly as for the base. `verify_ollama.py` then sends a real
-absent-person turn with the tool specs and expects a structured `recall_person` call.
+`mlx_lm.fuse --dequantize` writes an fp16 HF dir; `ollama create -q q4_K_M` imports it
+natively (Qwen2ForCausalLM) and quantises on import, so no llama.cpp. Two routes were tried
+and dropped: `mlx_lm.fuse --export-gguf` (llama-architecture GGUF only, `mlx_lm/gguf.py`),
+and llama.cpp's `convert_hf_to_gguf.py`, which failed on the fused `tokenizer_config.json`
+(transformers 5 writes `extra_special_tokens` as a list; the converter's transformers
+expects a dict). `export.sh` therefore replaces the fused tokenizer files with the base's
+originals from the HF cache (a LoRA changes no vocabulary). The Modelfile copies
+qwen2.5:3b's TEMPLATE and PARAMETERs as Ollama ships them, so tool calls and tool results
+render exactly as for the base. `verify_ollama.py` then sends a real absent-person turn with
+the tool specs and expects a structured `recall_person` call, plus a short-vs-full cold
+first-token timing.
 
-Status: the pilot export runs from `chain_after_pilot.sh` (see `train/logs/chain.log`,
-"EXPORT EXIT 0" and the `verify:` line). The full model is exported by hand afterwards:
-`train/export.sh` (uses `train/adapters-full`, creates `glydi-3b`).
+Never export beside a training run on 8 GB: the first full run died at its first evaluate
+(Metal out of memory) because `chain_after_pilot.sh` had started it while fuse/convert and
+Ollama held the GPU. `train_mlx.sh` now unloads every Ollama model and refuses to start
+while a fuse/convert/quantize process is alive; `export.sh` refuses to start while
+`mlx_lm.lora` runs. `chain_after_full.sh` (running in the background, log
+`train/logs/chain_full.log`) waits for the full run to exit, exports `glydi-3b-pilot` and
+`glydi-3b`, verifies both, and runs `eval_quick.py` for both and the baseline.
 
 ## Evaluation
 
