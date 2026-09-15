@@ -166,7 +166,7 @@ pub const SLEEP_AFTER: Duration = Duration::from_secs(180);
 /// path re-raises it when it starts the turn and its first sentence
 /// switches the face to speaking; a local model past ten seconds with no
 /// sentence is the timeout case anyway.
-pub const THINKING_TTL: Duration = Duration::from_secs(10);
+pub const THINKING_TTL: Duration = Duration::from_secs(4);
 
 /// An explicit `expression` command sticks for this long before the
 /// automatic mapping takes back over, so a `greeting` is seen and then

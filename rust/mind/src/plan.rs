@@ -412,11 +412,16 @@ impl Planner {
                     || entity
                         .last_spoke
                         .is_some_and(|t| now.saturating_duration_since(t) <= ADDRESSED_WITHIN);
+                // Never ask the name of a face that is already a named
+                // person standing right there (see
+                // `World::shadowed_by_known`): live, that produced
+                // "Hello Kalyan." followed by "What's your name?".
                 if settled
                     && !recently_asked_anyone
                     && engaged
                     && addressed
                     && !working.has_asked_name(id)
+                    && !world.shadowed_by_known(id, now)
                 {
                     Decision::AskName(id.clone())
                 } else {

@@ -365,7 +365,25 @@ pub const EARLY_MATCH_WINDOW: Duration = Duration::from_secs(8);
 /// warm prefix answers in 300-800 ms, a cold prefix or a tool round in
 /// 2-4 s; 1.5 s is where a person starts wondering whether they were
 /// heard.
-pub const FIRST_TOKEN_GRACE: Duration = Duration::from_millis(1500);
+pub const FIRST_TOKEN_GRACE: Duration = Duration::from_millis(2500);
+
+/// How long between two "Let me think." lines. At 1.5 s and no gap it
+/// prefaced nearly every reply in a live session, which reads as a tic.
+pub const THINKING_GAP: Duration = Duration::from_secs(90);
+
+/// A second proactive line inside this window, with no word from anyone
+/// in between, is suppressed: live, a greeting, a follow-up, another
+/// greeting and a small-talk opener all went out in one quiet minute.
+pub const PROACTIVE_FLOOR: Duration = Duration::from_secs(60);
+
+/// The shortest gap between any two unprompted lines, whoever they are
+/// aimed at, so two arrivals are greeted in turn and not in one breath.
+pub const PROACTIVE_MIN_GAP: Duration = Duration::from_secs(6);
+
+/// How many unprompted lines one person may collect before saying
+/// anything back. Two is a hello and one remark; the third is the bot
+/// talking to itself.
+pub const PROACTIVE_STREAK: u8 = 2;
 
 /// Said once per turn when the first token is late. A `backchannel`, so
 /// the speaker drops it rather than queue it behind the answer.
@@ -400,6 +418,10 @@ pub struct Config {
     /// as it is. On by default; the end-to-end tests turn it off so a
     /// greeting costs no model request and stays deterministic.
     pub proactive_via_model: bool,
+    /// The shortest gap between two unprompted lines; see
+    /// [`PROACTIVE_MIN_GAP`]. Zero in end-to-end tests, which compress a
+    /// visit into a few seconds.
+    pub proactive_min_gap: Duration,
 }
 
 impl Default for Config {
@@ -415,6 +437,7 @@ impl Default for Config {
             max_tool_rounds: MAX_TOOL_ROUNDS,
             adaptive_brevity: true,
             proactive_via_model: true,
+            proactive_min_gap: PROACTIVE_MIN_GAP,
         }
     }
 }
@@ -466,6 +489,20 @@ pub struct Session {
     /// GLYDI's last spoken line asked for a name, so a bare "Kalyan." next
     /// is an answer, whichever path asked.
     asked_name_last: bool,
+    /// When the last "Let me think." went out; see [`THINKING_GAP`].
+    last_thinking: Option<Instant>,
+    /// When the last proactive line of any kind went out, and whether a
+    /// person has said anything since; see [`PROACTIVE_FLOOR`].
+    last_proactive: Option<Instant>,
+    /// When the last proactive line went out to each person.
+    last_proactive_to: HashMap<Option<EntityId>, Instant>,
+    /// Unprompted lines to each person since they last said anything;
+    /// see [`PROACTIVE_STREAK`].
+    proactive_streak: HashMap<Option<EntityId>, u8>,
+    spoke_since_proactive: bool,
+    /// This turn answers someone greeted a moment ago: a second hello is
+    /// stripped from the reply.
+    strip_greeting: bool,
     /// Who the mind said not to answer, and when it said so. An entry is
     /// good for [`IGNORE_TTL`]; see [`Session::run`].
     ignore: HashMap<EntityId, Instant>,
@@ -499,6 +536,8 @@ pub struct Session {
     adaptive_brevity: bool,
     /// See [`Config::proactive_via_model`].
     proactive_via_model: bool,
+    /// See [`Config::proactive_min_gap`].
+    proactive_min_gap: Duration,
     /// How many times in a row the person has just said these same
     /// words ("Hello." for the fourth time is 4); 1 for anything new.
     streak: usize,
@@ -555,6 +594,12 @@ impl Session {
             last_curious: HashMap::new(),
             pending_name: None,
             asked_name_last: false,
+            last_thinking: None,
+            last_proactive: None,
+            last_proactive_to: HashMap::new(),
+            proactive_streak: HashMap::new(),
+            spoke_since_proactive: true,
+            strip_greeting: false,
             ignore: HashMap::new(),
             absent_hint: false,
             lull: false,
@@ -565,6 +610,7 @@ impl Session {
             turn_budget: config.max_tokens,
             adaptive_brevity: config.adaptive_brevity,
             proactive_via_model: config.proactive_via_model,
+            proactive_min_gap: config.proactive_min_gap,
             streak: 1,
             crowd: None,
             greeted_at: HashMap::new(),
@@ -945,6 +991,39 @@ impl Session {
     /// model).
     fn gate(&mut self, entity: Option<EntityId>, kind: &'static str) -> Option<()> {
         let now = self.clock.now();
+        // One unprompted line per person at a time: a follow-up is by
+        // design the second half of one ("Still there?"), but anything
+        // else aimed at someone who has not answered the last one waits.
+        // Live, one person collected a greeting, a follow-up, a second
+        // greeting and an opener inside one quiet minute.
+        //
+        // Per person, not per room: someone walking in must still be
+        // greeted promptly even if the bot just mused at an empty room.
+        if kind != "follow_up" {
+            // A hello and one real thing after it is a normal opening
+            // ("Hi John." ... "You asked me to remind you to call mum.").
+            // A third line to someone who has not said a word is the bot
+            // talking to itself, which is what a live session looked
+            // like: greeting, follow-up, greeting, opener in one minute.
+            let streak = self.proactive_streak.get(&entity).copied().unwrap_or(0);
+            if !self.spoke_since_proactive
+                && streak >= PROACTIVE_STREAK
+                && self
+                    .last_proactive_to
+                    .get(&entity)
+                    .is_some_and(|t| now.saturating_duration_since(*t) < PROACTIVE_FLOOR)
+            {
+                tracing::info!(kind, entity = ?entity, streak, "proactive line held: no answer to the last two");
+                return None;
+            }
+            if self
+                .last_proactive
+                .is_some_and(|t| now.saturating_duration_since(t) < self.proactive_min_gap)
+            {
+                tracing::info!(kind, "proactive line held: one just went out");
+                return None;
+            }
+        }
         let key = (entity, kind);
         let recently = self
             .last_intent_say
@@ -954,8 +1033,21 @@ impl Session {
             tracing::debug!(entity = ?key.0, kind, "intent suppressed: said that to them recently");
             return None;
         }
+        *self.proactive_streak.entry(key.0.clone()).or_insert(0) += 1;
+        self.last_proactive_to.insert(key.0.clone(), now);
         self.last_intent_say.insert(key, now);
+        self.last_proactive = Some(now);
+        self.spoke_since_proactive = false;
         Some(())
+    }
+
+    /// A person has spoken, so the next unprompted line to them is
+    /// allowed (see [`Session::gate`]). Every utterance sets this; tests
+    /// that drive intents directly use it for the words in between.
+    #[cfg(test)]
+    fn person_spoke(&mut self) {
+        self.spoke_since_proactive = true;
+        self.proactive_streak.clear();
     }
 
     /// The display name for a line of ours: the room's label when they
@@ -1313,7 +1405,10 @@ impl Session {
     /// wired in; this is what keeps the answer truthful.
     fn self_note(view: &WorldView) -> String {
         let m = view.self_model();
-        let mut s = String::from("[note] They are asking what you can do. The truth right now: ");
+        let mut s = String::from(
+            "[note] They are asking about YOU, Glydi -- not about themselves. Never answer with \
+             their name. The truth right now: ",
+        );
         s.push_str(if m.can_see(view.at) {
             "you can see (a camera is delivering)"
         } else {
@@ -1476,6 +1571,9 @@ impl Session {
         let introduced = self.enrol_introduction(text, answering_name || self.asked_name_last);
         self.asked_name_last = false;
         let introduced_some = introduced.is_some();
+        self.spoke_since_proactive = true;
+        self.proactive_streak.clear();
+        self.strip_greeting = greeted_line.is_some();
         let mut content = match (introduced, answering_name, greeted_line) {
             (Some(name), _, _) => format!(
                 "[note] They just told you their name: {name}. You have remembered it already. \
@@ -1697,8 +1795,11 @@ impl Session {
             // that keeps going cancels the turn (see mind's BargeInStop).
             let mut voice_since: Option<tokio::time::Instant> = None;
             // When to say we are thinking, if no token has come by then.
-            let mut thinking_due =
-                (!thought_aloud).then(|| tokio::time::Instant::now() + FIRST_TOKEN_GRACE);
+            let mut thinking_due = (!thought_aloud
+                && self
+                    .last_thinking
+                    .is_none_or(|t| self.clock.now().saturating_duration_since(t) >= THINKING_GAP))
+            .then(|| tokio::time::Instant::now() + FIRST_TOKEN_GRACE);
 
             loop {
                 let sustain = async {
@@ -1751,6 +1852,7 @@ impl Session {
                         thinking_due = None;
                         thought_aloud = true;
                         tracing::info!(ms = FIRST_TOKEN_GRACE.as_millis(), "first token late");
+                        self.last_thinking = Some(self.clock.now());
                         self.backchannel(THINKING_LINE);
                     }
                     ev = stream.next() => {
@@ -1803,7 +1905,14 @@ impl Session {
                 return Ok(TurnEnd::Cancelled);
             }
             if let Some(s) = splitter.finish() {
-                held.push(s);
+                // A tail with no terminal punctuation is a sentence the
+                // model never finished (it ran out of budget): saying it
+                // cuts the voice off mid-thought, so it is dropped.
+                if crate::voice::is_finished_sentence(&s) {
+                    held.push(s);
+                } else {
+                    tracing::info!(tail = %s, "unfinished tail dropped");
+                }
             }
             if crate::voice::might_be_tool_call(&raw) {
                 // Written as words: make it a real call (the tool round
@@ -1890,6 +1999,17 @@ impl Session {
     /// repeats a recent line of ours, in which case `dropped` records
     /// why. What is spoken is appended to `spoken` and remembered.
     fn emit(&mut self, sentence: String, spoken: &mut String, dropped: &mut Dropped) {
+        // Already said hello to them a moment ago: say the rest of it.
+        let sentence = if self.strip_greeting && spoken.is_empty() {
+            let bare = crate::voice::strip_leading_greeting(&sentence);
+            if bare.trim().is_empty() {
+                tracing::info!(sentence, "second greeting dropped");
+                return;
+            }
+            bare
+        } else {
+            sentence
+        };
         if is_generic(&sentence) {
             tracing::info!(sentence, "generic sentence dropped");
             dropped.generic = true;
@@ -2797,6 +2917,7 @@ mod tests {
 
     struct Rig {
         session: Session,
+        clock: Arc<FakeClock>,
         llm: Arc<MockLlm>,
         commands: Arc<CommandQueue>,
         facts: Arc<InMemoryFacts>,
@@ -2808,17 +2929,19 @@ mod tests {
         let llm = MockLlm::new(scripts);
         let commands = Arc::new(CommandQueue::new());
         let facts = Arc::new(InMemoryFacts::new());
+        let clock = Arc::new(FakeClock::new());
         let session = Session::new(
             llm.clone(),
             Config::default(),
             room_with(people),
             facts.clone(),
             commands.clone(),
-            Arc::new(FakeClock::new()),
+            clock.clone(),
         );
         let (obs_tx, obs_rx) = mpsc::channel(1);
         Rig {
             session,
+            clock,
             llm,
             commands,
             facts,
@@ -2915,10 +3038,9 @@ mod tests {
             .filter(|c| c.1 == "say")
             .map(|c| c.2)
             .collect();
-        assert_eq!(
-            says,
-            ["Good to see you.", "How's the project going?", "Tell me"]
-        );
+        // "Tell me" never got its full stop: the model ran out of budget
+        // and half a sentence is not said aloud.
+        assert_eq!(says, ["Good to see you.", "How's the project going?"]);
         // Nobody known and nobody visible: no "says:" prefix, and the note
         // points the model at recall_person.
         let last = r.llm.requests()[0].messages.last().unwrap().clone();
@@ -3298,15 +3420,21 @@ mod tests {
             ["Did you finish the Rust project?"]
         );
         // Another person is a separate budget; no entity is its own.
+        // Each line waits out PROACTIVE_MIN_GAP: unprompted lines come
+        // one at a time, not in one breath.
+        clock.advance(PROACTIVE_MIN_GAP);
         session.handle_intent(&intent(
             r#"{"decision":"say","text":"Hi Ada.","entity":"ada","goal":"greet"}"#,
         ));
+        clock.advance(PROACTIVE_MIN_GAP);
         session.handle_intent(&intent(
             r#"{"decision":"say","text":"Hello?","goal":"greet"}"#,
         ));
         assert_eq!(says(&drain(&commands)), ["Hi Ada.", "Hello?"]);
-        // After the gap john can be asked again.
-        clock.advance(Duration::from_millis(1));
+        // After the gap john can be asked again. Past PROACTIVE_FLOOR
+        // too: without a word from him, a second unprompted line waits
+        // that long whatever its kind.
+        clock.advance(PROACTIVE_FLOOR);
         session.handle_intent(&intent(ask));
         let cmds = drain(&commands);
         assert_eq!(says(&cmds), ["Did you finish the Rust project?"]);
@@ -3524,7 +3652,9 @@ mod tests {
             r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
         ));
         assert!(drain(&r.commands).is_empty());
-        // A different person, returning after 11 minutes.
+        // A different person, returning after 11 minutes (one unprompted
+        // line at a time: PROACTIVE_MIN_GAP).
+        r.clock.advance(PROACTIVE_MIN_GAP);
         session.handle_intent(&intent(
             r#"{"decision":"greet","name":"Ada","returned_after_secs":660,"entity":"ada","goal":"greet"}"#,
         ));
@@ -4411,6 +4541,68 @@ mod tests {
     }
 
     #[test]
+    fn one_unprompted_line_per_person_until_they_answer() {
+        let mut r = rig(vec![], vec![person("john", true)]);
+        let greet = r#"{"decision":"say","text":"Hi John.","entity":"john","goal":"greet"}"#;
+        let opener = r#"{"decision":"say","text":"What brings you here?","entity":"john","goal":"small_talk"}"#;
+        r.session.handle_intent(&intent(greet));
+        assert_eq!(says(&drain(&r.commands)), ["Hi John."]);
+        // A hello and one thing after it is a normal opening.
+        r.clock.advance(PROACTIVE_MIN_GAP);
+        r.session.handle_intent(&intent(opener));
+        assert_eq!(says(&drain(&r.commands)), ["What brings you here?"]);
+        // Still nothing back from him: the third line waits. Live he
+        // collected four in a quiet minute.
+        let third =
+            r#"{"decision":"say","text":"Anything I can do?","entity":"john","goal":"small_talk"}"#;
+        r.clock.advance(PROACTIVE_MIN_GAP);
+        r.session.handle_intent(&intent(third));
+        assert!(says(&drain(&r.commands)).is_empty());
+        r.clock.advance(PROACTIVE_FLOOR / 2);
+        r.session.handle_intent(&intent(third));
+        assert!(says(&drain(&r.commands)).is_empty());
+        // He answers: the next line is welcome again.
+        r.session.person_spoke();
+        r.session.handle_intent(&intent(third));
+        assert_eq!(says(&drain(&r.commands)), ["Anything I can do?"]);
+        // Someone else arriving is not held back by his silence, only by
+        // the short gap between two lines.
+        let ada = r#"{"decision":"say","text":"Hi Ada.","entity":"ada","goal":"greet"}"#;
+        r.session.handle_intent(&intent(ada));
+        assert!(
+            says(&drain(&r.commands)).is_empty(),
+            "too soon after the last line"
+        );
+        r.clock.advance(PROACTIVE_MIN_GAP);
+        r.session.handle_intent(&intent(ada));
+        assert_eq!(says(&drain(&r.commands)), ["Hi Ada."]);
+    }
+
+    #[tokio::test]
+    async fn a_second_hello_is_stripped_from_the_reply() {
+        let mut r = rig(
+            vec![Script::text(&["Hello John, how's the project?"])],
+            vec![person("john", true)],
+        );
+        // Greeted a moment ago by the planner.
+        r.session.handle_intent(&intent(
+            r#"{"decision":"say","text":"Hi John.","entity":"john","goal":"greet"}"#,
+        ));
+        let _ = drain(&r.commands);
+        r.session
+            .handle_utterance(
+                "hey",
+                Some(&EntityId::new("john")),
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let said = says(&drain(&r.commands));
+        assert_eq!(said, ["How's the project?"], "{said:?}");
+    }
+
+    #[test]
     fn a_group_gets_one_hello_and_a_long_talker_is_handed_over() {
         let mut r = rig(vec![], vec![person("ada", false), person("bob", false)]);
         r.session.handle_intent(&intent(
@@ -4428,7 +4620,11 @@ mod tests {
             r#"{"decision":"greet","name":"ada","entity":"ada","goal":"greet"}"#,
         ));
         assert!(says(&drain(&r.commands)).is_empty());
-        // Wrap-up names the one waiting.
+        // Wrap-up names the one waiting. In the room it comes after
+        // three quarters of a minute of Ada talking; here the clock says
+        // so, and her words clear the per-person hold.
+        r.session.person_spoke();
+        r.clock.advance(PROACTIVE_MIN_GAP);
         r.session.handle_intent(&intent(
             r#"{"decision":"wrap_up","entity":"ada","waiting":["Bob"]}"#,
         ));
@@ -4440,6 +4636,8 @@ mod tests {
             said[0]
         );
         // A stranger waiting is "someone else".
+        r.session.person_spoke();
+        r.clock.advance(PROACTIVE_MIN_GAP);
         r.session.handle_intent(&intent(
             r#"{"decision":"wrap_up","entity":"bob","waiting":["someone"]}"#,
         ));
@@ -5084,6 +5282,8 @@ mod tests {
             .unwrap();
         assert!(l.requests_reach(2).await);
         l.idle().await;
+        // One unprompted line at a time: the muse waits its turn.
+        l.clock.advance(PROACTIVE_MIN_GAP);
         l.itx.send(intent(r#"{"decision":"muse"}"#)).unwrap();
         assert!(l.requests_reach(3).await);
         l.idle().await;

@@ -48,6 +48,14 @@ pub const STRANGER_TTL: Duration = Duration::from_secs(60);
 /// has expired anyway ([`PRESENCE_TTL`]).
 pub const BEARING_FRESH: Duration = PRESENCE_TTL;
 
+/// Two faces this close in bearing are taken to be one person seen
+/// twice -- a named entity and an unrecognised track. From the camera's
+/// 60 degrees across the frame a face is ~4 degrees wide at
+/// conversational distance, so twelve is three face widths: wide enough
+/// for tracker jitter, narrow enough that two people standing apart are
+/// never merged.
+pub const SAME_FACE_DEGREES: f32 = 12.0;
+
 /// Whether an entity is in the room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -360,6 +368,28 @@ impl World {
     /// How many people are in the room right now. Walks the table (a
     /// few dozen entries at most, see [`STRANGER_TTL`]); called once per
     /// pass by the crowd bookkeeping, not per rule.
+    /// Whether this track is most likely the same human as a known
+    /// person already in the room: their faces are at the same bearing.
+    ///
+    /// One person can arrive as two entities -- named (from a voice
+    /// match) and an unrecognised face track -- and the bot then greets
+    /// them by name and asks their name in the same breath, or hands the
+    /// floor from them to themselves. Both were seen live; bearings are
+    /// the cheap physical test, since two faces cannot share a few
+    /// degrees.
+    pub fn shadowed_by_known(&self, track: &EntityId, now: Instant) -> bool {
+        let Some(mine) = self.get(track).and_then(|e| e.bearing_at(now)) else {
+            return false;
+        };
+        self.present().any(|e| {
+            !e.id.is_track()
+                && e.id != *track
+                && e.bearing_at(now)
+                    .is_some_and(|b| (b - mine).abs() < SAME_FACE_DEGREES)
+        })
+    }
+
+    /// How many people are in the room right now.
     pub fn people_present(&self) -> usize {
         self.present().count()
     }

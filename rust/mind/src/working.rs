@@ -303,6 +303,11 @@ impl WorkingMemory {
             if Some(&e.id) == talker.as_ref() || Some(&e.id) == engaged.as_ref() {
                 continue;
             }
+            // A track that is really the named person standing there is
+            // not a second human waiting to speak.
+            if e.id.is_track() && world.shadowed_by_known(&e.id, now) {
+                continue;
+            }
             let Some(facing) = e.engagement.facing_for(now) else {
                 continue;
             };

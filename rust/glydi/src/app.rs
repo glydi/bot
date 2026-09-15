@@ -305,6 +305,14 @@ impl App {
                     max_tokens: config.max_tokens,
                     request_timeout: config.llm_timeout,
                     proactive_via_model: !parts.canned_proactive,
+                    // Tests compress a whole visit into seconds; the
+                    // spacing between unprompted lines would swallow the
+                    // very line under test.
+                    proactive_min_gap: if parts.canned_proactive {
+                        Duration::ZERO
+                    } else {
+                        deliberate::deliberator::PROACTIVE_MIN_GAP
+                    },
                     ..deliberate::Config::default()
                 };
                 let facts: Arc<dyn deliberate::FactSource> = store.clone();

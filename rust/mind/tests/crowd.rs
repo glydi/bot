@@ -416,3 +416,49 @@ fn reflex_stays_under_a_millisecond_with_twelve_tracks() {
     eprintln!("crowd reflex over {N}: p99={p99:?} max={max:?}");
     assert!(p99 < Duration::from_millis(1), "p99 {p99:?} >= 1 ms");
 }
+
+/// One human seen twice -- named by voice, unrecognised by face -- is
+/// not two people: no name question for someone just greeted by name,
+/// and no handing the floor from them to themselves. Both were live.
+#[test]
+fn a_named_person_and_their_own_face_track_are_one_person() {
+    let clock = FakeClock::new();
+    let mut r = Reflex::with_rules("shadow", clock.now(), cognitive_rules());
+    r.world_mut().set_name(&EntityId::new("kalyan"), "Kalyan");
+    let at = |t: f64| clock.at_secs(t);
+    let face = |t: f64, hint: EntityHint, az: f32| {
+        Observation::new("cam0", "face", at(t))
+            .with_entity(hint)
+            .with_payload(Payload::Direction { azimuth_deg: az })
+    };
+    let known = EntityHint::Known(EntityId::new("kalyan"));
+    let track = EntityHint::Track(4);
+    // The same face, at the same bearing, arriving as both.
+    for t in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0] {
+        let _ = r.on_observation(&face(t, known.clone(), -3.0));
+        let _ = r.on_observation(&face(t, track.clone(), 1.0));
+        let _ = r.tick(at(t));
+    }
+    assert!(
+        r.world()
+            .shadowed_by_known(&EntityId::for_track(4), at(6.0)),
+        "the track sits where the named person is"
+    );
+    let asks: Vec<String> = r
+        .tick(at(7.0))
+        .iter()
+        .chain(r.on_observation(&face(7.0, track.clone(), 1.0)).iter())
+        .filter_map(|c| c.payload.as_text().map(str::to_owned))
+        .filter(|t| t.contains("ask_name") || t.contains("wrap_up"))
+        .collect();
+    assert!(asks.is_empty(), "{asks:?}");
+    // A second person, genuinely elsewhere in the frame, is not shadowed.
+    for t in [8.0, 9.0] {
+        let _ = r.on_observation(&face(t, EntityHint::Track(9), 40.0));
+        let _ = r.tick(at(t));
+    }
+    assert!(
+        !r.world()
+            .shadowed_by_known(&EntityId::for_track(9), at(9.0))
+    );
+}

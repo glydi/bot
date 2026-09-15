@@ -102,13 +102,13 @@ const GENERIC: [&str; 14] = [
     "let me know if",
 ];
 
-/// Reply ceiling in tokens for a short remark: one short sentence. 48
-/// tokens is about 35 words, which one sentence never needs, and a
-/// tool call with a name and a short fact fits with room to spare.
-pub const BUDGET_SHORT: u32 = 48;
+/// Reply ceiling in tokens for a short remark: one short sentence with
+/// room to finish it. 48 was too tight -- a reply that ran over stopped
+/// mid-word and was spoken that way, which is worse than a long line.
+pub const BUDGET_SHORT: u32 = 90;
 
-/// For a real question or a longer remark: two sentences.
-pub const BUDGET_QUESTION: u32 = 96;
+/// For a real question or a longer remark: two sentences, finished.
+pub const BUDGET_QUESTION: u32 = 160;
 
 /// An utterance of at most this many words is a remark, not a question,
 /// unless it ends in a question mark.
@@ -1360,5 +1360,27 @@ mod leak_tests {
         // A word inside another word is not the token.
         assert!(!leaks_example("Samantha is here.", ""));
         assert!(!leaks_example("Adamant about it?", ""));
+    }
+}
+
+/// Whether a sentence actually ends. The model stops mid-word when it
+/// hits the token budget, and half a sentence read aloud sounds like a
+/// fault; such a tail is dropped rather than spoken.
+pub fn is_finished_sentence(s: &str) -> bool {
+    let t = s.trim_end();
+    t.ends_with(['.', '!', '?', ':', ';', '"', ')', '\''])
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn an_unfinished_tail_is_recognised() {
+        assert!(is_finished_sentence("Good to see you."));
+        assert!(is_finished_sentence("Is that so?"));
+        assert!(is_finished_sentence("He said \"later.\""));
+        assert!(!is_finished_sentence("I was about to say that the"));
+        assert!(!is_finished_sentence("Kalyan, how is the"));
     }
 }

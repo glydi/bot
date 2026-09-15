@@ -1037,7 +1037,10 @@ impl AttentionRotation {
 
     /// Whether a wrap-up is due at `now` for this crowd.
     pub fn wrap_up_due(&self, crowd: &Crowd, now: Instant) -> bool {
-        crowd.talker.is_some()
+        // A hand-over needs two people. Alone with one person it read as
+        // "Hold that thought, Kalyan, who's next?" to an empty room.
+        crowd.present >= 2
+            && crowd.talker.is_some()
             && crowd.talker_total >= Self::FLOOR_LIMIT
             && !crowd.waiting.is_empty()
             && self
