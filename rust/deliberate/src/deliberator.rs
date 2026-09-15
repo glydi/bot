@@ -1196,6 +1196,25 @@ impl Session {
         })
     }
 
+    /// Everything real the model may draw on right now, lower-cased: the
+    /// room's names and the facts of everyone present. What the reply may
+    /// mention; see `voice::leaks_example`.
+    fn real_context(&self) -> String {
+        let view = (self.snapshot)();
+        let mut s = String::new();
+        for p in &view.people {
+            s.push_str(&p.label().to_lowercase());
+            s.push(' ');
+        }
+        // What was said this conversation is real too -- and the last
+        // user turn carries the room note with everyone's facts.
+        for m in self.conversation.history().iter().rev().take(8) {
+            s.push_str(&m.content.to_lowercase());
+            s.push(' ');
+        }
+        s
+    }
+
     /// The `[note]` line for a turn that asks what we can see, hear or
     /// do, built from the mind's [`SelfModel`](mind::SelfModel): which
     /// senses have actually delivered lately, and what the camera reports
@@ -1717,6 +1736,11 @@ impl Session {
     fn emit(&mut self, sentence: String, spoken: &mut String, dropped: &mut Dropped) {
         if is_generic(&sentence) {
             tracing::info!(sentence, "generic sentence dropped");
+            dropped.generic = true;
+            return;
+        }
+        if crate::voice::leaks_example(&sentence, &self.real_context()) {
+            tracing::info!(sentence, "example detail dropped: nothing real behind it");
             dropped.generic = true;
             return;
         }
@@ -3390,6 +3414,9 @@ mod tests {
             vec![Script::text(&["How's the Rust project going?"])],
             vec![person("john", true)],
         );
+        // Real: the note carries this fact, so "Rust project" may be said.
+        r.facts
+            .remember(&EntityId::new("john"), "John is working on a Rust project.");
         r.session
             .small_talk(
                 Some(&EntityId::new("john")),

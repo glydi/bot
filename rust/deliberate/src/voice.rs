@@ -1149,3 +1149,58 @@ mod self_intro_tests {
         assert!(!asks_for_name("What do you do?"));
     }
 }
+
+/// Names and details that exist only in the prompt's example exchanges.
+/// A reply that uses one of them for a real person is the model reading
+/// the examples as memory ("back after two days, working on a Rust
+/// parser" to a stranger it knows nothing about -- measured 3/3 on the
+/// recall-without-facts case; "Hello Ada" on the second hello in the
+/// dark). Each is allowed through only when the room or the facts
+/// contain it, i.e. when it is real.
+pub const EXAMPLE_TOKENS: [&str; 12] = [
+    "ada", "john", "mukesh", "priya", "sam", "leo", "parser", "rust", "two days", "coffee", "boss",
+    "yaju",
+];
+
+/// Whether `sentence` leans on an example-only token that nothing real
+/// backs. `real` is everything the model may legitimately know: the
+/// room's names and the facts in play, lower-cased.
+pub fn leaks_example(sentence: &str, real: &str) -> bool {
+    let lower = sentence.to_lowercase();
+    EXAMPLE_TOKENS.iter().any(|t| {
+        if !contains_word(&lower, t) {
+            return false;
+        }
+        !contains_word(real, t)
+    })
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(i, _)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + needle.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use super::*;
+
+    #[test]
+    fn example_details_are_dropped_unless_real() {
+        assert!(leaks_example(
+            "Two days, John. Did the parser give in?",
+            "people: ravi"
+        ));
+        assert!(leaks_example("Hello Ada.", ""));
+        assert!(!leaks_example(
+            "Hello Ada.",
+            "people: ada; facts: likes tea"
+        ));
+        assert!(!leaks_example("Hello Ravi, what brings you here?", ""));
+        // A word inside another word is not the token.
+        assert!(!leaks_example("Samantha is here.", ""));
+        assert!(!leaks_example("Adamant about it?", ""));
+    }
+}
