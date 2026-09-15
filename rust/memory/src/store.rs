@@ -345,6 +345,12 @@ pub struct Store {
     last_miss_log: Mutex<(Option<std::time::Instant>, Option<std::time::Instant>)>,
 }
 
+/// How many samples of one modality to keep per person. Enough poses to
+/// recognise someone across a room and a haircut; few enough that the
+/// gallery stays fast at hundreds of people, and that a bad run cannot
+/// bury the good samples.
+pub const MAX_SAMPLES: i64 = 16;
+
 /// The Python `SCHEMA`, verbatim in effect (whitespace aside), plus the
 /// episodic tables new to this build. Every statement is `IF NOT EXISTS` so
 /// it is safe on a db either reference build created.
@@ -710,6 +716,22 @@ impl Store {
                     ],
                 )?;
             }
+            // Keep the newest MAX_SAMPLES per person per modality. An
+            // unbounded gallery is slower to search and, worse, fills
+            // with whatever the camera happened to catch: the samples
+            // that made this bot's owner score 0.24 against himself were
+            // old ones taken mid-conversation. Newest wins because the
+            // sense now only offers samples it judged worth keeping
+            // (`sense_vision::attention::sample_quality`).
+            tx.execute(
+                "DELETE FROM embeddings
+                  WHERE person_id = ?1 AND modality = ?2 AND id NOT IN (
+                        SELECT id FROM embeddings
+                         WHERE person_id = ?1 AND modality = ?2
+                      ORDER BY created_at DESC, id DESC
+                         LIMIT ?3)",
+                params![id.as_str(), m.as_str(), MAX_SAMPLES],
+            )?;
             // A name mentioned earlier in a relation is now a person.
             tx.execute(
                 "UPDATE relations SET other_id = ?1

@@ -446,8 +446,25 @@ fn process_frame(
         };
         let unit: Arc<[f32]> = Arc::from(unit);
         let matched = gallery.best_match(&unit);
+        // How good this sighting is to *remember* someone by: straight
+        // on, close, sharp. Recognition uses every sample; enrolment
+        // should use the good ones (see `attention::sample_quality`).
+        let grey: Vec<u8> = crop
+            .pix
+            .chunks_exact(3)
+            .map(|p| {
+                ((u16::from(p[0]) * 29 + u16::from(p[1]) * 150 + u16::from(p[2]) * 77) >> 8) as u8
+            })
+            .collect();
+        let quality = crate::attention::sample_quality(
+            tracker
+                .get(a.track)
+                .map_or(0.0, |t| t.attention.scores().facing),
+            det.width(),
+            crate::attention::sharpness(&grey, crop.w, crop.h),
+        );
         if let Some(t) = tracker.get_mut(a.track) {
-            t.push_embedding(unit);
+            t.push_embedding_scored(unit, quality);
             t.vote(matched, cfg.votes_to_confirm);
         }
     }
@@ -538,11 +555,17 @@ fn emit(
             bump(&stats.observations, 1);
         }
 
+        // The sample offered for enrolment is the best the track has
+        // seen, not the latest frame, and only if it is good enough to
+        // recognise someone by later: the gallery this replaced held
+        // twelve mid-conversation samples of its owner that scored 0.24
+        // against his live face, under the 0.32 gate.
         if t.person.is_none()
-            && let Some(emb) = t.last_embedding()
+            && let Some((emb, quality)) = t.best_embedding()
+            && quality >= crate::attention::KEEP_SAMPLE
         {
             let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE_EMBEDDING, now)
-                .with_confidence(t.score)
+                .with_confidence(quality)
                 .with_entity(EntityHint::Track(t.id))
                 .with_payload(Payload::Embedding(emb));
             bump(&stats.evicted, tx.send(obs) as u64);

@@ -327,3 +327,54 @@ mod tests {
         assert!(geometry(&[[0.0; 2]; 5]).is_none());
     }
 }
+
+/// How good this sighting is as a face sample to remember someone by,
+/// 0..1: straight-on, close enough, and sharp.
+///
+/// Recognition is only as good as what was enrolled, and samples
+/// collected mid-conversation are poor: a live gallery scored its
+/// owner's own face at 0.24 against twelve such samples, under the 0.32
+/// gate, so he was a stranger every time. A sample is worth keeping when
+/// the face is facing the camera, is not a distant smudge, and is not
+/// motion-blurred -- the three things that cost an ArcFace embedding its
+/// bite.
+pub fn sample_quality(facing: f32, width_px: f32, sharpness: f32) -> f32 {
+    // Facing dominates: a profile is a different face to ArcFace.
+    let front = ((facing - 0.55) / 0.35).clamp(0.0, 1.0);
+    // 120 px across is a comfortable conversational distance; below 70
+    // the crop is interpolation.
+    let near = ((width_px - 70.0) / 50.0).clamp(0.0, 1.0);
+    // Laplacian variance of the crop: under ~40 is visibly smeared.
+    let sharp = ((sharpness - 40.0) / 80.0).clamp(0.0, 1.0);
+    0.55 * front + 0.25 * near + 0.20 * sharp
+}
+
+/// Quality at or above this is worth enrolling. Below it the sample is
+/// still fine for *recognising* someone -- only for remembering them.
+pub const KEEP_SAMPLE: f32 = 0.55;
+
+/// Variance of the Laplacian of a grey crop: the usual blur measure.
+/// Higher is sharper.
+pub fn sharpness(grey: &[u8], width: usize, height: usize) -> f32 {
+    if width < 3 || height < 3 || grey.len() < width * height {
+        return 0.0;
+    }
+    let at = |x: usize, y: usize| f32::from(grey[y * width + x]);
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut n = 0.0;
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            // 4-neighbour Laplacian.
+            let v = at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - 4.0 * at(x, y);
+            sum += v;
+            sum_sq += v * v;
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mean = sum / n;
+    (sum_sq / n - mean * mean).max(0.0)
+}

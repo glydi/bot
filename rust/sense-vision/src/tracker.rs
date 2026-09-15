@@ -99,6 +99,9 @@ pub fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 /// One face followed across frames.
 #[derive(Clone, Debug)]
 pub struct Track {
+    /// The best-quality sample so far, and its score; see
+    /// [`Track::push_embedding_scored`].
+    best: Option<(Arc<[f32]>, f32)>,
     /// Stable id for the life of the track; never reused within a process.
     pub id: u32,
     /// Last matched detection box, frame coordinates.
@@ -144,6 +147,7 @@ impl Track {
             age_frames: 0,
             misses: 0,
             embeddings: VecDeque::with_capacity(EMBEDDING_HISTORY),
+            best: None,
             votes: VecDeque::with_capacity(VOTE_WINDOW),
             scores: HashMap::new(),
             person: None,
@@ -205,10 +209,31 @@ impl Track {
 
     /// Store a unit-length embedding, dropping the oldest past the window.
     pub fn push_embedding(&mut self, emb: Arc<[f32]>) {
+        self.push_embedding_scored(emb, 0.0);
+    }
+
+    /// As [`Track::push_embedding`], remembering how good the sighting
+    /// was (see `crate::attention::sample_quality`). The best sample of
+    /// the track is kept separately: enrolment should use the frame
+    /// where the person was facing the camera, not whichever frame
+    /// happened to be last.
+    pub fn push_embedding_scored(&mut self, emb: Arc<[f32]>, quality: f32) {
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|(_, q)| quality > *q)
+        {
+            self.best = Some((Arc::clone(&emb), quality));
+        }
         if self.embeddings.len() == EMBEDDING_HISTORY {
             self.embeddings.pop_front();
         }
         self.embeddings.push_back(emb);
+    }
+
+    /// The best sample this track has offered, and its quality.
+    pub fn best_embedding(&self) -> Option<(Arc<[f32]>, f32)> {
+        self.best.clone()
     }
 
     /// The most recent embedding, if any.

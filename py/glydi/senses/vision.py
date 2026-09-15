@@ -177,6 +177,59 @@ def mouth_measure(kps: np.ndarray) -> float | None:
     return spread / (2.0 * inter_ocular)
 
 
+def facing_level(kps: np.ndarray | None) -> float:
+    """How square-on the face is, 0..1, from the five landmarks.
+
+    The nose sits between the eyes when someone looks at you and drifts
+    toward the far eye as they turn away; measured against the
+    inter-ocular distance so it does not change with distance. The same
+    rule as the Rust build's `attention::geometry`.
+    """
+    if kps is None or len(kps) < 3:
+        return 0.0
+    left_eye, right_eye, nose = np.asarray(kps[0]), np.asarray(kps[1]), np.asarray(kps[2])
+    inter = float(np.linalg.norm(right_eye - left_eye))
+    if inter <= 1e-6:
+        return 0.0
+    mid_x = (float(left_eye[0]) + float(right_eye[0])) / 2.0
+    # 0.5 inter-ocular of nose offset is roughly a 60-degree turn.
+    offset = abs(float(nose[0]) - mid_x) / inter
+    return min(max(1.0 - offset / 0.5, 0.0), 1.0)
+
+
+def sample_quality(facing: float, width_px: float, sharpness: float) -> float:
+    """How good this sighting is to *remember* someone by, 0..1.
+
+    The same measure the Rust build uses
+    (`sense_vision::attention::sample_quality`): facing dominates, since
+    a profile is a different face to ArcFace; then distance, then blur.
+    Mid-conversation samples are poor -- this gallery scored its owner's
+    own face at 0.24 against twelve of them, under the 0.32 gate.
+    """
+    front = min(max((facing - 0.55) / 0.35, 0.0), 1.0)
+    near = min(max((width_px - 70.0) / 50.0, 0.0), 1.0)
+    sharp = min(max((sharpness - 40.0) / 80.0, 0.0), 1.0)
+    return 0.55 * front + 0.25 * near + 0.20 * sharp
+
+
+#: Quality at or above this is worth enrolling.
+KEEP_SAMPLE = 0.55
+
+
+def sharpness(crop: np.ndarray) -> float:
+    """Variance of the Laplacian of a crop: the usual blur measure.
+
+    Imports cv2 late, as the rest of this module does, so the pure
+    helpers can be used without a camera stack.
+    """
+    if crop is None or crop.size == 0:
+        return 0.0
+    import cv2
+
+    grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    return float(cv2.Laplacian(grey, cv2.CV_64F).var())
+
+
 def lip_level(history: list[float] | deque[float]) -> float:
     """0..1 from the variance of recent mouth measures.
 
@@ -395,6 +448,7 @@ class VisionSense(threading.Thread):
                 match = self.gallery.identify_face(np.asarray(embedding))
                 who, score = track.vote(*match) if match else track.vote(None, 0.0)
 
+            facing = facing_level(getattr(face, "kps", None))
             measure = mouth_measure(getattr(face, "kps", None))
             if measure is not None:
                 track.mouth.append(measure)
@@ -429,9 +483,19 @@ class VisionSense(threading.Thread):
 
             # Only strangers are worth an embedding: a known face would
             # only be enrolled over itself, and the vector is 2 KB of ring.
+            # And only a sighting worth remembering someone by -- facing
+            # the camera, close, sharp (`sample_quality`). The samples
+            # that made this gallery's owner score 0.24 against his own
+            # face were whatever the camera caught mid-conversation.
+            quality = 0.0
+            if who is None and embedding is not None:
+                x1, y1, x2, y2 = (int(v) for v in track.box)
+                crop = frame[max(y1, 0) : max(y2, 0), max(x1, 0) : max(x2, 0)]
+                quality = sample_quality(facing, float(x2 - x1), sharpness(crop))
             if (
                 who is None
                 and embedding is not None
+                and quality >= KEEP_SAMPLE
                 and now - track.last_embedding >= EMBEDDING_PERIOD
             ):
                 track.last_embedding = now
@@ -441,7 +505,7 @@ class VisionSense(threading.Thread):
                         at=now,
                         source="vision",
                         entity=entity,
-                        confidence=float(getattr(face, "det_score", 0.0)),
+                        confidence=quality,
                         payload=np.asarray(embedding),
                     )
                 )
