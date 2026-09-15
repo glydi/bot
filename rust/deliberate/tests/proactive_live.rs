@@ -68,13 +68,18 @@ use common::{Command, CommandQueue, EntityId, FakeClock, Observation, Payload, P
 use deliberate::deliberator::{CURIOUS_GAP, INTENT_SAY_GAP};
 use deliberate::voice::{PROACTIVE_DEADLINE, overlap, split_sentences};
 use deliberate::{
-    Config, EXAMPLES, FactSource, INTENT_KIND, INTENT_TARGET, LOCAL_SYSTEM_PROMPT, OpenAiBackend,
-    Session,
+    Config, EXAMPLES, FactSource, INTENT_KIND, INTENT_TARGET, LOCAL_SYSTEM_PROMPT, Session,
 };
 use mind::{ViewEntity, WorldView};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+mod support;
+use support::{Timed, Timing, model_under_test};
+
+/// Every request of every moment, for the latency line at the end.
+static TIMINGS: Mutex<Vec<Timing>> = Mutex::new(Vec::new());
 
 fn ollama_up() -> bool {
     std::process::Command::new("curl")
@@ -151,8 +156,15 @@ struct Rig {
     session: Session,
     commands: Arc<CommandQueue>,
     clock: Arc<FakeClock>,
+    timings: Arc<Mutex<Vec<Timing>>>,
     obs_rx: mpsc::Receiver<Observation>,
     _obs_tx: mpsc::Sender<Observation>,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        TIMINGS.lock().extend(self.timings.lock().drain(..));
+    }
 }
 
 impl Rig {
@@ -163,17 +175,14 @@ impl Rig {
         context: &[(&str, &str)],
     ) -> Self {
         let mut config = Config::default();
+        // `GLYDI_LOCAL_MODEL=name` runs the suite against another model.
+        model_under_test(&mut config);
         if !flag("PL_FEWSHOT") {
             config.system_prompt = LOCAL_SYSTEM_PROMPT.replace(EXAMPLES, "");
         }
         config.adaptive_brevity = flag("PL_BREVITY");
-        let backend = OpenAiBackend::new(
-            &config.base_url,
-            &config.model,
-            None,
-            config.request_timeout,
-        )
-        .expect("client");
+        let backend = Timed::new(&config);
+        let timings = Arc::clone(&backend.timings);
         let store = Arc::new(Facts::default());
         for (who, fact) in facts {
             store.remember(&EntityId::new(*who), fact);
@@ -208,6 +217,7 @@ impl Rig {
             session,
             commands,
             clock,
+            timings,
             obs_rx,
             _obs_tx: obs_tx,
         }
@@ -502,6 +512,7 @@ fn proactive_moments_are_in_character() {
     let (passes, total): (usize, usize) = table.iter().fold((0, 0), |(p, t), r| (p + r.1, t + r.2));
     let rate = passes as f32 / total as f32;
     eprintln!("overall {passes}/{total} = {rate:.2}; deadline {PROACTIVE_DEADLINE:?}");
+    support::report("latency", &TIMINGS.lock());
     assert!(rate >= 0.66, "proactive lines: {passes}/{total}");
 }
 
@@ -524,6 +535,7 @@ fn six_hellos_in_the_dark() {
         eprintln!("hello {} ({took:?}): {line:?}", i + 1);
         lines.push(line);
     }
+    support::report("hello latency", &rig.timings.lock());
     let distinct: HashSet<&String> = lines.iter().collect();
     assert_eq!(distinct.len(), 6, "{lines:?}");
     for l in &lines {

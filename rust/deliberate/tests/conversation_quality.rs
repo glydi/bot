@@ -140,11 +140,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::{Command, CommandQueue, EntityId, Observation, Payload, Priority, RealClock};
-use deliberate::{Config, FactSource, INTENT_KIND, INTENT_TARGET, OpenAiBackend, Session};
+use deliberate::{Config, FactSource, INTENT_KIND, INTENT_TARGET, Session};
 use mind::{ViewEntity, WorldView};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+mod support;
+use support::{Timed, Timing, model_under_test};
+
+/// Every request of every case, for the latency line at the end.
+static TIMINGS: Mutex<Vec<Timing>> = Mutex::new(Vec::new());
 
 /// Minimum pass rate per case (passes out of runs) for the test to pass.
 /// Two in three: a case that fails once in three is a flake to watch, a
@@ -224,6 +230,7 @@ struct Rig {
     session: Session,
     commands: Arc<CommandQueue>,
     facts: Arc<Facts>,
+    timings: Arc<Mutex<Vec<Timing>>>,
     obs_rx: mpsc::Receiver<Observation>,
     _obs_tx: mpsc::Sender<Observation>,
 }
@@ -231,18 +238,15 @@ struct Rig {
 impl Rig {
     fn new(people: Vec<ViewEntity>, facts: Vec<(&str, &str)>) -> Self {
         let mut config = Config::default();
+        // `GLYDI_LOCAL_MODEL=name` runs the suite against another model.
+        model_under_test(&mut config);
         // `CQ_TEMP=0.5` measures a different sampling temperature without
         // touching the default.
         if let Some(t) = std::env::var("CQ_TEMP").ok().and_then(|s| s.parse().ok()) {
             config.temperature = t;
         }
-        let backend = OpenAiBackend::new(
-            &config.base_url,
-            &config.model,
-            None,
-            config.request_timeout,
-        )
-        .expect("client");
+        let backend = Timed::new(&config);
+        let timings = Arc::clone(&backend.timings);
         let store = Arc::new(Facts::default());
         for (who, fact) in facts {
             store.remember(&EntityId::new(who), fact);
@@ -267,11 +271,20 @@ impl Rig {
             session,
             commands,
             facts: store,
+            timings,
             obs_rx,
             _obs_tx: obs_tx,
         }
     }
+}
 
+impl Drop for Rig {
+    fn drop(&mut self) {
+        TIMINGS.lock().extend(self.timings.lock().drain(..));
+    }
+}
+
+impl Rig {
     /// Say `text` as `speaker` and return what the bot said back, joined.
     async fn say(&mut self, text: &str, speaker: Option<&str>) -> String {
         let id = speaker.map(EntityId::new);
@@ -811,6 +824,7 @@ fn conversation_quality() {
         );
     }
     eprintln!("{:<32} {style_ok:>2}/{style_all:<2}", "style_all_replies");
+    support::report("latency", &TIMINGS.lock());
     eprintln!(
         "{:<32} {short_cases:>2}/{total_cases:<2}  (cases with <= 2 sentences in most runs)",
         "length_le_2_sentences"
