@@ -64,19 +64,20 @@ fn outcome_tally_moves_with_said_silence_and_stop() {
     assert_eq!(tally(&r, "john", "greet"), (1.0, 1.0));
     assert!(r.working().outcomes.pending().is_empty());
 
-    // Ignored: an opening line nobody answers. Settle, fall silent.
-    for t in [10.0, 20.0, 30.0, 39.0] {
+    // Ignored: an opening line nobody answers. Eight quiet seconds after
+    // his last words (the lull's SILENCE) the bot opens; nobody answers.
+    for t in [5.0, 9.0] {
         r.on_observation(&face_known(clock.at_secs(t), "john"));
         r.tick(clock.at_secs(t));
     }
-    let mut cmds = r.on_observation(&face_known(clock.at_secs(41.0), "john"));
-    cmds.extend(r.tick(clock.at_secs(41.0)));
+    let mut cmds = r.on_observation(&face_known(clock.at_secs(12.0), "john"));
+    cmds.extend(r.tick(clock.at_secs(12.0)));
     let i = intents(&cmds);
     assert!(i.iter().any(|i| i.contains("small_talk")), "{i:?}");
-    r.on_observation(&face_known(clock.at_secs(44.0), "john"));
+    r.on_observation(&face_known(clock.at_secs(15.0), "john"));
     assert_eq!(tally(&r, "john", "small_talk"), (0.0, 0.0), "still pending");
     r.on_observation(&face_known(
-        clock.at_secs(41.0) + ENGAGED_WINDOW + Duration::from_millis(100),
+        clock.at_secs(12.0) + ENGAGED_WINDOW + Duration::from_millis(100),
         "john",
     ));
     assert_eq!(tally(&r, "john", "small_talk"), (0.0, 1.0));

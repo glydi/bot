@@ -190,31 +190,54 @@ fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
     for t in [1.0, 2.0, 3.0, 4.0] {
         assert!(step(&mut r, &clock, t).is_empty(), "not settled yet at {t}");
     }
-    let got = step(&mut r, &clock, Lull::SETTLE.as_secs_f64() + 1.0);
+    let got = step(
+        &mut r,
+        &clock,
+        Lull::SETTLE.max(Lull::SILENCE).as_secs_f64() + 1.0,
+    );
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].contains(r#""name":"John""#), "{}", got[0]);
     // He answers: the opening landed, so the next comes a little sooner
     // than the base gap (LEARN stage; see `outcome::lull_factor`).
-    let _ = r.on_observation(&utterance(clock.at_secs(43.0), "john", "yeah, fine"));
-    assert!(
-        r.snapshot().working.rates[0].small_talk_gap < Lull::MIN_GAP,
-        "{:?}",
-        r.snapshot().working.rates
-    );
+    let opened_at = Lull::SETTLE.max(Lull::SILENCE).as_secs_f64() + 1.0;
+    let _ = r.on_observation(&utterance(
+        clock.at_secs(opened_at + 2.0),
+        "john",
+        "yeah, fine",
+    ));
+    let adapted = r.snapshot().working.rates[0].small_talk_gap;
+    assert!(adapted < Lull::MIN_GAP, "{:?}", r.snapshot().working.rates);
     // Not again for a while, even in silence.
-    for t in [30.0, 60.0] {
+    for t in [opened_at + 10.0, opened_at + 20.0] {
         assert!(step(&mut r, &clock, t).is_empty());
     }
-    // A voice resets the silence; the gap still applies.
-    let _ = r.on_observation(&face_known(clock.at_secs(120.0), "john"));
-    let _ = r.on_observation(&voice(clock.at_secs(120.0), Some("john"), true));
-    let _ = r.on_observation(&voice(clock.at_secs(121.0), Some("john"), false));
-    for t in [122.0, 150.0] {
-        assert!(step(&mut r, &clock, t).is_empty());
+    // A voice resets the silence; the gap still applies. Past the
+    // (adapted) gap and a quiet spell: once more, and only once.
+    let spoke = opened_at + 30.0;
+    let _ = r.on_observation(&face_known(clock.at_secs(spoke), "john"));
+    let _ = r.on_observation(&voice(clock.at_secs(spoke), Some("john"), true));
+    let _ = r.on_observation(&voice(clock.at_secs(spoke + 1.0), Some("john"), false));
+    let mut fired_at = None;
+    let mut t = spoke + 2.0;
+    while t < opened_at + Lull::MIN_GAP.as_secs_f64() + 30.0 {
+        let n = step(&mut r, &clock, t).len();
+        if n > 0 {
+            assert_eq!(n, 1);
+            fired_at = Some(t);
+            break;
+        }
+        t += 2.0;
     }
-    // Past the gap and 25 s quiet: once more, and only once.
-    assert_eq!(step(&mut r, &clock, 240.0).len(), 1);
-    assert!(step(&mut r, &clock, 242.0).is_empty());
+    let fired_at = fired_at.expect("a second opening");
+    assert!(
+        fired_at >= spoke + 1.0 + Lull::SILENCE.as_secs_f64(),
+        "{fired_at}"
+    );
+    assert!(
+        fired_at >= opened_at + adapted.as_secs_f64() - 2.0,
+        "{fired_at} vs {adapted:?}"
+    );
+    assert!(step(&mut r, &clock, fired_at + 2.0).is_empty());
     // Never over the bot's own voice.
     let _ = r.on_observation(&self_speaking(clock.at_secs(500.0), true));
     assert!(step(&mut r, &clock, 600.0).is_empty());
