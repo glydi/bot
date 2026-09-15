@@ -442,10 +442,22 @@ impl World {
         let confidence = RECOGNITION_MODALITIES
             .contains(&o.modality.as_str())
             .then_some(o.confidence);
-        let id = o
-            .entity
-            .as_ref()
-            .map(|h| self.sight(h, now, confidence, &mut out));
+        // Naming is not seeing. The gallery hands over every name it
+        // knows at start-up so a greeting can use it; sighting those
+        // hints made everyone in the database present in an empty room,
+        // and the bot greeted them before the camera had even started.
+        // A binding that names a face the camera is tracking
+        // (`KnownOnTrack`) is still a sighting -- that face is right
+        // there.
+        let naming_only =
+            o.modality == "name_binding" && matches!(o.entity.as_ref(), Some(EntityHint::Known(_)));
+        let id = if naming_only {
+            o.entity.as_ref().and_then(EntityHint::known).cloned()
+        } else {
+            o.entity
+                .as_ref()
+                .map(|h| self.sight(h, now, confidence, &mut out))
+        };
 
         // Every observation about a person is evidence for their beliefs,
         // whatever the modality: that is what keeps belief tables

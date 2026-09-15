@@ -8,7 +8,7 @@ mod fixtures;
 
 use std::time::Duration;
 
-use common::{Clock, EntityHint, EntityId, FakeClock};
+use common::{Clock, EntityHint, EntityId, FakeClock, Observation, Payload};
 use mind::{EventKind, Status, World, WorldView};
 
 use crate::fixtures::*;
@@ -241,4 +241,30 @@ fn absent_strangers_are_forgotten_and_known_people_are_kept() {
     // The house rule stands for people: John comes back as RETURNED.
     let evs = w.fold(&face_known(clock.at_secs(300.0), "john"));
     assert_eq!(kinds(&evs), ["RETURNED"]);
+}
+
+/// The gallery's names arrive before anyone does. Naming must not make
+/// them present: live, the bot greeted a name from the database in an
+/// empty room, before the camera had started, and the whole
+/// conversation ran without ever needing to see anyone.
+#[test]
+fn seeding_names_does_not_put_anyone_in_the_room() {
+    let clock = FakeClock::new();
+    let mut w = World::new();
+    let john = EntityId::new("john");
+    let seed = Observation::new("store", "name_binding", clock.at_secs(0.0))
+        .with_entity(EntityHint::Known(john.clone()))
+        .with_payload(Payload::Text("John".into()));
+    let events = w.fold(&seed);
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(w.people_present(), 0);
+    // ... and when he does walk in, the greeting already has his name.
+    let face = Observation::new("cam0", "face", clock.at_secs(1.0))
+        .with_entity(EntityHint::Known(john.clone()))
+        .with_payload(Payload::None);
+    let events = w.fold(&face);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].kind, EventKind::Entered));
+    assert_eq!(w.people_present(), 1);
+    assert_eq!(w.get(&john).and_then(|e| e.name.as_deref()), Some("John"));
 }
