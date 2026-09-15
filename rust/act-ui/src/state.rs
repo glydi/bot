@@ -130,6 +130,11 @@ pub struct UiState {
     pub behaviour: Behaviour,
     /// The camera's preview frames, for the Faces tab.
     pub faces: Faces,
+    /// The last thing the bot said, from the speaker's own `spoke`
+    /// observation, for the presence strip. The speaker reports what it
+    /// actually played, which is the only honest source: a `say` command
+    /// may be cancelled by a barge-in before a word of it is heard.
+    pub said: Option<String>,
     /// Speaker levels waiting out the output latency, with when each is due.
     pending_levels: VecDeque<(Instant, f32)>,
     /// See [`lip_sync_delay`].
@@ -158,6 +163,7 @@ impl UiState {
             seen: 0,
             behaviour,
             faces: Faces::default(),
+            said: None,
             pending_levels: VecDeque::with_capacity(16),
             lip_sync: lip_sync_delay(),
         }
@@ -265,6 +271,14 @@ impl UiState {
                     } else {
                         self.face.set_mic_level(l);
                     }
+                }
+            }
+            // What the speaker actually played, for the strip's "said"
+            // line. Only the bot's own speaker: no other source speaks
+            // for it.
+            "spoke" if o.source == SPEAKER_SOURCE => {
+                if let Some(t) = o.payload.as_text() {
+                    self.said = Some(t.to_owned());
                 }
             }
             // Someone else talking: company, and a wake-up.
@@ -606,6 +620,25 @@ mod tests {
             .with_payload(Payload::Opaque(Arc::new(7u8)));
         s.on_observation(&foreign, later);
         assert_eq!(s.faces.seq, 3);
+    }
+
+    #[test]
+    fn the_speakers_spoke_is_the_last_thing_said() {
+        let now = Instant::now();
+        let mut s = UiState::new(now);
+        assert_eq!(s.said, None);
+        let spoke = |src: &str, t: &str| {
+            Observation::new(src, "spoke", now).with_payload(Payload::Text(t.to_owned()))
+        };
+        s.on_observation(&spoke(SPEAKER_SOURCE, "Hello again."), now);
+        assert_eq!(s.said.as_deref(), Some("Hello again."));
+        // Newest wins.
+        s.on_observation(&spoke(SPEAKER_SOURCE, "The bus is at six."), now);
+        assert_eq!(s.said.as_deref(), Some("The bus is at six."));
+        // Nothing else speaks for the bot: a `spoke` from elsewhere is
+        // not what the bot said.
+        s.on_observation(&spoke("mic0", "somebody else"), now);
+        assert_eq!(s.said.as_deref(), Some("The bus is at six."));
     }
 
     #[test]

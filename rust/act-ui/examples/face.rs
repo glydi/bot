@@ -8,6 +8,9 @@
 //!     cargo run -p act-ui --example face -- --react laugh   # a reaction every 2.5 s
 //!     cargo run -p act-ui --example face -- --music         # sways to a 0.8 Hz beat
 //!     cargo run -p act-ui --example face -- --faces --debug # a synthetic camera preview
+//!     cargo run -p act-ui --example face -- --faces         # the presence strip, no panel
+//!     cargo run -p act-ui --example face -- --no-strip      # only the face
+//!     cargo run -p act-ui --example face -- --strip-shot    # the docs/presence-strip.png pose
 //!
 //! Runs on the main thread, like the binary must. The screenshots in
 //! `docs/` come from `--state <name>`, captured a few seconds in; the
@@ -30,7 +33,12 @@ fn main() {
     let level_demo = args.iter().any(|a| a == "--level-demo");
     let debug = args.iter().any(|a| a == "--debug");
     let music = args.iter().any(|a| a == "--music");
-    let faces = args.iter().any(|a| a == "--faces");
+    // `--strip-shot`: the pose `docs/presence-strip.png` was taken in --
+    // a preview with a named and an unnamed face, state "thinking", and
+    // no panel, so the strip is the only thing besides the face.
+    let strip_shot = args.iter().any(|a| a == "--strip-shot");
+    let faces = args.iter().any(|a| a == "--faces") || strip_shot;
+    let no_strip = args.iter().any(|a| a == "--no-strip");
     // `--react <name>`: play that reaction over the held state every
     // 2.5 s (the yawn is 1.6 s; the pause between lets it read as one).
     let react = args
@@ -59,6 +67,7 @@ fn main() {
             })
         })
         .map(String::as_str)
+        .or_else(|| strip_shot.then_some("thinking"))
         .or_else(|| (level_demo || react.is_some() || music || faces).then_some("idle"))
         .and_then(|a| {
             let e = Expression::parse(a);
@@ -75,7 +84,7 @@ fn main() {
     let _router = router.spawn().unwrap_or_else(|e| panic!("router: {e}"));
     let (obs_tx, obs_rx) = ObservationRing::bounded(64);
 
-    std::thread::spawn(move || drive(hold, react, music, faces, &queue, &obs_tx));
+    std::thread::spawn(move || drive(hold, react, music, faces, strip_shot, &queue, &obs_tx));
 
     let sources = demo_sources(faces);
 
@@ -83,7 +92,8 @@ fn main() {
     // product and the panel is for whoever is debugging it.
     // `--faces` opens the panel on its tab: that is what it is for.
     let config = UiConfig {
-        debug: debug || faces,
+        debug: debug || (faces && !strip_shot),
+        strip: !no_strip,
         tab: if faces {
             act_ui::Tab::Faces
         } else {
@@ -106,9 +116,18 @@ fn drive(
     react: Option<act_ui::Reaction>,
     music: bool,
     faces: bool,
+    strip_shot: bool,
     queue: &CommandQueue,
     obs_tx: &common::RingSender,
 ) {
+    // One `spoke`, so the strip's "said" line has something in it for
+    // the screenshot without the face having to be speaking.
+    if strip_shot {
+        obs_tx.send(
+            Observation::new("speaker", "spoke", Instant::now())
+                .with_payload(Payload::Text("it shuts at six on weekdays".to_owned())),
+        );
+    }
     {
         let states = [
             "idle",
@@ -374,5 +393,8 @@ fn demo_sources(faces: bool) -> Sources {
             ]
         })),
         known_count: faces.then(|| Box::new(|| 7usize) as Box<dyn Fn() -> usize + Send>),
+        // What the strip's "heard" line shows; the "said" line comes
+        // from the driver's own `spoke` observations.
+        heard: Box::new(|| Some("does the library shut at six".to_owned())),
     }
 }

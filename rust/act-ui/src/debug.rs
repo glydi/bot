@@ -15,6 +15,7 @@ use common::{Preview, PreviewFace, Stage, TurnSummary};
 use mind::{Event, EventKind, WorldView};
 
 use crate::state::UiState;
+use crate::strip::PreviewTexture;
 
 /// A snapshot getter: called on the render thread, once per frame, and
 /// must not block. The world one is an `ArcSwap` load; the others read a
@@ -42,6 +43,11 @@ pub struct Sources {
     /// "gallery: N known" row. `None` when there is no gallery (no store,
     /// or the example).
     pub known_count: Option<Box<dyn Fn() -> usize + Send>>,
+    /// The last thing a person said, for the presence strip's "heard"
+    /// line: the text of the newest `SAID` event. `None` (and a getter
+    /// that returns `None`) when nothing has been transcribed yet, or
+    /// when there is no event log to read.
+    pub heard: Getter<Option<String>>,
 }
 
 impl Sources {
@@ -53,6 +59,7 @@ impl Sources {
             events: Box::new(|_| Vec::new()),
             latency: None,
             known_count: None,
+            heard: Box::new(|| None),
         }
     }
 }
@@ -87,13 +94,15 @@ impl Tab {
 
 /// The window's own panel state: which tab is open and the preview
 /// texture, which is re-uploaded only when a new preview has arrived
-/// (`Faces::seq`), not every frame.
+/// (`Faces::seq`), not every frame. The texture lives here rather than in
+/// the window so the Faces tab and the presence strip share one upload.
 #[derive(Default)]
 pub struct Panel {
     /// The open tab.
     pub tab: Tab,
-    texture: Option<egui::TextureHandle>,
-    uploaded_seq: u64,
+    /// The camera preview as a texture, shared with
+    /// [`strip`](crate::strip).
+    pub preview: PreviewTexture,
 }
 
 impl Panel {
@@ -160,27 +169,13 @@ fn faces_tab(ui: &mut egui::Ui, panel: &mut Panel, state: &UiState, src: &Source
         ui.weak("no camera preview yet");
         return;
     };
-    if panel.texture.is_none() || panel.uploaded_seq != state.faces.seq {
-        let image = egui::ColorImage::from_rgb([preview.width, preview.height], &preview.rgb);
-        match panel.texture.as_mut() {
-            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
-            None => {
-                panel.texture = Some(ui.ctx().load_texture(
-                    "camera_preview",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        }
-        panel.uploaded_seq = state.faces.seq;
-    }
-    if let Some(tex) = &panel.texture {
+    if let Some(tex) = panel.preview.ensure(ui.ctx(), &state.faces) {
         let aspect = preview.width as f32 / preview.height.max(1) as f32;
         let w = ui.available_width().min(preview.width as f32 * 2.0);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w / aspect), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.image(
-            tex.id(),
+            tex,
             rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
@@ -469,7 +464,10 @@ mod tests {
             events: Box::new(|_| Vec::new()),
             latency: Some(Box::new(|| vec![turn(1, Some(310), Some(1420), Some(180))])),
             known_count: Some(Box::new(|| 4)),
+            heard: Box::new(|| Some("is the bus late".to_owned())),
         };
+        assert_eq!((full.heard)().as_deref(), Some("is the bus late"));
+        assert_eq!((empty.heard)(), None);
         assert_eq!(full.known_count.as_ref().map(|f| f()), Some(4));
         let got = full.latency.as_ref().map(|f| f());
         assert_eq!(got.as_ref().map(Vec::len), Some(1));

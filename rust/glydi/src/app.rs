@@ -1352,6 +1352,11 @@ const KNOWN_COUNT_REFRESH: Duration = Duration::from_secs(2);
 
 /// The debug panel's readers, over the reflex's lock-free snapshots and,
 /// throttled, the store.
+/// How many events back the strip's "heard" line looks for a `SAID`. A
+/// few sightings and speaking transitions can land between two
+/// utterances; 32 covers that without walking the whole log every frame.
+const HEARD_LOOKBACK: usize = 32;
+
 fn ui_sources(
     reflex: &Arc<ReflexHandle>,
     timeline: &Arc<common::TurnTimeline>,
@@ -1367,6 +1372,22 @@ fn ui_sources(
         let tl = Arc::clone(timeline);
         move || tl.recent()
     }));
+    // The strip's "heard" line: the newest SAID event's text. Read from
+    // the same event log the panel shows, so there is no second copy of
+    // the transcript to keep in step.
+    s.heard = Box::new({
+        let events = Arc::clone(reflex);
+        move || {
+            events
+                .recent_events(HEARD_LOOKBACK)
+                .into_iter()
+                .rev()
+                .find_map(|e| match e.kind {
+                    mind::EventKind::Said(text) => Some(text),
+                    _ => None,
+                })
+        }
+    });
     s.known_count = Some(Box::new({
         let cached: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
         move || {

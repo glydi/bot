@@ -37,7 +37,8 @@
 //! * `camera_preview` (`Payload::Opaque(Arc<common::Preview>)`) -- the
 //!   camera's downscaled picture with the tracked faces, drawn by the
 //!   debug panel's Faces tab (see [`debug::Tab`]); nothing on the face
-//!   itself changes.
+//!   itself changes, and by the always-on presence strip (see
+//!   [`strip`]).
 //! * `audio_event` with `Payload::Text("music")` -- the contract for a
 //!   sense that does not exist yet (a music detector on the mic): send
 //!   one per detected beat, or at least one every 2 s while music is
@@ -55,6 +56,14 @@
 //! double-take; after three minutes its eyes drift shut and it sleeps
 //! until a voice or a face wakes it. None of that runs while the loop is
 //! listening, thinking or speaking. See [`behaviour`].
+//!
+//! # The presence strip
+//!
+//! The window also shows, in its top-left corner and with no panel to
+//! open, the camera's thumbnail with a box per tracked face and the
+//! bot's state in a word, plus the last thing heard and the last thing
+//! said: see [`strip`], and `--no-strip` / [`UiConfig::strip`] to turn it
+//! off. `act-ui/docs/presence-strip.png` is a screenshot of it.
 //!
 //! # The face
 //!
@@ -85,6 +94,7 @@ pub mod expression;
 pub mod face;
 pub mod router;
 pub mod state;
+pub mod strip;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,6 +109,7 @@ pub use debug::{Panel, Sources, Tab};
 pub use expression::{Expression, FaceState};
 pub use router::{CommandRouter, RouterHandle};
 pub use state::{Attend, Faces, UiState};
+pub use strip::{PreviewTexture, StripRow, strip_rows};
 
 /// How long the consumer loops block before re-checking for shutdown.
 const POLL: Duration = Duration::from_millis(50);
@@ -120,6 +131,11 @@ pub struct UiConfig {
     pub debug: bool,
     /// Which tab the panel opens on.
     pub tab: debug::Tab,
+    /// Whether the always-on presence strip is drawn (see [`strip`]).
+    /// Default on: what the camera sees and what the bot is doing should
+    /// not need a panel. `--no-strip` clears it -- for a kiosk where only
+    /// the face should show.
+    pub strip: bool,
     /// Come to the front on launch. The Go face did this, then stopped
     /// being pushy after 600 ms; a window that stays always-on-top is
     /// obnoxious.
@@ -137,6 +153,7 @@ impl Default for UiConfig {
             size: (520.0, 494.0 + TOGGLE_BAR),
             debug: false,
             tab: debug::Tab::default(),
+            strip: true,
             front_on_launch: true,
             quit: None,
         }
@@ -206,6 +223,7 @@ struct FaceApp {
     observations: Option<RingReceiver>,
     sources: Sources,
     debug: bool,
+    strip: bool,
     panel: debug::Panel,
     /// How many `attend`s have already been turned into a glance.
     attends_seen: u64,
@@ -228,6 +246,7 @@ impl FaceApp {
             observations,
             sources,
             debug: config.debug,
+            strip: config.strip,
             panel: debug::Panel::on(config.tab),
             attends_seen: 0,
             quit: config.quit.clone(),
@@ -335,6 +354,19 @@ impl eframe::App for FaceApp {
                     now,
                 );
             }
+            // Over the face, in the corner: the face keeps the middle of
+            // the window and the strip never takes layout space from it.
+            if self.strip {
+                let heard = (self.sources.heard)();
+                strip::show(
+                    ui,
+                    &mut self.panel.preview,
+                    &self.state,
+                    heard.as_deref(),
+                    rect,
+                    now,
+                );
+            }
         });
 
         // 60 fps while anything moves (a blink, a transition, speech), 30
@@ -350,7 +382,7 @@ impl eframe::App for FaceApp {
 }
 
 /// The page behind the face, from the design's CSS (`#f4f5f7`).
-const PAGE: egui::Color32 = egui::Color32::from_rgb(0xf4, 0xf5, 0xf7);
+pub(crate) const PAGE: egui::Color32 = egui::Color32::from_rgb(0xf4, 0xf5, 0xf7);
 
 /// The largest rect of `aspect` (width / height) centred in `outer`.
 fn fit(outer: egui::Rect, aspect: f32) -> egui::Rect {

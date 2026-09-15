@@ -40,6 +40,10 @@ enum Cmd {
         /// Synthesise but play nothing.
         #[arg(long)]
         silent: bool,
+        /// Hide the presence strip: no camera thumbnail, no state line,
+        /// just the face. For a kiosk where only the face should show.
+        #[arg(long)]
+        no_strip: bool,
     },
     /// The gallery: who GLYDI knows, and forgetting anyone it should not.
     ///
@@ -97,6 +101,7 @@ fn main() -> anyhow::Result<()> {
             config,
             record,
             silent,
+            no_strip,
         } => {
             let config = Config::load(config.as_deref())?;
             let parts = Parts {
@@ -108,7 +113,7 @@ fn main() -> anyhow::Result<()> {
                 record,
                 ..Parts::default()
             };
-            run(&config, parts)
+            run(&config, parts, !no_strip)
         }
         Cmd::People { config, forget } => {
             let config = Config::load(config.as_deref())?;
@@ -149,7 +154,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Build, run until Ctrl-C (or the window closes), stop.
-fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
+fn run(config: &Config, parts: Parts, strip: bool) -> anyhow::Result<()> {
     let headless = parts.headless;
     let mut app = App::build(config, parts)?;
     exit::install_fast_exit();
@@ -177,6 +182,7 @@ fn run(config: &Config, parts: Parts) -> anyhow::Result<()> {
     } else if let Some(ui) = app.take_ui() {
         let ui_config = act_ui::UiConfig {
             quit: Some(quit),
+            strip,
             ..act_ui::UiConfig::default()
         };
         // eframe owns the main thread until the window closes; Ctrl-C
