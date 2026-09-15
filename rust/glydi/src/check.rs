@@ -52,6 +52,11 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
     let (det, rec) = sense_vision_model_names();
     vec![
         file("whisper model", &config.whisper_model, true),
+        file(
+            "parakeet model",
+            &config.models_dir.join("parakeet/encoder-model.int8.onnx"),
+            false,
+        ),
         file("turn model", &config.turn_model, false),
         file(
             "vad model",

@@ -193,19 +193,9 @@ impl Whisper {
         Ok(text)
     }
 
-    /// Post-filter shared by every path: the blank sentinel, bracketed
-    /// sound notes, and whisper's stock guesses at near-silence.
+    /// Post-filter shared by every path; see [`clean_transcript`].
     fn clean(text: &str, samples: &[f32]) -> String {
-        let text = text.trim();
-        if text == BLANK_AUDIO
-            || is_non_speech(text)
-            || is_hallucination(text, speech_secs(samples))
-        {
-            tracing::debug!(text = %text, "dropped as non-speech");
-            return String::new();
-        }
-        // A longer transcript can still carry the sentinel inline.
-        text.replace(BLANK_AUDIO, "").trim().to_string()
+        clean_transcript(text, samples)
     }
 
     /// Run one throwaway inference. The first call after loading pays
@@ -233,6 +223,20 @@ impl Transcriber for Whisper {
     fn last_language(&self) -> Option<&'static str> {
         self.last_language
     }
+}
+
+/// Post-filter shared by every transcriber: the blank sentinel, bracketed
+/// sound notes, and the stock guesses at near-silence. Parakeet has no
+/// sentinel and describes no sounds, but its guard against a lone filler
+/// on a bell ding is the same one, and `is_non_speech` costs nothing.
+pub(crate) fn clean_transcript(text: &str, samples: &[f32]) -> String {
+    let text = text.trim();
+    if text == BLANK_AUDIO || is_non_speech(text) || is_hallucination(text, speech_secs(samples)) {
+        tracing::debug!(text = %text, "dropped as non-speech");
+        return String::new();
+    }
+    // A longer transcript can still carry the sentinel inline.
+    text.replace(BLANK_AUDIO, "").trim().to_string()
 }
 
 /// Under this much voiced audio a lone filler word is far more likely to be

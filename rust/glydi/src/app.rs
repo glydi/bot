@@ -1122,6 +1122,23 @@ fn spawn_audio(
     } else {
         cfg.turn_model = present("turn", &config.turn_model);
         cfg.whisper_model = present("whisper", &config.whisper_model);
+        // Which transcriber: Parakeet TDT (2x faster than whisper base.en
+        // on this M2, same words) when its files are present and
+        // GLYDI_STT selects it; whisper otherwise.
+        cfg.stt = std::env::var("GLYDI_STT")
+            .ok()
+            .and_then(|s| sense_audio::SttKind::parse(&s))
+            .unwrap_or_default();
+        let parakeet_dir = std::env::var("GLYDI_PARAKEET_MODEL")
+            .map_or_else(|_| config.models_dir.join("parakeet"), PathBuf::from);
+        if cfg.stt == sense_audio::SttKind::Parakeet
+            && !parakeet_dir.join("encoder-model.int8.onnx").is_file()
+        {
+            tracing::warn!(dir = %parakeet_dir.display(), "parakeet selected but its files are missing; using whisper");
+            cfg.stt = sense_audio::SttKind::Whisper;
+        }
+        cfg.parakeet_model = Some(parakeet_dir);
+        tracing::info!(stt = ?cfg.stt, "transcriber");
         // None = detect per utterance (needs a multilingual whisper
         // model, e.g. "base"; a ".en" model always reports English).
         cfg.language = std::env::var("GLYDI_LANGUAGE")

@@ -42,6 +42,7 @@ pub mod input;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod onnx;
+pub mod parakeet;
 pub mod pipeline;
 pub mod stt;
 pub mod turn;
@@ -60,6 +61,7 @@ use crossbeam_channel::{Sender, TrySendError};
 use smol_str::SmolStr;
 
 use crate::input::{FrameSource, MicInput};
+use crate::parakeet::Parakeet;
 pub use crate::pipeline::{MAX_DEFERRALS, Stats};
 use crate::pipeline::{Pipeline, TurnGate, Worker};
 use crate::stt::{Transcriber, Whisper};
@@ -149,6 +151,35 @@ impl Default for VadConfig {
     }
 }
 
+/// Which speech-to-text engine the utterance worker runs. The binary maps
+/// `GLYDI_STT=whisper|parakeet|moonshine` onto this with [`SttKind::parse`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SttKind {
+    /// whisper.cpp on Metal ([`stt::Whisper`], [`AudioConfig::whisper_model`]).
+    /// The default until the others are measured better on the machine.
+    #[default]
+    Whisper,
+    /// NVIDIA Parakeet TDT 0.6B, ONNX on the CPU ([`parakeet::Parakeet`],
+    /// [`AudioConfig::parakeet_model`]). English only.
+    Parakeet,
+    /// Moonshine (usefulsensors). Reserved: selecting it is an error until
+    /// a port lands.
+    Moonshine,
+}
+
+impl SttKind {
+    /// `"whisper"`, `"parakeet"` or `"moonshine"`, case-insensitive;
+    /// `None` for anything else (the caller keeps its default).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "whisper" => Some(Self::Whisper),
+            "parakeet" => Some(Self::Parakeet),
+            "moonshine" => Some(Self::Moonshine),
+            _ => None,
+        }
+    }
+}
+
 /// How to build the sense.
 #[derive(Clone)]
 pub struct AudioConfig {
@@ -162,8 +193,15 @@ pub struct AudioConfig {
     /// smart-turn ONNX model; `None` disables semantic end-of-turn (the VAD
     /// hangover alone decides, ~250 ms slower per turn).
     pub turn_model: Option<PathBuf>,
-    /// whisper ggml model; `None` disables transcription.
+    /// Which transcriber [`AudioConfig::whisper_model`] /
+    /// [`AudioConfig::parakeet_model`] is loaded into.
+    pub stt: SttKind,
+    /// whisper ggml model; `None` disables transcription (with
+    /// [`SttKind::Whisper`]).
     pub whisper_model: Option<PathBuf>,
+    /// Parakeet model *directory* (see [`parakeet`] for its files); `None`
+    /// disables transcription (with [`SttKind::Parakeet`]).
+    pub parakeet_model: Option<PathBuf>,
     /// ECAPA ONNX model; `None` disables speaker id.
     pub voiceid_model: Option<PathBuf>,
     /// Silero VAD ONNX model. When set and loadable, voice activity means
@@ -222,7 +260,9 @@ impl std::fmt::Debug for AudioConfig {
             .field("device", &self.device)
             .field("sample_rate", &self.sample_rate)
             .field("turn_model", &self.turn_model)
+            .field("stt", &self.stt)
             .field("whisper_model", &self.whisper_model)
+            .field("parakeet_model", &self.parakeet_model)
             .field("voiceid_model", &self.voiceid_model)
             .field("vad_model", &self.vad_model)
             .field("ort_lib", &self.ort_lib)
@@ -259,7 +299,9 @@ impl AudioConfig {
             device: None,
             sample_rate: input::TARGET_RATE,
             turn_model: Some(dir.join("turn/smart-turn-v3.2-cpu.onnx")),
+            stt: SttKind::default(),
             whisper_model: Some(dir.join("whisper/ggml-tiny.en.bin")),
+            parakeet_model: Some(dir.join("parakeet")),
             voiceid_model: Some(dir.join("voiceid/ecapa.onnx")),
             vad_model: Some(dir.join(vad_model_relative())),
             ort_lib: PathBuf::from(onnx::DEFAULT_ORT_LIBRARY),
@@ -288,6 +330,7 @@ impl AudioConfig {
     pub fn without_models(mut self) -> Self {
         self.turn_model = None;
         self.whisper_model = None;
+        self.parakeet_model = None;
         self.voiceid_model = None;
         self.vad_model = None;
         self.sound_model = None;
@@ -620,20 +663,40 @@ impl AudioSense {
             }
             None => None,
         };
-        let stt: Option<Box<dyn Transcriber>> = match &config.whisper_model {
-            Some(p) => {
-                let mut w = Whisper::open_with_language(
-                    p,
-                    config.whisper_threads,
-                    config.language.as_deref(),
-                )?;
-                if config.warm_up {
-                    w.warm_up()?;
+        let stt: Option<Box<dyn Transcriber>> =
+            match (config.stt, &config.whisper_model, &config.parakeet_model) {
+                (SttKind::Whisper, Some(p), _) => {
+                    let mut w = Whisper::open_with_language(
+                        p,
+                        config.whisper_threads,
+                        config.language.as_deref(),
+                    )?;
+                    if config.warm_up {
+                        w.warm_up()?;
+                    }
+                    Some(Box::new(w))
                 }
-                Some(Box::new(w))
-            }
-            None => None,
-        };
+                (SttKind::Parakeet, _, Some(dir)) => {
+                    if config.language.as_deref().is_some_and(|l| l != "en") {
+                        tracing::warn!(
+                            requested = config.language.as_deref(),
+                            "parakeet v2 is English-only; language forced to en"
+                        );
+                    }
+                    let mut p = Parakeet::open(dir, &config.ort_lib, config.whisper_threads)?;
+                    if config.warm_up {
+                        p.warm_up()?;
+                    }
+                    Some(Box::new(p))
+                }
+                (SttKind::Moonshine, _, _) => {
+                    return Err(Error::Model(
+                        "stt=moonshine is reserved and not implemented; use whisper or parakeet"
+                            .into(),
+                    ));
+                }
+                _ => None,
+            };
         let encoder = match &config.voiceid_model {
             Some(p) => Some(Encoder::open(p, &config.ort_lib)?),
             None => None,
