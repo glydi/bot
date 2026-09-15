@@ -187,7 +187,7 @@ fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
     r.world_mut().set_name(&EntityId::new("john"), "John");
     // Arrival (greeting is the planner's business, not this rule's).
     let _ = step(&mut r, &clock, 0.0);
-    for t in [1.0, 2.0, 10.0, 20.0, 30.0] {
+    for t in [1.0, 2.0, 3.0, 4.0] {
         assert!(step(&mut r, &clock, t).is_empty(), "not settled yet at {t}");
     }
     let got = step(&mut r, &clock, Lull::SETTLE.as_secs_f64() + 1.0);
@@ -202,7 +202,7 @@ fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
         r.snapshot().working.rates
     );
     // Not again for a while, even in silence.
-    for t in [60.0, 100.0] {
+    for t in [30.0, 60.0] {
         assert!(step(&mut r, &clock, t).is_empty());
     }
     // A voice resets the silence; the gap still applies.

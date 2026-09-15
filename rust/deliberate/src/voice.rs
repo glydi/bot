@@ -38,7 +38,7 @@ use crate::tools::local_utc_offset;
 /// this before the hello; a warm qwen2.5:3b answers a one-sentence note
 /// in 0.6-1.2 s (see `tests/proactive_live.rs`), so the fallback is for
 /// a cold prefix or a stalled server, not the common case.
-pub const PROACTIVE_DEADLINE: Duration = Duration::from_millis(2500);
+pub const PROACTIVE_DEADLINE: Duration = Duration::from_millis(4000);
 
 /// Sampling temperature for proactive lines. Higher than an answer's
 /// 0.7: the note is nearly the same every time the same person walks
@@ -1044,6 +1044,23 @@ const NOT_NAMES: [&str; 22] = [
 /// `forget_person`. A name given is enrolled here, deterministically,
 /// before the model sees the turn.
 pub fn self_introduction(text: &str, after_name_question: bool) -> Option<String> {
+    // Whisper hands over whole runs of speech ("I am Kalyan. I am Kalyan.
+    // Hello. What are you doing?"): look at each sentence, first match
+    // wins; a bare-name answer must be the whole utterance.
+    let sentences: Vec<&str> = text
+        .split_inclusive(['.', '!', '?'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sentences.len() > 1 {
+        return sentences
+            .iter()
+            .find_map(|s| self_introduction_one(s, false));
+    }
+    self_introduction_one(text, after_name_question)
+}
+
+fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String> {
     let t = text.trim().trim_end_matches(['.', '!', '?', ',']).trim();
     let lower = t.to_lowercase();
     let rest = LEADS
@@ -1116,6 +1133,18 @@ mod self_intro_tests {
         assert!(self_introduction("I'm fine", true).is_none());
         assert!(self_introduction("I am going to Google it", false).is_none());
         assert!(self_introduction("we don't know anyone", true).is_none());
+        assert_eq!(
+            self_introduction(
+                "I am Kalyan. I am Kalyan. Hello. What are you doing?",
+                false
+            )
+            .unwrap(),
+            "Kalyan"
+        );
+        assert_eq!(
+            self_introduction("Hello there. My name is Ravi. Nice place.", false).unwrap(),
+            "Ravi"
+        );
         assert!(asks_for_name("I don't know your name yet, what is it?"));
         assert!(!asks_for_name("What do you do?"));
     }

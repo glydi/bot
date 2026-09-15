@@ -1061,7 +1061,12 @@ mod tests {
         assert!(intents(&r.on_observation(&o)).is_empty());
         assert!(intents(&r.on_observation(&face(clock.at_secs(71.0), ada.clone()))).is_empty());
         r.world_mut().set_bot_speaking(false);
-        let i = intents(&r.on_observation(&face(clock.at_secs(72.0), ada)));
+        // Within a tick or two: another rule (the lull's opener, filtered
+        // out of `intents`) may take the first quiet pass.
+        let mut i = intents(&r.on_observation(&face(clock.at_secs(72.0), ada)));
+        if i.is_empty() {
+            i = intents(&r.tick(clock.at_secs(72.2)));
+        }
         assert_eq!(i.len(), 1, "{i:?}");
         assert!(i[0].contains(r#""id":8"#), "{}", i[0]);
     }

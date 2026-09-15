@@ -462,15 +462,15 @@ impl Default for Lull {
 }
 
 impl Lull {
-    /// Silence before the bot speaks up. Long enough that a pause for
-    /// thought is not interrupted; short enough that the room does not go
-    /// dead.
-    pub const SILENCE: Duration = Duration::from_secs(25);
+    /// Silence before the bot speaks up. A school foyer, not a study: a
+    /// person who walked up and said nothing for eight seconds is waiting
+    /// for the bot to start.
+    pub const SILENCE: Duration = Duration::from_secs(8);
     /// Minimum time between two unprompted openings to the same person.
-    pub const MIN_GAP: Duration = Duration::from_secs(180);
+    pub const MIN_GAP: Duration = Duration::from_secs(90);
     /// Someone must have been here this long first: an opening line ten
     /// seconds after a greeting is two greetings.
-    pub const SETTLE: Duration = Duration::from_secs(40);
+    pub const SETTLE: Duration = Duration::from_secs(5);
 
     /// A new rule.
     pub fn new() -> Self {

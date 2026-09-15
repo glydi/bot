@@ -1946,11 +1946,22 @@ impl Session {
                     continue;
                 }
             }
+            // Who said it: the voice match when there is one, else whoever
+            // the mind says is speaking (the camera-confirmed engaged
+            // person). Without this a recognised face with an un-enrolled
+            // voice was answered as a stranger -- "Hello, Bado. I don't know
+            // your name yet" -- in one breath.
             let speaker = o
                 .entity
                 .as_ref()
                 .and_then(common::EntityHint::known)
-                .cloned();
+                .cloned()
+                .or_else(|| {
+                    let view = (self.snapshot)();
+                    view.speaker()
+                        .map(|p| p.id.clone())
+                        .filter(|id| !id.is_track())
+                });
             // The mind's verdict on this utterance travels on the intent
             // channel, a hair behind it: read what is there before the
             // turn starts, so an `ignore_utterance` for it is not found
