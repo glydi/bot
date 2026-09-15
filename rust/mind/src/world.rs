@@ -56,6 +56,18 @@ pub const BEARING_FRESH: Duration = PRESENCE_TTL;
 /// never merged.
 pub const SAME_FACE_DEGREES: f32 = 12.0;
 
+/// How recent a lip-motion sample must be to say who is speaking. The
+/// vision sense reports every 100 ms and the transcript arrives a few
+/// hundred milliseconds after the words, so this spans the utterance's
+/// tail rather than its middle.
+pub const LIP_WINDOW: Duration = Duration::from_millis(1500);
+
+/// How much clearer one mouth must be than every other before its owner
+/// is credited with the words. Two people talking at once credits
+/// nobody: the bot would answer the wrong one and file their words under
+/// the wrong name.
+pub const LIP_LEAD: f32 = 0.2;
+
 /// Whether an entity is in the room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -368,6 +380,33 @@ impl World {
     /// How many people are in the room right now. Walks the table (a
     /// few dozen entries at most, see [`STRANGER_TTL`]); called once per
     /// pass by the crowd bookkeeping, not per rule.
+    /// The face whose lips were moving as the words arrived, when that
+    /// is unambiguous: the clearest mouth in the room, moving past
+    /// [`crate::engage::LIP_GATE`], and at least [`LIP_LEAD`] clearer
+    /// than the next one. `None` with no camera, nobody moving, or two
+    /// people talking at once -- attributing words to the wrong person
+    /// is worse than leaving them unattributed, since the bot answers
+    /// the wrong one and remembers their words under the wrong name.
+    pub fn lip_speaker(&self, now: Instant) -> Option<EntityId> {
+        let mut best: Option<(&EntityId, f32)> = None;
+        let mut runner_up = 0.0f32;
+        for e in self.present() {
+            let Some(level) = e.engagement.lip_level(now, LIP_WINDOW) else {
+                continue;
+            };
+            match best {
+                Some((_, b)) if level <= b => runner_up = runner_up.max(level),
+                Some((_, b)) => {
+                    runner_up = runner_up.max(b);
+                    best = Some((&e.id, level));
+                }
+                None => best = Some((&e.id, level)),
+            }
+        }
+        let (id, level) = best?;
+        (level >= crate::engage::LIP_GATE && level - runner_up >= LIP_LEAD).then(|| id.clone())
+    }
+
     /// Whether this track is most likely the same human as a known
     /// person already in the room: their faces are at the same bearing.
     ///
@@ -495,7 +534,12 @@ impl World {
                 }
             }
             "utterance" => {
-                if let (Some(id), Some(text)) = (id, o.payload.as_text()) {
+                // Whose words these are. The voice gallery names a speaker
+                // only when it has met them; with several faces in a
+                // school foyer the lips settle it, which is what a person
+                // does when two people are in front of them.
+                let who = id.or_else(|| self.lip_speaker(now));
+                if let (Some(id), Some(text)) = (who, o.payload.as_text()) {
                     if let Some(e) = self.entities.get_mut(&id) {
                         e.last_spoke = Some(now);
                     }

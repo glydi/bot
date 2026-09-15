@@ -157,6 +157,15 @@ impl Engagement {
         })
     }
 
+    /// How much the lips were moving, if the sample is recent enough to
+    /// mean anything. What [`crate::World::lip_speaker`] ranks faces by
+    /// when a voice arrives with no name on it.
+    pub fn lip_level(&self, now: Instant, window: Duration) -> Option<f32> {
+        self.lips
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= window)
+            .map(|(l, _)| l)
+    }
+
     /// Lips moving within the coincidence window.
     pub fn lips_moving(&self, now: Instant) -> bool {
         self.lips.is_some_and(|(l, at)| {

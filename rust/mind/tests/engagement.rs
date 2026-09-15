@@ -16,6 +16,7 @@ use common::{Clock, Command, EntityHint, EntityId, FakeClock, Observation, Paylo
 use mind::belief::{ENGAGED_WITH_BOT, YES};
 use mind::engage::{FACING, HYSTERESIS, LIP_MOTION};
 use mind::plan::{INTENT_KIND, INTENT_TARGET};
+use mind::{EventKind, World};
 use mind::{Reflex, WorldView};
 
 use crate::fixtures::*;
@@ -222,4 +223,55 @@ fn two_simultaneous_talkers_engage_nobody() {
     assert!(!engaged(&r, "ada", now));
     assert!(!engaged(&r, "john", now));
     assert!(r.snapshot().speaker().is_none());
+}
+
+/// The lips say who spoke when the voice does not. In a foyer the
+/// gallery knows few voices, so without this the words belong to nobody
+/// and the bot answers the room instead of the person.
+#[test]
+fn the_moving_mouth_is_credited_with_the_words() {
+    let clock = FakeClock::new();
+    let mut w = World::new();
+    let ada = EntityId::new("ada");
+    let bob = EntityId::new("bob");
+    let see = |w: &mut World, t: f64, id: &EntityId, facing: f32, lips: f32| {
+        for (m, v) in [(FACING, facing), (LIP_MOTION, lips)] {
+            w.fold(
+                &Observation::new("cam0", m, clock.at_secs(t))
+                    .with_entity(EntityHint::Known(id.clone()))
+                    .with_payload(Payload::Level(v)),
+            );
+        }
+        w.fold(
+            &Observation::new("cam0", "face", clock.at_secs(t))
+                .with_entity(EntityHint::Known(id.clone()))
+                .with_payload(Payload::None),
+        );
+    };
+    // Both in shot; Ada is the one talking.
+    see(&mut w, 0.0, &ada, 0.9, 0.8);
+    see(&mut w, 0.0, &bob, 0.9, 0.05);
+    assert_eq!(w.lip_speaker(clock.at_secs(0.1)), Some(ada.clone()));
+    let said = w.fold(
+        &Observation::new("mic0", "utterance", clock.at_secs(0.2))
+            .with_payload(Payload::Text("is this thing on?".into())),
+    );
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].entity, ada);
+    assert!(matches!(said[0].kind, EventKind::Said(_)));
+    // Both mouths moving: nobody is credited, rather than the wrong one.
+    see(&mut w, 1.0, &ada, 0.9, 0.7);
+    see(&mut w, 1.0, &bob, 0.9, 0.75);
+    assert_eq!(w.lip_speaker(clock.at_secs(1.1)), None);
+    // A stale sample says nothing either.
+    assert_eq!(w.lip_speaker(clock.at_secs(9.0)), None);
+    // A named voice always wins over the lips.
+    see(&mut w, 10.0, &ada, 0.9, 0.9);
+    see(&mut w, 10.0, &bob, 0.9, 0.0);
+    let said = w.fold(
+        &Observation::new("mic0", "utterance", clock.at_secs(10.1))
+            .with_entity(EntityHint::Known(bob.clone()))
+            .with_payload(Payload::Text("actually it was me".into())),
+    );
+    assert_eq!(said[0].entity, bob);
 }
