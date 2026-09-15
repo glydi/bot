@@ -34,6 +34,70 @@ fn voice_stopped(o: &Observation) -> bool {
     o.modality == VOICE_ACTIVITY && o.payload.as_bool() == Some(false)
 }
 
+/// The eyes follow the face the camera sees, continuously.
+///
+/// The Go build tracked whoever was in shot; in the port the gaze moved
+/// only on a voice edge that named its speaker -- and the microphone
+/// never names one -- so the eyes stopped following people. This rule
+/// puts the bearing of the face we are attending to on the `ui/attend`
+/// stream whenever it moves, whether anyone is talking or not.
+#[derive(Debug, Default)]
+pub struct GazeFollow {
+    /// The bearing last sent, and when.
+    last: Cell<Option<(f32, Instant)>>,
+}
+
+impl GazeFollow {
+    /// Degrees the face must move before the eyes are told again. Small
+    /// enough to read as following, large enough not to chase jitter.
+    pub const STEP: f32 = 2.0;
+
+    /// A refresh even when the bearing has not moved, so a gaze that has
+    /// drifted home (see act-ui's `ATTEND_HOLD`) comes back.
+    pub const REFRESH: Duration = Duration::from_millis(1200);
+}
+
+impl Rule for GazeFollow {
+    fn name(&self) -> &'static str {
+        "gaze_follow"
+    }
+
+    fn apply(&self, o: &Observation, w: &World, out: &mut Commands) {
+        // Only a sighting carries a bearing worth following.
+        if o.modality != "face" {
+            return;
+        }
+        let Some(id) = o.entity.as_ref().and_then(|h| w.resolve(h)).map(|e| &e.id) else {
+            return;
+        };
+        // One person: follow them. Several: follow whoever has the floor,
+        // so the eyes do not flick between faces.
+        let target = w
+            .engaged_speaker(o.at)
+            .map(|e| e.id.clone())
+            .or_else(|| (w.people_present() == 1).then(|| id.clone()));
+        if target.as_ref() != Some(id) {
+            return;
+        }
+        let Some(bearing) = w.get(id).and_then(|e| e.bearing_at(o.at)) else {
+            return;
+        };
+        let moved = self.last.get().is_none_or(|(was, at)| {
+            (bearing - was).abs() >= Self::STEP
+                || o.at.saturating_duration_since(at) >= Self::REFRESH
+        });
+        if !moved {
+            return;
+        }
+        self.last.set(Some((bearing, o.at)));
+        out.push(
+            Command::new("ui", "attend", Priority::Reflex).with_payload(Payload::Direction {
+                azimuth_deg: bearing,
+            }),
+        );
+    }
+}
+
 /// Someone started talking and we know who: turn the face toward them.
 /// Fires on the edge only (the sense emits `voice_activity` as
 /// started/stopped), so a long monologue is one `attend`, not a stream.
@@ -1172,6 +1236,7 @@ pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     // After curiosity: something new to remark on beats a word to an
     // empty room.
     v.push(Box::new(crate::initiative::Muse::new()));
+    v.push(Box::new(GazeFollow::default()));
     // Last: it reads every command the rules above pushed this pass.
     v.push(Box::new(crate::outcome::OutcomeRule));
     v

@@ -363,13 +363,14 @@ fn attention_rotates_to_whoever_is_engaged() {
         "{bob_at:?}"
     );
     assert_eq!(r.working().crowd.engaged, Some(EntityId::new("bob")));
-    // Once per change, not once per frame: the rotation's own attends are
-    // the ones with a direction (the voice-edge rule has no entity here).
+    // Not once per frame. Two changes of target, plus the gaze following
+    // the engaged face as it moves (`GazeFollow`, which is what makes the
+    // eyes track a person at all) -- but far fewer than the frames sent.
     let directed = attends(&all)
         .iter()
         .filter(|p| matches!(p, Payload::Direction { .. }))
         .count();
-    assert!(directed <= 4, "{directed} attends for two changes");
+    assert!(directed <= 8, "{directed} attends for two changes");
     // Backchannels only to the engaged speaker: Bob's turn ends while the
     // camera confirms him.
     let t = clock.at_secs(5.0);

@@ -13,6 +13,7 @@ use std::time::Instant;
 use common::{Clock, Command, EntityHint, EntityId, FakeClock, Observation, Payload, Priority};
 use mind::Reflex;
 use mind::engage::{FACING, LIP_MOTION};
+use mind::rules::cognitive_rules;
 use mind::rules::{Acknowledge, AttendToSpeaker, ListenOnVoice};
 use smallvec::SmallVec;
 
@@ -317,4 +318,41 @@ fn attend_carries_direction_after_a_face_with_azimuth() {
         true,
     ));
     assert_eq!(cmds[0].payload.as_text(), Some("john"));
+}
+
+/// The eyes follow the face, talking or not -- the Go build's tracking,
+/// which the port had lost: `attend` only fired on a voice edge that
+/// named its speaker, and the microphone never names one.
+#[test]
+fn the_gaze_follows_a_face_across_the_frame() {
+    let clock = FakeClock::new();
+    let mut r = Reflex::with_rules("gaze", clock.now(), cognitive_rules());
+    let bearings = |cmds: &[Command]| -> Vec<f32> {
+        cmds.iter()
+            .filter(|c| c.target == "ui" && c.kind == "attend")
+            .filter_map(|c| match c.payload {
+                Payload::Direction { azimuth_deg } => Some(azimuth_deg),
+                _ => None,
+            })
+            .collect()
+    };
+    let face = |t: f64, az: f32| {
+        Observation::new("cam0", "face", clock.at_secs(t))
+            .with_entity(EntityHint::Track(1))
+            .with_payload(Payload::Direction { azimuth_deg: az })
+    };
+    // Walking across the frame: every real move is passed on.
+    let mut seen = Vec::new();
+    for (i, az) in [-20.0, -18.0, -12.0, 0.0, 9.0, 18.0].iter().enumerate() {
+        seen.extend(bearings(&r.on_observation(&face(i as f64 * 0.2, *az))));
+    }
+    assert_eq!(seen.len(), 6, "{seen:?}");
+    assert!((seen[5] - 18.0).abs() < 0.01);
+    // Jitter under the step is not chased.
+    let quiet = bearings(&r.on_observation(&face(1.3, 18.5)));
+    assert!(quiet.is_empty(), "{quiet:?}");
+    // After a while the eyes are told again, so a gaze that drifted home
+    // comes back to the face.
+    let again = bearings(&r.on_observation(&face(2.6, 18.5)));
+    assert_eq!(again.len(), 1, "{again:?}");
 }
