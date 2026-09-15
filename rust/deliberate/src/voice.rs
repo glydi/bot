@@ -1154,10 +1154,76 @@ const CLAUSE: [&str; 12] = [
     "and", "but", "so", "because", "is", "was", "from", "the", "a", "an", "at", "in",
 ];
 
-/// "I'm fine", "I'm good", "I am here", "it's me": states, not names.
-const NOT_NAMES: [&str; 22] = [
-    "fine", "good", "ok", "okay", "great", "well", "here", "back", "me", "tired", "bored", "sorry",
-    "done", "ready", "busy", "not", "just", "so", "very", "really", "leaving", "going",
+/// Words that are never a name, however they arrive. "I'm fine", "it's
+/// me" -- and, measured against a live gallery, answers like "No" and
+/// "I'm alone" that were enrolled as people: six of the owner's own face
+/// samples ended up filed under a person called "No", which split his
+/// face across two identities and made him unrecognisable.
+const NOT_NAMES: [&str; 64] = [
+    "fine",
+    "good",
+    "ok",
+    "okay",
+    "great",
+    "well",
+    "here",
+    "back",
+    "me",
+    "tired",
+    "bored",
+    "sorry",
+    "done",
+    "ready",
+    "busy",
+    "not",
+    "just",
+    "so",
+    "very",
+    "really",
+    "leaving",
+    "going",
+    "no",
+    "nope",
+    "yes",
+    "yeah",
+    "yep",
+    "sure",
+    "maybe",
+    "alone",
+    "nothing",
+    "nobody",
+    "none",
+    "someone",
+    "somebody",
+    "hello",
+    "hi",
+    "hey",
+    "bye",
+    "goodbye",
+    "thanks",
+    "thank",
+    "please",
+    "stop",
+    "wait",
+    "what",
+    "who",
+    "why",
+    "when",
+    "where",
+    "how",
+    "this",
+    "that",
+    "them",
+    "they",
+    "you",
+    "your",
+    "mine",
+    "ours",
+    "everyone",
+    "everybody",
+    "again",
+    "now",
+    "today",
 ];
 
 /// The name in a self-introduction: "I'm Kalyan", "I am Kalyan", "my
@@ -1229,7 +1295,12 @@ fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String
     if words.is_empty() || words.len() > 2 {
         return None;
     }
-    if NOT_NAMES.contains(&words[0].to_lowercase().as_str()) {
+    // Any word of it being a non-name is enough: "No thanks", "alone
+    // here", "yes please" are answers, not introductions.
+    if words
+        .iter()
+        .any(|w| NOT_NAMES.contains(&w.to_lowercase().as_str()))
+    {
         return None;
     }
     if !words.iter().all(|w| {
@@ -1281,6 +1352,25 @@ mod self_intro_tests {
         assert!(self_introduction("I'm fine", true).is_none());
         assert!(self_introduction("I am going to Google it", false).is_none());
         assert!(self_introduction("we don't know anyone", true).is_none());
+        // Measured against the live gallery: these were enrolled as
+        // people and split the owner's face across identities.
+        for said in [
+            "No",
+            "no thanks",
+            "I'm alone",
+            "Alone",
+            "yes",
+            "nothing",
+            "hello",
+            "bye",
+            "what",
+            "someone",
+        ] {
+            assert!(
+                self_introduction(said, true).is_none(),
+                "{said} was taken for a name"
+            );
+        }
         // A name offered mid-sentence, and the clause after it ignored.
         assert_eq!(
             self_introduction("hey I'm Ada, is this thing on?", false).unwrap(),

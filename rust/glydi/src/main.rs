@@ -41,6 +41,21 @@ enum Cmd {
         #[arg(long)]
         silent: bool,
     },
+    /// The gallery: who GLYDI knows, and forgetting anyone it should not.
+    ///
+    /// A mishearing can enrol a person ("No", "Alone" both appeared in a
+    /// live gallery) and a stray identity splits someone's face across
+    /// two, which stops them being recognised at all. This is how to see
+    /// that and undo it without SQL.
+    People {
+        /// Config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Forget these people, by name or id. Everything about them
+        /// goes: faces, voices, facts, episodes.
+        #[arg(long = "forget", value_name = "NAME|ID")]
+        forget: Vec<String>,
+    },
     /// Report what a run would find: models, runtime, devices, model server.
     Check {
         /// Config file.
@@ -94,6 +109,28 @@ fn main() -> anyhow::Result<()> {
                 ..Parts::default()
             };
             run(&config, parts)
+        }
+        Cmd::People { config, forget } => {
+            let config = Config::load(config.as_deref())?;
+            let store = memory::Store::open(&config.db)?;
+            for who in &forget {
+                match store.forget_named(who) {
+                    Ok(true) => println!("forgot {who}"),
+                    Ok(false) => println!("no one called {who}"),
+                    Err(e) => println!("could not forget {who}: {e}"),
+                }
+            }
+            let people = store.people()?;
+            if people.is_empty() {
+                println!("the gallery is empty");
+            }
+            for p in &people {
+                println!(
+                    "{:<14} {:<16} faces={:<3} voices={:<3} facts={}",
+                    p.id, p.name, p.faces, p.voices, p.facts
+                );
+            }
+            Ok(())
         }
         Cmd::Check { config, tts } => {
             let config = Config::load(config.as_deref())?;

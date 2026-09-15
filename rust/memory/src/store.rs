@@ -340,6 +340,9 @@ pub struct Store {
     forgotten: Mutex<HashSet<EntityId>>,
     /// Seconds east of UTC for "today" (see [`Store::with_utc_offset`]).
     pub(crate) utc_offset_secs: i64,
+    /// When the last "no match" line went out, per modality (face,
+    /// voice); see `Store::log_due`.
+    last_miss_log: Mutex<(Option<std::time::Instant>, Option<std::time::Instant>)>,
 }
 
 /// The Python `SCHEMA`, verbatim in effect (whitespace aside), plus the
@@ -487,6 +490,7 @@ impl Store {
             face_gates: Gates::FACE,
             voice_gates: Gates::VOICE,
             stash: Mutex::new(Stashes::default()),
+            last_miss_log: Mutex::new((None, None)),
             forgotten: Mutex::new(HashSet::new()),
             utc_offset_secs: 0,
         };
@@ -594,7 +598,45 @@ impl Store {
         let probe = normalise(emb)?;
         let ranked = self.index(m).read().search(&probe)?;
         let g = self.gates(m);
-        Ok(open_set_match(&ranked, g.threshold, g.margin))
+        let out = open_set_match(&ranked, g.threshold, g.margin);
+        // Why someone was or was not recognised, in the log, at most once
+        // a second per modality: a live gallery had the owner's face
+        // split across two people (one of them called "No", enrolled from
+        // a mishearing) and every sighting failed the margin with no
+        // trace of why.
+        if out.is_none() && self.log_due(m) {
+            let top: Vec<String> = ranked
+                .iter()
+                .take(3)
+                .map(|(id, score)| {
+                    let name = self.name_of(id).unwrap_or_else(|| id.as_str().to_owned());
+                    format!("{name} {score:.3}")
+                })
+                .collect();
+            tracing::info!(
+                modality = m.as_str(),
+                threshold = g.threshold,
+                margin = g.margin,
+                candidates = top.join(", "),
+                "no match"
+            );
+        }
+        Ok(out)
+    }
+
+    /// Whether a "no match" line is due for this modality (one a second).
+    fn log_due(&self, m: Modality) -> bool {
+        let now = std::time::Instant::now();
+        let mut last = self.last_miss_log.lock();
+        let slot = match m {
+            Modality::Face => &mut last.0,
+            Modality::Voice => &mut last.1,
+        };
+        if slot.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1)) {
+            return false;
+        }
+        *slot = Some(now);
+        true
     }
 
     /// How many embeddings the gallery holds for `m`.
@@ -893,6 +935,23 @@ impl Store {
     /// Whether `id` was forgotten in this process (see [`Store::forget_person`]).
     pub fn is_forgotten(&self, id: &EntityId) -> bool {
         self.forgotten.lock().contains(id)
+    }
+
+    /// Forget whoever is called this, or whose id is this. For the
+    /// `glydi people --forget` command: a name misheard into a person
+    /// ("No", "Alone" both appeared in a live gallery) splits a real
+    /// person's face across identities and stops them being recognised.
+    pub fn forget_named(&self, who: &str) -> Result<bool, Error> {
+        let want = who.trim().to_lowercase();
+        let id = self
+            .people()?
+            .into_iter()
+            .find(|p| p.name.to_lowercase() == want || p.id.as_str().to_lowercase() == want)
+            .map(|p| p.id);
+        match id {
+            Some(id) => self.forget_person(&id),
+            None => Ok(false),
+        }
     }
 
     /// [`Store::forget_person`] under the `FactSource` name.
