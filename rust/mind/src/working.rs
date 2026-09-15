@@ -73,6 +73,10 @@ pub const MAX_GREETED: usize = 16;
 /// track number that old has been recycled by the tracker anyway.
 pub const MAX_NAME_ASKED: usize = 16;
 
+/// People we have decided to leave alone for a while (one per person).
+/// Same bound as the greetings, for the same reason.
+pub const MAX_LEFT_ALONE: usize = 16;
+
 /// Object classes held as "in view". Thirty-two: a camera pointed at a
 /// desk reports a dozen classes; the COCO set has eighty, and a thirty-
 /// third drops the oldest rather than growing.
@@ -173,6 +177,10 @@ pub struct WorkingMemory {
     /// When the group hello last went out, so a burst of arrivals is one
     /// `greet_group`, not one per late-comer.
     pub last_group_greet: Option<Instant>,
+    /// People not to speak to unprompted until the given instant: the
+    /// follow-up rule sets it after its one "still there?" (see
+    /// `rules::FollowUp`), and the lull and invite rules honour it.
+    left_alone: Vec<(EntityId, Instant)>,
 }
 
 impl Default for WorkingMemory {
@@ -208,7 +216,28 @@ impl WorkingMemory {
             crowd: Crowd::default(),
             speech_runs: VecDeque::new(),
             last_group_greet: None,
+            left_alone: Vec::new(),
         }
+    }
+
+    /// Leave `entity` alone -- no unprompted line to them -- until
+    /// `until` (replacing any earlier instruction).
+    pub fn leave_alone(&mut self, entity: EntityId, until: Instant) {
+        if let Some(slot) = self.left_alone.iter_mut().find(|(e, _)| *e == entity) {
+            slot.1 = until;
+            return;
+        }
+        if self.left_alone.len() >= MAX_LEFT_ALONE {
+            self.left_alone.remove(0);
+        }
+        self.left_alone.push((entity, until));
+    }
+
+    /// Whether `entity` is being left alone at `now`.
+    pub fn is_left_alone(&self, entity: &EntityId, now: Instant) -> bool {
+        self.left_alone
+            .iter()
+            .any(|(e, until)| e == entity && now < *until)
     }
 
     /// Rebuild [`WorkingMemory::crowd`] from the room at `now`. Called
@@ -483,6 +512,11 @@ impl WorkingMemory {
                         }
                     }
                     self.name_asked.retain(|e| e != from);
+                    for l in &mut self.left_alone {
+                        if l.0 == *from {
+                            l.0 = to.clone();
+                        }
+                    }
                     for s in &mut self.speech_runs {
                         if s.who.as_ref() == Some(from) {
                             s.who = Some(to.clone());

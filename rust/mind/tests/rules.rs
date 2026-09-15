@@ -185,8 +185,11 @@ fn a_lull_with_a_known_person_present_opens_small_talk_sparingly() {
     let clock = FakeClock::new();
     let mut r = Reflex::with_rules("l", clock.now(), cognitive_rules());
     r.world_mut().set_name(&EntityId::new("john"), "John");
-    // Arrival (greeting is the planner's business, not this rule's).
+    // Arrival (greeting is the planner's business, not this rule's), and
+    // John answers it: a hello left unanswered is the follow-up rule's
+    // business (`tests/initiative.rs`), after which he is left alone.
     let _ = step(&mut r, &clock, 0.0);
+    let _ = r.on_observation(&utterance(clock.at_secs(0.5), "john", "hey"));
     for t in [1.0, 2.0, 3.0, 4.0] {
         assert!(step(&mut r, &clock, t).is_empty(), "not settled yet at {t}");
     }

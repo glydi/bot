@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::belief::{BeliefSet, ENGAGED_WITH_BOT};
-use crate::engage::{AWAY_FOR, COINCIDENCE, Engagement};
+use crate::engage::{ATTENTIVE_AFTER, AWAY_FOR, COINCIDENCE, Engagement};
 use crate::event::{Event, EventKind};
 
 /// A presence older than this has left the room -- the person walked off.
@@ -131,6 +131,20 @@ impl Entity {
     /// fresh evidence (see [`Engagement::confirmed`]).
     pub fn engaged(&self, now: Instant) -> bool {
         !self.engagement.has_facing() || self.engagement.confirmed(now)
+    }
+
+    /// Engaged enough to be addressed: the gated verdict
+    /// ([`Entity::engaged`]), *or* facing the bot for [`ATTENTIVE_AFTER`]
+    /// without saying anything. The name question and the opening lines
+    /// read this rather than `engaged`, so a silent person who walked up
+    /// and is looking at the bot gets spoken to. Without camera data it
+    /// is `true`, like `engaged`.
+    pub fn attentive(&self, now: Instant) -> bool {
+        self.engaged(now)
+            || self
+                .engagement
+                .facing_for(now)
+                .is_some_and(|d| d >= ATTENTIVE_AFTER)
     }
 
     /// Whether this is a recognised person rather than a track.

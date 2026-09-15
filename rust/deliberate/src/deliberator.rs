@@ -31,10 +31,11 @@ use crate::prompt::{
 use crate::sentence::SentenceSplitter;
 use crate::tools::{FactSource, REMEMBER_NAME, SystemRunner, ToolPolicy, Tools};
 use crate::voice::{
-    GREETING_WINDOW, Moment, NOTE_RECENT, NoteContext, PROACTIVE_DEADLINE, PROACTIVE_MAX_TOKENS,
-    PROACTIVE_TEMPERATURE, Proactive, RETRY_DIFFERENTLY, RETRY_GENERIC, RETRY_REPEAT, Said,
-    clean_reply, fallback_opener, first_sentence, is_generic, local_time, reply_budget,
-    same_words_streak, strip_leading_greeting,
+    BUDGET_QUESTION, FOLLOW_UP_LINE, GREETING_WINDOW, INVITE_LINE, MUSE_LINE, Moment, NOTE_RECENT,
+    NoteContext, PROACTIVE_DEADLINE, PROACTIVE_MAX_TOKENS, PROACTIVE_TEMPERATURE, Proactive,
+    RETRY_DIFFERENTLY, RETRY_GENERIC, RETRY_REPEAT, STRANGER_OPENER_LINE,
+    STRANGER_OPENER_OBJECT_LINE, Said, clean_reply, fallback_opener, first_sentence, is_generic,
+    local_time, reply_budget, same_words_streak, strip_leading_greeting,
 };
 
 /// Modality of a transcribed utterance.
@@ -128,6 +129,10 @@ struct Intent {
     /// `greet_group`: how many arrived.
     #[serde(default)]
     count: Option<usize>,
+    /// `reply_hint`: the reply to the utterance arriving with this
+    /// intent should end with a hook (see [`HOOK_NOTE`]).
+    #[serde(default)]
+    hook: Option<bool>,
 }
 
 impl Intent {
@@ -277,6 +282,19 @@ pub const IGNORE_TTL: Duration = Duration::from_millis(1500);
 /// intent can land a hair after the utterance; one short wait keeps the
 /// pairing from depending on scheduling luck.
 pub const IGNORE_GRACE: Duration = Duration::from_millis(5);
+
+/// How long a `reply_hint` intent stays valid: like `ignore_utterance`
+/// it is raised in the same reflex pass as the utterance it is about.
+pub const HOOK_TTL: Duration = IGNORE_TTL;
+
+/// Appended to the utterance the mind flagged with `{"hook":true}`: the
+/// person answered in a few words, and this is the one time in three
+/// (more for someone who answers, see `mind::initiative::ReplyHint`) the
+/// reply ends with something for them to pick up, so the exchange does
+/// not stop dead at "fine".
+pub const HOOK_NOTE: &str = "[note] That was a short answer. React to it, then end with a hook: \
+one short question back about what they said, or an invitation to say more (\"go on\", \
+\"tell me more\"). Two sentences at most.";
 
 /// Prefixed to the utterance that answers the name question. A small
 /// model given only the transcript "Ada" replies "Hi Ada!" and never calls
@@ -491,6 +509,16 @@ pub struct Session {
     /// out; inside [`GREETING_WINDOW`] the next line to them carries no
     /// greeting word.
     greeted_at: HashMap<EntityId, Instant>,
+    /// Whom the mind's latest `reply_hint` was for, and when; good for
+    /// [`HOOK_TTL`] (see [`Session::run`]).
+    hook_for: Option<(EntityId, Instant)>,
+    /// The turn in flight answers a short answer with a hook
+    /// ([`HOOK_NOTE`]).
+    hook: bool,
+    /// The turn in flight is an opener to a silent stranger: what to say
+    /// when the model gives only generic lines twice, instead of
+    /// [`fallback_opener`]'s name question.
+    stranger_opener: Option<String>,
 }
 
 impl Session {
@@ -540,6 +568,9 @@ impl Session {
             streak: 1,
             crowd: None,
             greeted_at: HashMap::new(),
+            hook_for: None,
+            hook: false,
+            stranger_opener: None,
         }
     }
 
@@ -631,6 +662,13 @@ impl Session {
     ///   ([`Planned::Turn`]), each with the canned line it used to be.
     ///   `curious` is once per [`CURIOUS_GAP`] per `about`, and never
     ///   while holding.
+    /// * `invite`, `follow_up`, `muse` (the mind's initiative, see
+    ///   `mind::initiative`): moments, with [`INVITE_LINE`],
+    ///   [`FOLLOW_UP_LINE`] and [`MUSE_LINE`] as the fallbacks; the
+    ///   follow-up's `about` (the unanswered question) goes on the note.
+    ///   None while holding.
+    /// * `reply_hint`: bookkeeping -- the utterance arriving beside it
+    ///   gets [`HOOK_NOTE`] (see [`Session::run`]).
     /// * `small_talk`, `check_in`, `answer` are model turns and are taken
     ///   by the loop (see [`Session::run`]); here they are logged only.
     pub fn plan_intent(&mut self, cmd: &Command) -> Option<Planned> {
@@ -835,6 +873,55 @@ impl Session {
                 self.curious(intent.about.unwrap_or_default(), text)
                     .map(Planned::Turn)
             }
+            "invite" => {
+                if self.holding() {
+                    tracing::info!("invite intent suppressed: holding");
+                    return None;
+                }
+                self.gate(entity.clone(), "invite")?;
+                let mut p = Proactive::new(Moment::Invite, INVITE_LINE);
+                p.name = intent
+                    .name
+                    .clone()
+                    .or_else(|| self.name_of(entity.as_ref()));
+                p.entity = entity;
+                p.mood = mood;
+                Some(Planned::Turn(p))
+            }
+            "follow_up" => {
+                if self.holding() {
+                    tracing::info!("follow_up intent suppressed: holding");
+                    return None;
+                }
+                self.gate(entity.clone(), "follow_up")?;
+                let mut p = Proactive::new(Moment::FollowUp, FOLLOW_UP_LINE);
+                p.name = intent
+                    .name
+                    .clone()
+                    .or_else(|| self.name_of(entity.as_ref()));
+                p.entity = entity;
+                p.about = intent.about.filter(|a| !a.trim().is_empty());
+                Some(Planned::Turn(p))
+            }
+            "muse" => {
+                if self.holding() {
+                    tracing::info!("muse intent suppressed: holding");
+                    return None;
+                }
+                self.gate(None, "muse")?;
+                Some(Planned::Turn(Proactive::new(Moment::Muse, MUSE_LINE)))
+            }
+            "reply_hint" => {
+                let Some(id) = entity else {
+                    tracing::warn!("reply_hint intent without an entity");
+                    return None;
+                };
+                if intent.hook == Some(true) {
+                    tracing::debug!(%id, "mind says: end the next reply to them with a hook");
+                    self.hook_for = Some((id, self.clock.now()));
+                }
+                None
+            }
             "small_talk" | "check_in" | "answer" => {
                 tracing::debug!(
                     decision = intent.decision,
@@ -1021,6 +1108,10 @@ impl Session {
                 .map(str::to_owned)
                 .collect(),
             time: local_time(),
+            self_line: (p.moment == Moment::Muse).then(|| {
+                let view = (self.snapshot)();
+                view.self_model().describe(view.at)
+            }),
         }
     }
 
@@ -1315,7 +1406,10 @@ impl Session {
             note.push_str(&c.line());
         }
         if !view.people.is_empty() {
-            let stranger_talking = speaker.is_none() && view.people.iter().any(|p| !p.is_known());
+            // Nobody is talking on a lull turn, so "the one speaking is
+            // the stranger" would be false there.
+            let stranger_talking =
+                speaker.is_none() && !self.lull && view.people.iter().any(|p| !p.is_known());
             if stranger_talking {
                 note.push('\n');
                 note.push_str(NOTE_STRANGER_SPEAKING);
@@ -1397,10 +1491,23 @@ impl Session {
             content.push_str("\n\n");
             content.push_str(&Self::self_note(&(self.snapshot)()));
         }
+        // The mind asked for a hook on this one (see `HOOK_NOTE`); a
+        // stranger giving their name is enrolled and greeted instead.
+        let hook = std::mem::take(&mut self.hook) && !introduced && !answering_name;
+        if hook {
+            content.push_str("\n\n");
+            content.push_str(HOOK_NOTE);
+        }
         // The reply follows the length of what it answers; a lull note
-        // asks for one sentence and gets the budget for one.
+        // asks for one sentence and gets the budget for one. A hook is a
+        // reaction and a question: the budget of a question.
         self.turn_budget = if self.adaptive_brevity {
-            reply_budget(text, self.lull, self.max_tokens)
+            let b = reply_budget(text, self.lull, self.max_tokens);
+            if hook {
+                b.max(BUDGET_QUESTION.min(self.max_tokens))
+            } else {
+                b
+            }
         } else {
             self.max_tokens
         };
@@ -1488,6 +1595,50 @@ impl Session {
         tracing::info!(name, about, "check-in");
         self.lull = true;
         let result = self.handle_utterance(&note, entity, obs, cancel).await;
+        self.lull = false;
+        result
+    }
+
+    /// The room has gone quiet with a stranger in it who has said
+    /// nothing -- asked their name already, or greeted -- and the mind
+    /// wants them drawn in with something that is *not* the name question
+    /// again (see `mind::rules::Lull`). `object` is what the camera says
+    /// they may be carrying. A lull turn like [`Session::small_talk`],
+    /// with [`STRANGER_OPENER_LINE`] / [`STRANGER_OPENER_OBJECT_LINE`] in
+    /// place of the generic-twice fallback, which would ask the name.
+    pub async fn stranger_opener(
+        &mut self,
+        entity: Option<&EntityId>,
+        object: Option<&str>,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: CancellationToken,
+    ) -> Result<TurnEnd, LlmError> {
+        let object = object.map(str::trim).filter(|o| !o.is_empty());
+        let mut note = String::from(
+            "[note] Someone you do not know is standing here and has said nothing for a while. \
+             You already asked their name and got no answer, so do NOT ask their name again. \
+             Say one short thing to draw them in: ask what brings them here, or which class \
+             they are in",
+        );
+        match object {
+            Some(o) => {
+                let _ = write!(
+                    note,
+                    ", or what that {o} is they have with them. One sentence, no hello."
+                );
+            }
+            None => note.push_str(". One sentence, no hello."),
+        }
+        tracing::info!(?entity, ?object, "stranger opener");
+        self.lull = true;
+        self.stranger_opener = Some(match object {
+            Some(o) => STRANGER_OPENER_OBJECT_LINE.replace("{object}", o),
+            None => STRANGER_OPENER_LINE.to_owned(),
+        });
+        // No speaker: the note would otherwise read "track:7 says:".
+        let _ = entity;
+        let result = self.handle_utterance(&note, None, obs, cancel).await;
+        self.stranger_opener = None;
         self.lull = false;
         result
     }
@@ -1687,8 +1838,13 @@ impl Session {
                         continue;
                     }
                     if dropped.generic {
-                        let facts = speaker.map_or_else(Vec::new, |id| self.facts.recall(id));
-                        let line = fallback_opener(name.as_deref(), &facts);
+                        // Never the name question to someone who was
+                        // asked it and did not answer: the stranger
+                        // opener's own fallback comes first.
+                        let line = self.stranger_opener.clone().unwrap_or_else(|| {
+                            let facts = speaker.map_or_else(Vec::new, |id| self.facts.recall(id));
+                            fallback_opener(name.as_deref(), &facts)
+                        });
                         tracing::info!(line, "generic twice: specific opener");
                         self.speak_line(line);
                     } else {
@@ -2008,6 +2164,11 @@ impl Session {
                 Some(id) => id.clone(),
                 None => EntityId::for_track(h.track().unwrap_or_default()),
             });
+            // The hook the mind asked for travels the same way: it is
+            // for this utterance if it names its speaker and is fresh.
+            self.hook = self.hook_for.take().is_some_and(|(id, at)| {
+                who.as_ref() == Some(&id) && now.saturating_duration_since(at) < HOOK_TTL
+            });
             if who.as_ref().is_some_and(|id| self.ignored(id)) {
                 // Not talking to us: no prompt, no speech, but the words
                 // stay in the transcript so the next turn has the context.
@@ -2100,7 +2261,16 @@ impl Session {
         let token = shutdown.child_token();
         *current.lock() = Some(token.clone());
         let result = match &turn {
-            TurnIntent::SmallTalk { entity, name } => {
+            TurnIntent::SmallTalk {
+                entity,
+                stranger: true,
+                object,
+                ..
+            } => {
+                self.stranger_opener(entity.as_ref(), object.as_deref(), obs, token)
+                    .await
+            }
+            TurnIntent::SmallTalk { entity, name, .. } => {
                 self.small_talk(entity.as_ref(), name, obs, token).await
             }
             TurnIntent::CheckIn { entity, about } => {
@@ -2326,10 +2496,13 @@ fn asks_to_be_forgotten(text: &str) -> bool {
 /// An intent that is a model turn rather than a line to speak.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TurnIntent {
-    /// The lull rule's opening line to `name`.
+    /// The lull rule's opening line to `name`; to a silent stranger
+    /// when `stranger`, with what they may be carrying.
     SmallTalk {
         entity: Option<EntityId>,
         name: String,
+        stranger: bool,
+        object: Option<String>,
     },
     /// Ask how the thing from their last visit went.
     CheckIn {
@@ -2352,7 +2525,9 @@ impl TurnIntent {
 
 /// The `small_talk` / `check_in` / `answer` intents (see `mind::plan` and
 /// `mind::rules::WaveHello`): the ones that need a model turn. `None` for
-/// every other command.
+/// every other command. A `small_talk` with `"stranger":true` (the lull
+/// rule's opener to a silent stranger) carries `object`, what the camera
+/// says they have with them, and goes to [`Session::stranger_opener`].
 fn turn_intent(cmd: &Command) -> Option<TurnIntent> {
     if cmd.kind != INTENT_KIND {
         return None;
@@ -2364,6 +2539,11 @@ fn turn_intent(cmd: &Command) -> Option<TurnIntent> {
         "small_talk" => Some(TurnIntent::SmallTalk {
             entity,
             name: field("name").unwrap_or("them").to_owned(),
+            stranger: v.get("stranger").and_then(serde_json::Value::as_bool) == Some(true),
+            object: field("object")
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .map(str::to_owned),
         }),
         "check_in" => Some(TurnIntent::CheckIn {
             entity,
@@ -3451,7 +3631,20 @@ mod tests {
             )),
             Some(TurnIntent::SmallTalk {
                 entity: Some(EntityId::new("john")),
-                name: "John".into()
+                name: "John".into(),
+                stranger: false,
+                object: None,
+            })
+        );
+        assert_eq!(
+            turn_intent(&intent(
+                r#"{"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true,"object":"backpack"}"#
+            )),
+            Some(TurnIntent::SmallTalk {
+                entity: Some(EntityId::for_track(7)),
+                name: "them".into(),
+                stranger: true,
+                object: Some("backpack".into()),
             })
         );
         assert!(turn_intent(&intent(r#"{"decision":"greet","entity":"john"}"#)).is_none());
@@ -4866,6 +5059,152 @@ mod tests {
             last.content.contains("In view: a laptop, a cup"),
             "{}",
             last.content
+        );
+    }
+
+    // ------------------------------------------------------ initiative
+
+    #[tokio::test]
+    async fn invite_follow_up_and_muse_are_model_turns_with_canned_fallbacks() {
+        let l = start(
+            vec![Script::text(&["Over here, I don't bite.", " Honest."])],
+            vec![person("john", false)],
+        );
+        l.itx
+            .send(intent(r#"{"decision":"invite","entity":"track:7"}"#))
+            .unwrap();
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        // Unscripted from here: the mock says nothing, the canned lines
+        // are spoken so the moments are not lost.
+        l.itx
+            .send(intent(
+                r#"{"decision":"follow_up","entity":"john","name":"John","about":"What's your name?"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        l.itx.send(intent(r#"{"decision":"muse"}"#)).unwrap();
+        assert!(l.requests_reach(3).await);
+        l.idle().await;
+        // A replayed muse inside the say gap costs no request.
+        l.itx.send(intent(r#"{"decision":"muse"}"#)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(
+            says(&cmds),
+            ["Over here, I don't bite.", FOLLOW_UP_LINE, MUSE_LINE]
+        );
+        let invite = reqs[0].messages.last().unwrap().content.clone();
+        assert!(invite.starts_with("[note] "), "{invite}");
+        assert!(invite.contains("has not come over"), "{invite}");
+        assert!(invite.contains("Call them over"), "{invite}");
+        let follow = reqs[1].messages.last().unwrap().content.clone();
+        assert!(
+            follow.contains("you asked John \"What's your name?\" and got nothing back"),
+            "{follow}"
+        );
+        assert!(follow.contains("still there"), "{follow}");
+        let muse = reqs[2].messages.last().unwrap().content.clone();
+        assert!(muse.contains("room is empty"), "{muse}");
+        assert!(muse.contains("About yourself right now: awake"), "{muse}");
+        assert!(muse.contains("Not a question."), "{muse}");
+        // Proactive settings on all three: no tools, one sentence.
+        for r in &reqs {
+            assert!(r.tools.is_empty());
+            assert_eq!(r.max_tokens, PROACTIVE_MAX_TOKENS);
+        }
+    }
+
+    #[tokio::test]
+    async fn stranger_opener_never_falls_back_to_the_name_question() {
+        let stranger = ViewEntity {
+            id: EntityId::for_track(7),
+            name: None,
+            confidence: 0.8,
+            is_speaking: false,
+            first_seen: Instant::now(),
+            returned: None,
+        };
+        let l = start(
+            vec![
+                // Generic twice: the stranger fallback, not "what's your
+                // name?".
+                Script::text(&["How are you doing today?"]),
+                Script::text(&["Is there anything I can help with?"]),
+                Script::text(&["Which class are you in, then?"]),
+            ],
+            vec![stranger],
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true,"object":"backpack"}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        l.itx
+            .send(intent(
+                r#"{"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true}"#,
+            ))
+            .unwrap();
+        assert!(l.requests_reach(3).await);
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        assert_eq!(
+            says(&cmds),
+            [
+                "What's that backpack you've got there?",
+                "Which class are you in, then?"
+            ]
+        );
+        let note = user_turns(&reqs[0]).last().unwrap().clone();
+        assert!(note.contains("do NOT ask their name again"), "{note}");
+        assert!(note.contains("what that backpack is"), "{note}");
+        assert!(!note.contains(NOTE_STRANGER_SPEAKING), "{note}");
+        assert!(!note.contains("says:"), "{note}");
+        assert_eq!(reqs[0].max_tokens, crate::voice::BUDGET_SHORT);
+        let note = user_turns(&reqs[2]).last().unwrap().clone();
+        assert!(!note.contains("backpack"), "{note}");
+        assert!(!crate::voice::asks_for_name(&says(&cmds)[0]));
+    }
+
+    #[tokio::test]
+    async fn reply_hint_makes_the_next_reply_end_with_a_hook() {
+        let l = start(
+            vec![
+                Script::text(&["Fine is fine.", " What made it fine?"]),
+                Script::text(&["Okay."]),
+            ],
+            vec![person("john", false)],
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"reply_hint","entity":"john","hook":true}"#,
+            ))
+            .unwrap();
+        // The intent lands a hair before the utterance, as from the mind.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        l.utter("fine").await;
+        assert!(l.requests_reach(1).await);
+        l.idle().await;
+        // The next short answer carries no hint: no hook.
+        l.utter("yeah").await;
+        assert!(l.requests_reach(2).await);
+        l.idle().await;
+        let (reqs, cmds) = l.stop().await;
+        let first = user_turns(&reqs[0]).last().unwrap().clone();
+        assert!(first.contains(HOOK_NOTE), "{first}");
+        assert!(first.contains("john says: fine"), "{first}");
+        assert_eq!(reqs[0].max_tokens, BUDGET_QUESTION);
+        let second = user_turns(&reqs[1]).last().unwrap().clone();
+        assert!(!second.contains(HOOK_NOTE), "{second}");
+        assert_eq!(reqs[1].max_tokens, crate::voice::BUDGET_SHORT);
+        assert_eq!(
+            says(&cmds),
+            ["Fine is fine.", "What made it fine?", "Okay."]
         );
     }
 }

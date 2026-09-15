@@ -27,6 +27,9 @@ fn intents(cmds: &[Command]) -> Vec<String> {
     cmds.iter()
         .filter(|c| c.target == INTENT_TARGET && c.kind == INTENT_KIND)
         .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
+        // The muse to an empty room (`mind::initiative::Muse`) lands in
+        // the long quiet stretches here and is another rule's business.
+        .filter(|t| !t.contains("\"muse\""))
         .collect()
 }
 

@@ -24,12 +24,19 @@
 //! followed each proactive act, feeding the acknowledge and lull rules),
 //! [`Curiosity`] (novelty → `curious` intents), and a [`SelfModel`] the
 //! deliberate path can answer "what can you see?" from truthfully.
+//!
+//! The INITIATIVE rules ([`initiative`]) make it speak first in a foyer:
+//! an [`Invite`] to whoever is in view and not yet engaged, one
+//! [`FollowUp`] after a hello or a question that got no answer, a
+//! [`Muse`] to an empty room, and a [`ReplyHint`] that tells the
+//! deliberate path when to end a reply with a hook.
 
 pub mod belief;
 pub mod curiosity;
 pub mod engage;
 pub mod event;
 pub mod goal;
+pub mod initiative;
 pub mod outcome;
 pub mod plan;
 pub mod reflex;
@@ -45,6 +52,7 @@ pub use curiosity::{Curiosity, InterestView};
 pub use engage::Engagement;
 pub use event::{Event, EventKind, EventLog};
 pub use goal::{Goal, GoalStack};
+pub use initiative::{FollowUp, Invite, Muse, ReplyHint};
 pub use outcome::{Attempt, EffectiveRates, Outcome, OutcomeRule, Outcomes, Tally};
 pub use plan::{Decision, Planner, PlannerRule};
 pub use reflex::{Cognition, RECENT_EVENTS, Reflex, ReflexHandle, Rule};

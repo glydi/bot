@@ -80,7 +80,14 @@ pub const EMIT_SLACK: f32 = 1e-3;
 
 /// The kinds of proactive act that are tracked, as they appear in the
 /// `kind` field and in the command/intent that produced them.
-pub const KINDS: [&str; 5] = ["backchannel", "greet", "ask_name", "small_talk", "attend"];
+pub const KINDS: [&str; 6] = [
+    "backchannel",
+    "greet",
+    "ask_name",
+    "small_talk",
+    "attend",
+    "invite",
+];
 
 /// The prior behind every tally: two successes in four trials, i.e. a
 /// rate of 0.5 that takes a few real trials to move. A single ignored
@@ -211,6 +218,19 @@ impl Outcomes {
     /// nothing is known.
     pub fn rate(&self, entity: &EntityId, kind: &str) -> f32 {
         self.get(entity, kind).map_or(0.5, Tally::rate)
+    }
+
+    /// How readily `entity` answers anything we start: the mean of their
+    /// smoothed rates over every kind we have a tally for, or the prior
+    /// (0.5) when there is none. Read by the reply-hint rule: someone who
+    /// answers gets asked more.
+    pub fn answer_rate(&self, entity: &EntityId) -> f32 {
+        let (sum, n) = self
+            .tallies
+            .iter()
+            .filter(|t| t.entity == *entity)
+            .fold((0.0_f32, 0_u32), |(s, n), t| (s + t.rate(), n + 1));
+        if n == 0 { 0.5 } else { sum / n as f32 }
     }
 
     /// Record an attempt. When [`MAX_PENDING`] are already in flight the
@@ -429,6 +449,7 @@ fn attempt_of(c: &Command, speaker: Option<&EntityId>) -> Option<(&'static str, 
             "greet" | "say" | "recall" => "greet",
             "ask_name" => "ask_name",
             "small_talk" => "small_talk",
+            "invite" => "invite",
             _ => return None,
         };
         let entity = intent_field(json, "entity")?;

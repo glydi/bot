@@ -405,7 +405,35 @@ pub enum Moment {
     Group,
     /// One person has held the floor a long while and others are waiting.
     WrapUp,
+    /// Someone is in view -- far, passing, looking elsewhere -- and has
+    /// not been drawn in (the mind's `invite`).
+    Invite,
+    /// We said hello or asked something and heard nothing back (the
+    /// mind's `follow_up`); `about` carries the unanswered question when
+    /// there was one.
+    FollowUp,
+    /// Nobody has been in view for a while: a word to the empty room
+    /// (the mind's `muse`).
+    Muse,
 }
+
+/// What the invite is if the model fails or is late.
+pub const INVITE_LINE: &str = "Hey, over here! I'm Glydi. Come say hi?";
+
+/// What the follow-up is if the model fails or is late.
+pub const FOLLOW_UP_LINE: &str = "Still there?";
+
+/// What the muse is if the model fails or is late.
+pub const MUSE_LINE: &str = "It's quiet. If anyone's around, I'm here.";
+
+/// The opener to a stranger who has said nothing, when the model gave
+/// only generic lines twice. Never the name question again: they were
+/// asked it already and did not answer.
+pub const STRANGER_OPENER_LINE: &str = "What brings you here today?";
+
+/// The same, when the camera reports something they may be carrying:
+/// `{object}` is replaced with it.
+pub const STRANGER_OPENER_OBJECT_LINE: &str = "What's that {object} you've got there?";
 
 impl Moment {
     /// Which kinds may end in a question. An arrival or a lights-out
@@ -414,7 +442,7 @@ impl Moment {
     fn question_allowed(&self) -> bool {
         !matches!(
             self,
-            Self::Arrival | Self::Return | Self::Pair | Self::Group | Self::LightsOut
+            Self::Arrival | Self::Return | Self::Pair | Self::Group | Self::LightsOut | Self::Muse
         )
     }
 
@@ -427,6 +455,9 @@ impl Moment {
             Self::Reminder => "remind",
             Self::Novelty => "curious",
             Self::LightsOut => "scene",
+            Self::Invite => "invite",
+            Self::FollowUp => "follow_up",
+            Self::Muse => "muse",
         }
     }
 }
@@ -472,6 +503,9 @@ pub struct NoteContext {
     pub recent_lines: Vec<String>,
     /// Local time as `(hour, minute)`.
     pub time: (u32, u32),
+    /// The mind's self-model in a line ("awake 12 min, 3 turns, ... can
+    /// see, can speak"), for the muse.
+    pub self_line: Option<String>,
 }
 
 impl Proactive {
@@ -499,6 +533,52 @@ impl Proactive {
         let mut s = String::from(
             "[note] Nobody said anything; this is you speaking first. What is happening: ",
         );
+        self.situation(&mut s, &who);
+        let _ = write!(s, "\nTime: {}.", time_of_day(cx.time.0, cx.time.1));
+        if let Some(line) = cx.self_line.as_deref().filter(|l| !l.trim().is_empty()) {
+            let _ = write!(
+                s,
+                "\nAbout yourself right now: {}.",
+                line.trim().trim_end_matches('.')
+            );
+        }
+        if let Some(ctx) = &cx.returned_context {
+            let _ = write!(s, "\nAbout {who}: {ctx}.");
+        }
+        if !cx.facts.is_empty() {
+            let facts: Vec<&str> = cx
+                .facts
+                .iter()
+                .rev()
+                .take(3)
+                .map(|f| f.trim().trim_end_matches('.'))
+                .collect();
+            let _ = write!(s, "\nYou know about {who}: {}.", facts.join("; "));
+        }
+        if let Some(c) = &self.crowd {
+            let line = c.line();
+            if !line.is_empty() {
+                s.push('\n');
+                s.push_str(&line);
+            }
+        }
+        if let Some(mood) = self.mood.as_deref().filter(|m| !m.trim().is_empty()) {
+            let _ = write!(s, "\n{who} has seemed {} lately.", mood.trim());
+        }
+        if !cx.recent_lines.is_empty() {
+            let quoted: Vec<String> = cx.recent_lines.iter().map(|l| format!("\"{l}\"")).collect();
+            let _ = write!(
+                s,
+                "\nYou said these recently, so none of that phrasing again: {}.",
+                quoted.join(" ")
+            );
+        }
+        self.brief(&mut s, cx.greeted_recently);
+        s
+    }
+
+    /// "What is happening": the moment, in a sentence, for the note.
+    fn situation(&self, s: &mut String, who: &str) {
         match &self.moment {
             Moment::Arrival => {
                 let _ = write!(s, "{who} just walked in.");
@@ -555,41 +635,39 @@ impl Proactive {
                     self.name.as_deref().unwrap_or("this person")
                 );
             }
-        }
-        let _ = write!(s, "\nTime: {}.", time_of_day(cx.time.0, cx.time.1));
-        if let Some(ctx) = &cx.returned_context {
-            let _ = write!(s, "\nAbout {who}: {ctx}.");
-        }
-        if !cx.facts.is_empty() {
-            let facts: Vec<&str> = cx
-                .facts
-                .iter()
-                .rev()
-                .take(3)
-                .map(|f| f.trim().trim_end_matches('.'))
-                .collect();
-            let _ = write!(s, "\nYou know about {who}: {}.", facts.join("; "));
-        }
-        if let Some(c) = &self.crowd {
-            let line = c.line();
-            if !line.is_empty() {
-                s.push('\n');
-                s.push_str(&line);
+            Moment::Invite => match &self.name {
+                Some(n) => {
+                    let _ = write!(
+                        s,
+                        "{n} is in view, some way off, not looking your way, and has not come over."
+                    );
+                }
+                None => s.push_str(
+                    "someone you do not know is in view, some way off, not looking your way, \
+                     and has not come over; you have not spoken to them.",
+                ),
+            },
+            Moment::FollowUp => match self.about.as_deref().filter(|a| !a.trim().is_empty()) {
+                Some(q) => {
+                    let _ = write!(
+                        s,
+                        "a few seconds ago you asked {who} \"{}\" and got nothing back.",
+                        q.trim()
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        s,
+                        "a few seconds ago you said hello to {who} and got nothing back."
+                    );
+                }
+            },
+            Moment::Muse => {
+                s.push_str(
+                    "nobody has been in view for a while; the room is empty as far as you can tell.",
+                );
             }
         }
-        if let Some(mood) = self.mood.as_deref().filter(|m| !m.trim().is_empty()) {
-            let _ = write!(s, "\n{who} has seemed {} lately.", mood.trim());
-        }
-        if !cx.recent_lines.is_empty() {
-            let quoted: Vec<String> = cx.recent_lines.iter().map(|l| format!("\"{l}\"")).collect();
-            let _ = write!(
-                s,
-                "\nYou said these recently, so none of that phrasing again: {}.",
-                quoted.join(" ")
-            );
-        }
-        self.brief(&mut s, cx.greeted_recently);
-        s
     }
 
     /// The hard brief at the end of the note: length, greeting, and
@@ -632,6 +710,18 @@ impl Proactive {
             Moment::LightsOut => s.push_str(
                 "Plain words, no drama and no poetry: the lights went and you cannot see. \
                  No question. ",
+            ),
+            Moment::Invite => s.push_str(
+                "Call them over, warmly and briefly, and say who you are (\"Hey, over here, I'm \
+                 Glydi\" is the register). A question at the end is fine. ",
+            ),
+            Moment::FollowUp => s.push_str(
+                "Either check lightly whether they are still there, or ask the same thing again \
+                 in different words. No hello. ",
+            ),
+            Moment::Muse => s.push_str(
+                "A short remark to the empty room, about the time of day or yourself, so anyone \
+                 within earshot knows you are here and awake. No question, no hello. ",
             ),
         }
         if !self.moment.question_allowed() {
@@ -837,6 +927,7 @@ mod tests {
             greeted_recently: true,
             recent_lines: vec!["Hi John.".into()],
             time: (21, 40),
+            self_line: None,
         };
         let n = back.note(&cx);
         assert!(n.starts_with("[note] "));
@@ -886,6 +977,37 @@ mod tests {
             cup.note(&NoteContext::default())
                 .contains("Your first thought was: What's that cup for?")
         );
+
+        // The initiative moments: an invite may ask, a follow-up carries
+        // the question, a muse carries the self-model and never asks.
+        let invite = Proactive::new(Moment::Invite, INVITE_LINE).note(&NoteContext::default());
+        assert!(invite.contains("has not come over"), "{invite}");
+        assert!(invite.contains("Call them over"), "{invite}");
+        assert!(!invite.contains("Not a question."));
+        let mut follow = Proactive::new(Moment::FollowUp, FOLLOW_UP_LINE);
+        follow.about = Some("What's your name?".into());
+        let n = follow.note(&NoteContext::default());
+        assert!(
+            n.contains("you asked someone \"What's your name?\" and got nothing back"),
+            "{n}"
+        );
+        assert!(n.contains("still there"), "{n}");
+        let n = Proactive::new(Moment::FollowUp, FOLLOW_UP_LINE).note(&NoteContext::default());
+        assert!(
+            n.contains("said hello to someone and got nothing back"),
+            "{n}"
+        );
+        let cx = NoteContext {
+            self_line: Some("awake 12 min, 3 turns, 0 interruptions; can see, can speak".into()),
+            ..NoteContext::default()
+        };
+        let n = Proactive::new(Moment::Muse, MUSE_LINE).note(&cx);
+        assert!(n.contains("room is empty"), "{n}");
+        assert!(n.contains("About yourself right now: awake 12 min"), "{n}");
+        assert!(n.contains("Not a question."), "{n}");
+        assert_eq!(Moment::Invite.kind(), "invite");
+        assert_eq!(Moment::FollowUp.kind(), "follow_up");
+        assert_eq!(Moment::Muse.kind(), "muse");
     }
 
     #[test]

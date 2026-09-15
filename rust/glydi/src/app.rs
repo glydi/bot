@@ -257,7 +257,22 @@ impl App {
         // A few slots, not one: see `DELIBERATE_BACKLOG`. A stalled
         // deliberate path still drops, never blocks the reflex.
         let (delib_tx, delib_rx) = crossbeam_channel::bounded::<Observation>(DELIBERATE_BACKLOG);
-        let reflex = Reflex::with_rules(session_id.as_str(), epoch, cognitive_rules())
+        // The mind keeps no wall clock; the muse's quiet hours (22:00-07:00
+        // local) get the hour from here.
+        let mut rules = cognitive_rules();
+        rules.retain(|r| r.name() != "muse");
+        rules.push(Box::new(mind::initiative::Muse::new().with_quiet_hours(
+            22,
+            7,
+            || {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+                    + deliberate::tools::local_utc_offset();
+                (secs.rem_euclid(86_400) / 3_600) as u8
+            },
+        )));
+        let reflex = Reflex::with_rules(session_id.as_str(), epoch, rules)
             .with_event_tap(Some(tap_tx))
             .spawn(Arc::clone(&clock), reflex_rx, queue.clone(), Some(delib_tx))
             .context("spawning reflex")?;

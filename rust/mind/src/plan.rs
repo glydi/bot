@@ -36,7 +36,8 @@
 //!
 //! `ask_name` goes to one stranger at a time (one open name question in
 //! the room, [`ASK_NAME_GAP`] between them), only to someone who is
-//! engaged with the bot as far as the senses can tell, and with
+//! engaged with the bot as far as the senses can tell -- talking to it,
+//! or silently facing it for a second and a half -- and with
 //! [`BUSY`](crate::working::BUSY) or more people present only once they
 //! have addressed it themselves. A stranger at the back of a group is
 //! never asked across the room.
@@ -323,7 +324,9 @@ impl Planner {
     /// 7. `AskName`: the track has been present for [`ASK_NAME_AFTER`],
     ///    was never asked, nobody was asked within [`ASK_NAME_GAP`] (so
     ///    at most one name question is open at a time), they are engaged with the
-    ///    bot ([`Entity::engaged`](crate::Entity::engaged)), and -- with
+    ///    bot ([`Entity::attentive`](crate::Entity::attentive): the gated
+    ///    verdict, or facing it for `engage::ATTENTIVE_AFTER` in silence),
+    ///    and -- with
     ///    [`BUSY`] or more present -- they addressed it: the camera's
     ///    confirmed speaker, or spoke within [`ADDRESSED_WITHIN`]
     ///    → `AskName`.
@@ -403,7 +406,7 @@ impl Planner {
                 // holds the next one until the first has had a minute to
                 // be answered (or abandoned -- a stranger who never
                 // answers must not block the question for everyone).
-                let engaged = entity.engaged(now);
+                let engaged = entity.attentive(now);
                 let addressed = working.crowd.present < BUSY
                     || working.crowd.engaged.as_ref() == Some(id)
                     || entity
@@ -857,8 +860,14 @@ mod tests {
         cmds.iter()
             .filter(|c| c.target == INTENT_TARGET && c.kind == INTENT_KIND)
             .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
-            // The lull rule's opening lines are another rule's business.
-            .filter(|t| !t.contains("\"small_talk\""))
+            // The lull's opening lines, the follow-up after a hello that
+            // got no answer and the invite to a passer-by are other
+            // rules' business (see `tests/initiative.rs`).
+            .filter(|t| {
+                !t.contains("\"small_talk\"")
+                    && !t.contains("\"follow_up\"")
+                    && !t.contains("\"invite\"")
+            })
             .collect()
     }
 

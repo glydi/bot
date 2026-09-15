@@ -64,6 +64,14 @@ pub const AWAY_FOR: Duration = Duration::from_secs(1);
 /// lost the face, and engagement falls back to "unknown".
 pub const FACING_STALE: Duration = Duration::from_secs(1);
 
+/// Someone who has faced the bot ([`FACING_GATE`]) for this long without
+/// a word is engaged enough to be spoken to (see
+/// [`Entity::attentive`](crate::Entity::attentive)). The full gate needs
+/// a voice, and a silent newcomer in a foyer never has one: they stand
+/// and look, and a bot that waits for them to speak first is a kiosk. A
+/// second and a half is longer than a glance on the way past.
+pub const ATTENTIVE_AFTER: Duration = Duration::from_millis(1500);
+
 /// The camera-side evidence about one person, and the gated verdict.
 #[derive(Clone, Debug, Default)]
 pub struct Engagement {

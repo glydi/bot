@@ -433,7 +433,7 @@ impl Rule for BackchannelAfterLongSpeech {
     }
 }
 
-/// Nobody has said anything for a while and someone we know is here: say
+/// Nobody has said anything for a while and someone is here: say
 /// something to them. A companion that only ever answers is a kiosk; one
 /// that picks up a thread on its own ("how's the Rust project going?") is
 /// company. Emitted as a `deliberate/intent` with `decision: small_talk`
@@ -441,12 +441,31 @@ impl Rule for BackchannelAfterLongSpeech {
 /// [`Lull::MIN_GAP`] per person, and never while anyone (the bot included)
 /// is talking or within [`Lull::SILENCE`] of the last voice.
 ///
+/// A stranger counts too (a school foyer is mostly strangers): one who
+/// was asked their name and has not answered, or who was greeted (a
+/// wave, a group hello), gets an opener that is *not* the name question
+/// again -- the intent carries `"stranger":true` and, when the camera
+/// reports something in view, `"object":"<class>"`, so the deliberate
+/// path asks what brings them here, which class they are in, or what
+/// that thing is they are carrying:
+///
+/// ```json
+/// {"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true,"object":"laptop"}
+/// ```
+///
+/// A known, named person is preferred over a stranger; among strangers
+/// the most engaged (longest facing the bot; the camera reports no face
+/// size) and then the longest present. Nobody the follow-up rule has
+/// asked to be left alone (`WorkingMemory::is_left_alone`).
+///
 /// The per-person gap adapts (LEARN stage): it is [`Lull::MIN_GAP`] times
 /// [`lull_factor`] of their small-talk outcome rate, read from working
 /// memory in [`Rule::plan`] (which runs on every observation and tick, so
 /// nothing is lost by deciding there rather than in `apply`/`on_tick`).
 /// Someone who never answers is opened to a third as often (9 min);
-/// someone who always answers, twice as often (90 s).
+/// someone who always answers, twice as often (90 s). An intent from an
+/// earlier rule in the same pass counts as our voice: the silence is
+/// measured from it, whether or not the speaker echoes it back.
 #[derive(Debug)]
 pub struct Lull {
     /// Last time anyone spoke or the bot did; the lull is measured from it.
@@ -502,13 +521,37 @@ impl Lull {
         if now.saturating_duration_since(quiet_since) < Self::SILENCE {
             return;
         }
-        // The known, named person who has been here longest.
-        let Some(who) = w
+        let working = &*cx.working;
+        let settled =
+            |e: &&crate::world::Entity| now.saturating_duration_since(e.first_seen) >= Self::SETTLE;
+        let free = |e: &&crate::world::Entity| !working.is_left_alone(&e.id, now);
+        // The known, named person who has been here longest ...
+        let known = w
             .present()
             .filter(|e| !e.id.is_track() && e.name.is_some())
-            .filter(|e| now.saturating_duration_since(e.first_seen) >= Self::SETTLE)
-            .min_by_key(|e| e.first_seen)
-        else {
+            .filter(settled)
+            .filter(free)
+            .min_by_key(|e| e.first_seen);
+        // ... else the stranger we have already addressed once: most
+        // engaged first, then longest here.
+        let stranger = || {
+            w.present()
+                .filter(|e| e.id.is_track())
+                .filter(|e| {
+                    working.has_asked_name(&e.id)
+                        || working.greeted_within(&e.id, now, GREET_WINDOW)
+                })
+                .filter(settled)
+                .filter(free)
+                .max_by_key(|e| {
+                    (
+                        e.attentive(now),
+                        e.engagement.facing_for(now).unwrap_or_default(),
+                        std::cmp::Reverse(e.first_seen),
+                    )
+                })
+        };
+        let Some(who) = known.or_else(stranger) else {
             return;
         };
         let gap = Self::gap_for(cx.working.outcomes.rate(&who.id, "small_talk"));
@@ -531,12 +574,26 @@ impl Lull {
         // Counts as a voice: the next lull is measured from here even if
         // the deliberate path decides to say nothing.
         self.last_voice.set(Some(now));
-        let name = who.display_name();
-        let json = format!(
-            "{{\"decision\":\"small_talk\",\"name\":\"{}\",\"entity\":\"{}\",\"goal\":\"small_talk\"}}",
-            name.replace('"', ""),
-            who.id.as_str()
-        );
+        let json = if who.id.is_track() {
+            let mut json = format!(
+                "{{\"decision\":\"small_talk\",\"entity\":\"{}\",\"goal\":\"small_talk\",\"stranger\":true",
+                who.id.as_str()
+            );
+            if let Some(class) = cx.working.objects.last() {
+                json.push_str(",\"object\":\"");
+                json.push_str(&class.replace('"', ""));
+                json.push('"');
+            }
+            json.push('}');
+            json
+        } else {
+            let name = who.display_name();
+            format!(
+                "{{\"decision\":\"small_talk\",\"name\":\"{}\",\"entity\":\"{}\",\"goal\":\"small_talk\"}}",
+                name.replace('"', ""),
+                who.id.as_str()
+            )
+        };
         out.push(
             Command::new(
                 crate::plan::INTENT_TARGET,
@@ -565,6 +622,13 @@ impl Rule for Lull {
     }
 
     fn plan(&self, cx: &mut Cognition<'_>, out: &mut Commands) {
+        // A line of ours this pass (a hello, a name question, a
+        // follow-up) is a voice: the lull is measured from it, and one
+        // intent per step is enough.
+        if has_intent(out) {
+            self.last_voice.set(Some(cx.now));
+            return;
+        }
         self.check(cx, out);
     }
 }
@@ -1078,7 +1142,11 @@ pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
 /// Also here: the camera-fed rules ([`WaveHello`], [`RoomInventory`],
 /// [`ReactToEvents`]), which emit nothing without their modalities, the
 /// crowd's [`AttentionRotation`] (after the planner, so a group hello
-/// comes before a wrap-up), and
+/// comes before a wrap-up), the initiative rules of [`crate::initiative`]
+/// ([`FollowUp`](crate::initiative::FollowUp) before the lull,
+/// [`Invite`](crate::initiative::Invite), [`Muse`](crate::initiative::Muse)
+/// and [`ReplyHint`](crate::initiative::ReplyHint) after the
+/// commitments), and
 /// the [`CommitmentRule`](crate::plan::CommitmentRule) that delivers
 /// reminders and check-ins, after the planner and the lull (a hello
 /// before a reminder) and before curiosity.
@@ -1089,9 +1157,18 @@ pub fn cognitive_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     v.push(Box::<crate::plan::PlannerRule>::default());
     v.push(Box::new(WaveHello::default()));
     v.push(Box::new(AttentionRotation::default()));
+    // The follow-up before the lull: a hello that got nothing back is
+    // followed up once, and that person is then left alone, which the
+    // lull honours.
+    v.push(Box::new(crate::initiative::FollowUp::new()));
     v.push(Box::new(Lull::new()));
     v.push(Box::new(crate::plan::CommitmentRule::new()));
+    v.push(Box::new(crate::initiative::Invite::new()));
+    v.push(Box::new(crate::initiative::ReplyHint::new()));
     v.push(Box::new(crate::curiosity::Curiosity::new()));
+    // After curiosity: something new to remark on beats a word to an
+    // empty room.
+    v.push(Box::new(crate::initiative::Muse::new()));
     // Last: it reads every command the rules above pushed this pass.
     v.push(Box::new(crate::outcome::OutcomeRule));
     v
@@ -1124,14 +1201,21 @@ mod tests {
     }
 
     /// The intents of the rules under test. Curiosity's questions about a
-    /// novel gesture or scene, and the planner's name question to a
-    /// settled stranger, land in the same passes and are other rules'
+    /// novel gesture or scene, the planner's name question to a settled
+    /// stranger, the lull's opener, the follow-up after an unanswered
+    /// hello and the invite land in the same passes and are other rules'
     /// business.
     fn intents(cmds: &[Command]) -> Vec<String> {
         cmds.iter()
             .filter(|c| c.target == INTENT_TARGET && c.kind == INTENT_KIND)
             .map(|c| c.payload.as_text().unwrap_or_default().to_owned())
-            .filter(|t| !t.contains("\"curious\"") && !t.contains("\"ask_name\""))
+            .filter(|t| {
+                !t.contains("\"curious\"")
+                    && !t.contains("\"ask_name\"")
+                    && !t.contains("\"follow_up\"")
+                    && !t.contains("\"small_talk\"")
+                    && !t.contains("\"invite\"")
+            })
             .collect()
     }
 
