@@ -12,3 +12,9 @@ go/bin/
 .pytest_cache/
 *.log
 rust/ttsd/ttsd
+train/.venv/
+train/llama.cpp/
+train/adapters-*/
+train/logs/
+train/export/
+train/*.gguf

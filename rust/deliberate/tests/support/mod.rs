@@ -23,6 +23,24 @@ pub fn model_under_test(config: &mut Config) {
             config.model = m;
         }
     }
+    // `CQ_SYSTEM_SHORT=path` swaps the system prompt for the file's text: the
+    // fine-tuned model (train/README.md) is trained against the short prompt
+    // in train/system_short.txt, so it is measured with it. Relative paths
+    // are taken from the workspace root, where `cargo test` is run.
+    if let Ok(path) = std::env::var("CQ_SYSTEM_SHORT") {
+        if !path.trim().is_empty() {
+            let candidates = [
+                std::path::PathBuf::from(&path),
+                std::path::Path::new("..").join(&path),
+                std::path::Path::new("../..").join(&path),
+            ];
+            let text = candidates
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_else(|| panic!("CQ_SYSTEM_SHORT: cannot read {path}"));
+            config.system_prompt = text.trim().to_owned();
+        }
+    }
 }
 
 /// One request's timings, from the request leaving to the first event
