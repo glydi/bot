@@ -19,3 +19,6 @@ train/logs/
 train/export/
 train/*.gguf
 train/fused-*/
+py/.venv/
+py/**/__pycache__/
+.pytest_cache/
