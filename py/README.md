@@ -22,7 +22,7 @@ it is made fast in Rust. When the two disagree, the Rust build is right.
 
 ```sh
 cd /Users/mukesh/bot
-py/.venv/bin/python -m glydi
+py/run.sh
 ```
 
 Flags, for running the half you are working on:

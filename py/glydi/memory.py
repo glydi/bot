@@ -570,8 +570,19 @@ class Gallery:
         """The id of the person called `name` (case-insensitive), if one is."""
         lower = name.strip().lower()
         with self._lock:
+            # Whoever of that name the gallery actually knows: two people
+            # can end up sharing a name (a live gallery held a "Kalyan"
+            # with twelve faces and an empty one made from the same name),
+            # and new samples must join the one with the samples, or
+            # neither ever clears the margin.
             row = self._db.execute(
-                "SELECT person_id FROM persons WHERE lower(name) = ? ORDER BY created_at LIMIT 1",
+                """SELECT p.person_id,
+                          (SELECT COUNT(*) FROM embeddings e
+                            WHERE e.person_id = p.person_id) AS n
+                     FROM persons p
+                    WHERE lower(p.name) = ?
+                 ORDER BY n DESC, p.created_at
+                    LIMIT 1""",
                 (lower,),
             ).fetchone()
         return row["person_id"] if row else None

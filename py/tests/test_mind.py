@@ -409,12 +409,19 @@ def test_a_recognised_voice_names_the_speaker(room):
     assert mind.people["track:1"].name == "Kalyan"
 
 
-def test_the_visit_is_written_with_what_was_said(room):
+def test_the_visit_is_written_with_what_they_said(room):
+    """Their words, not ours.
+
+    With the bot's own lines in the visit record, the episode summary
+    came back as a previous greeting and the next greeting read it out:
+    "Hello again, Kalyan. last visit just now: Hello again, Kalyan. ..."
+    -- seen in a live session.
+    """
     mind, gallery, _ = room
     mind.step([face("p1", 100.0)], 100.0)
     mind.step([face("p1", 101.0), Observation(UTTERANCE, at=101.0, payload="hi")], 101.0)
     mind.step([], 110.0)   # they walk out
-    assert gallery.visit_lines["p1"] == ["Hello, Kalyan.", "hi", "Sure.", "Here you go."]
+    assert gallery.visit_lines["p1"] == ["hi"]
 
 
 def test_somebody_starting_to_talk_cuts_the_bot_off(room):

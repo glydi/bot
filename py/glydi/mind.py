@@ -101,7 +101,12 @@ class Entity:
     #: The gallery's id for them, once a face or a name has resolved one.
     #: `who` stays the track it started as; this is who to store against.
     pid: EntityId | None = None
-    #: What was said this visit, for the gallery's visit record.
+    #: What *they* said this visit, for the gallery's visit record. Ours
+    #: is deliberately left out: with the bot's own lines in it, the
+    #: episode summary came back as a previous greeting and the next
+    #: greeting read it out -- "Hello again, Kalyan. last visit just now:
+    #: Hello again, Kalyan. ..." (seen live). The Rust build's worker
+    #: drops its own lines for the same reason.
     lines: list[str] = field(default_factory=list)
 
     # What we have already said to them, so we don't say it again.
@@ -324,8 +329,6 @@ class Mind:
                 out.append(self._state(SPEAKING))
             out.append(Command("speaker", SAY, sentence))
             out.append(Command("ui", "said", sentence))
-            if speaker is not None:
-                speaker.lines.append(sentence)
             said += 1
         out.append(self._state(IDLE))
         self.last_line_at = now
@@ -434,7 +437,6 @@ class Mind:
         out.append(Command("speaker", SAY, line))
         out.append(Command("ui", "said", line))
         out.append(self._state(IDLE))
-        person.lines.append(line)
         log.info("said to %s: %s", person.label(), line)
 
     # --- names ---------------------------------------------------------
