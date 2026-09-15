@@ -1149,6 +1149,11 @@ const LEADS: [&str; 8] = [
     "it's ",
 ];
 
+/// Words that end the name and carry the sentence on.
+const CLAUSE: [&str; 12] = [
+    "and", "but", "so", "because", "is", "was", "from", "the", "a", "an", "at", "in",
+];
+
 /// "I'm fine", "I'm good", "I am here", "it's me": states, not names.
 const NOT_NAMES: [&str; 22] = [
     "fine", "good", "ok", "okay", "great", "well", "here", "back", "me", "tired", "bored", "sorry",
@@ -1185,10 +1190,20 @@ pub fn self_introduction(text: &str, after_name_question: bool) -> Option<String
 fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String> {
     let t = text.trim().trim_end_matches(['.', '!', '?', ',']).trim();
     let lower = t.to_lowercase();
+    // The lead may sit anywhere in the sentence: "hey I'm Ada, is this
+    // thing on?" is an introduction, and the model was the only thing
+    // catching it before (measured: our own detector 0/3 on that case).
+    // Only what follows the lead up to the next comma or clause end is
+    // the name, which is what the two-word cap below enforces.
     let rest = LEADS
         .iter()
-        .find_map(|l| lower.strip_prefix(l).map(|_| &t[l.len()..]))
-        .map(str::trim);
+        .filter_map(|l| lower.find(l).map(|i| (i, l.len())))
+        .min_by_key(|(i, _)| *i)
+        .map(|(i, len)| {
+            let after = &t[i + len..];
+            after.split([',', ';']).next().unwrap_or(after).trim()
+        });
+    let led = rest.is_some();
     let candidate = match rest {
         Some(r) => r,
         None if after_name_question => t,
@@ -1199,7 +1214,18 @@ fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String
         .trim_end_matches(" here")
         .trim_end_matches(" by the way")
         .trim();
-    let words: Vec<&str> = candidate.split_whitespace().collect();
+    // After a lead, the name is what comes before the sentence carries on
+    // ("my name is Ravi and I'm new here"). A bare answer to the name
+    // question must be the whole utterance, or it is not a name at all.
+    let words: Vec<&str> = if led {
+        candidate
+            .split_whitespace()
+            .take_while(|w| !CLAUSE.contains(&w.to_lowercase().as_str()))
+            .take(2)
+            .collect()
+    } else {
+        candidate.split_whitespace().collect()
+    };
     if words.is_empty() || words.len() > 2 {
         return None;
     }
@@ -1255,6 +1281,16 @@ mod self_intro_tests {
         assert!(self_introduction("I'm fine", true).is_none());
         assert!(self_introduction("I am going to Google it", false).is_none());
         assert!(self_introduction("we don't know anyone", true).is_none());
+        // A name offered mid-sentence, and the clause after it ignored.
+        assert_eq!(
+            self_introduction("hey I'm Ada, is this thing on?", false).unwrap(),
+            "Ada"
+        );
+        assert_eq!(
+            self_introduction("well, my name is Ravi and I'm new here", false).unwrap(),
+            "Ravi"
+        );
+        assert!(self_introduction("so I'm not sure about that", false).is_none());
         assert_eq!(
             self_introduction(
                 "I am Kalyan. I am Kalyan. Hello. What are you doing?",

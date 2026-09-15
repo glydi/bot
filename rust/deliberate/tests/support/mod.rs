@@ -38,7 +38,7 @@ pub fn model_under_test(config: &mut Config) {
                 .iter()
                 .find_map(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_else(|| panic!("CQ_SYSTEM_SHORT: cannot read {path}"));
-            config.system_prompt = text.trim().to_owned();
+            text.trim().clone_into(&mut config.system_prompt);
         }
     }
 }

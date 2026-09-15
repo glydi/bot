@@ -228,6 +228,8 @@ fn stranger(track: u32, speaking: bool) -> ViewEntity {
 /// One live session over a fixed room.
 struct Rig {
     session: Session,
+    /// `set_name` payloads seen, newest last; see [`Rig::enrolled`].
+    enrolled: std::cell::RefCell<Vec<String>>,
     commands: Arc<CommandQueue>,
     facts: Arc<Facts>,
     timings: Arc<Mutex<Vec<Timing>>>,
@@ -269,6 +271,7 @@ impl Rig {
         let (obs_tx, obs_rx) = mpsc::channel(1);
         Self {
             session,
+            enrolled: std::cell::RefCell::new(Vec::new()),
             commands,
             facts: store,
             timings,
@@ -309,11 +312,35 @@ impl Rig {
     }
 
     fn spoken(&self) -> String {
-        std::iter::from_fn(|| self.commands.try_pop())
-            .filter(|c| c.kind == "say")
-            .filter_map(|c| c.payload.as_text().map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut said = Vec::new();
+        while let Some(c) = self.commands.try_pop() {
+            // A name the runtime enrolled itself travels as `set_name`
+            // (see `Session::enrol_introduction`): for the person in front
+            // of the bot, that is the name being remembered.
+            if c.kind == "set_name" {
+                if let Some(t) = c.payload.as_text() {
+                    self.enrolled.borrow_mut().push(t.to_owned());
+                }
+            } else if c.kind == "say" {
+                if let Some(t) = c.payload.as_text() {
+                    said.push(t.to_owned());
+                }
+            }
+        }
+        said.join(" ")
+    }
+
+    /// Whether `name` ended up remembered this session, by either route:
+    /// the model calling `remember_name`, or the runtime enrolling the
+    /// self-introduction before the model saw the turn.
+    fn enrolled(&self, name: &str) -> bool {
+        let want = name.to_lowercase();
+        self.called("remember_name", &want)
+            || self
+                .enrolled
+                .borrow()
+                .iter()
+                .any(|p| p.to_lowercase().contains(&want))
     }
 
     /// Every tool call the model made this session, as (name, arguments).
@@ -503,7 +530,7 @@ fn john_with_facts(speaking: bool) -> Rig {
 async fn stranger_name_mid_sentence() -> Outcome {
     let mut r = Rig::new(vec![stranger(1, true)], vec![]);
     let reply = r.say("hey I'm Ada, is this thing on?", None).await;
-    let called = r.called("remember_name", "ada");
+    let called = r.enrolled("ada");
     outcome(called, reply, format!("calls={:?}", r.calls()))
 }
 
@@ -637,10 +664,13 @@ async fn name_answer_with_correction() -> Outcome {
     let mut r = Rig::new(vec![stranger(2, true)], vec![]);
     r.intent(r#"{"decision":"ask_name","entity":"track:2"}"#);
     let reply = r.say("it's Mukesh actually", None).await;
-    let exact = r
-        .calls()
-        .iter()
-        .any(|(n, a)| n == "remember_name" && a.contains("Mukesh") && !a.contains("actually"));
+    // The bare name, not the hedge around it.
+    let exact = r.enrolled("mukesh")
+        && !r
+            .enrolled
+            .borrow()
+            .iter()
+            .any(|p| p.to_lowercase().contains("actually"));
     outcome(exact, reply, format!("calls={:?}", r.calls()))
 }
 
