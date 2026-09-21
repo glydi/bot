@@ -51,22 +51,31 @@ data/            glydi.db (gitignored)
 
 ## Setup (macOS, Apple Silicon)
 
+Full instructions, including what breaks and why, are in
+[BUILD.md](BUILD.md). The short version:
+
 ```bash
-# toolchain
+brew install onnxruntime ollama espeak-ng python@3.12
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-brew install onnxruntime ollama
 brew services start ollama && ollama pull qwen2.5:3b
 
-# the macOS voice helper
-make -C rust/ttsd
-
-# models (whisper, smart-turn, ecapa, insightface buffalo_s)
-# -> models/ and ~/.insightface/models/buffalo_s ; see STACK.txt
+scripts/fetch-models.sh                 # the 1.6 GB of models (not in git)
+cp .env.example .env
 
 cd rust && cargo build --release -p glydi --features vision,kokoro
-rust/make_app.sh            # GLYDI.app on the Desktop
-./target/release/glydi check
-./target/release/glydi run
+cd .. && ./rust/make_app.sh             # GLYDI.app on the Desktop
+```
+
+Launch the **app bundle**, not `cargo run`: macOS grants camera and
+microphone access per application, and a terminal run inherits the
+terminal's permissions instead of asking for its own.
+
+There is a second implementation in [py/](py/README.md) -- the same models
+and the same gallery, in plain Python, meant to be read:
+
+```bash
+py/setup.sh      # py/.venv, Python 3.12
+py/run.sh        # the bot
 ```
 
 `glydi check` reports every model, device, and server it will use.

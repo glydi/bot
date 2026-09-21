@@ -1,0 +1,11 @@
+# The Python build's dependencies. Pinned loosely: this build exists to be
+# read and edited, and a hard pin here would fight the Rust build's models
+# every time one of them moves.
+numpy>=2.0
+onnxruntime>=1.20          # face/voice models, VAD, speech to text
+opencv-python>=4.10        # camera and the window
+insightface>=0.7.3         # face detection and ArcFace embeddings
+onnx-asr>=0.6              # Parakeet TDT decoding (the Rust build ports this)
+sounddevice>=0.5           # microphone
+requests>=2.32             # Ollama
+pytest>=8.0                # tests
