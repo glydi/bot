@@ -34,6 +34,24 @@ fn clip(name: &str) -> Vec<f32> {
     load_wav(&p).unwrap_or_else(|e| panic!("{e}")).0
 }
 
+/// [`clip`] for the clips only a Mac can make (`french.wav` is `say`):
+/// `None`, with a note, when the file is not here, like [`model`] for a
+/// model that was not downloaded.
+fn mac_clip(name: &str) -> Option<Vec<f32>> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name);
+    if p.is_file() {
+        Some(clip(name))
+    } else {
+        eprintln!(
+            "skipping: {} not present (made with macOS `say`; see the module docs)",
+            p.display()
+        );
+        None
+    }
+}
+
 fn model(name: &str) -> Option<PathBuf> {
     let p = repo_root().join("models/whisper").join(name);
     if p.is_file() {
@@ -53,16 +71,14 @@ fn ms(t: Instant) -> f64 {
 
 #[test]
 fn multilingual_model_detects_french_and_english() {
-    let Some(base) = model("ggml-base.bin") else {
+    let (Some(base), Some(french)) = (model("ggml-base.bin"), mac_clip("french.wav")) else {
         return;
     };
     let mut w = Whisper::open_with_language(&base, 4, None).unwrap_or_else(|e| panic!("{e}"));
     assert!(w.is_multilingual());
     w.warm_up().unwrap_or_else(|e| panic!("{e}"));
 
-    let fr = w
-        .transcribe(&clip("french.wav"))
-        .unwrap_or_else(|e| panic!("{e}"));
+    let fr = w.transcribe(&french).unwrap_or_else(|e| panic!("{e}"));
     eprintln!("french ({:?}): {fr:?}", w.last_language());
     assert_eq!(w.last_language(), Some("fr"));
     let lower = fr.to_lowercase();
@@ -79,15 +95,13 @@ fn multilingual_model_detects_french_and_english() {
     // transcript is whatever whisper makes of French in English mode).
     let mut forced =
         Whisper::open_with_language(&base, 4, Some("en")).unwrap_or_else(|e| panic!("{e}"));
-    forced
-        .transcribe(&clip("french.wav"))
-        .unwrap_or_else(|e| panic!("{e}"));
+    forced.transcribe(&french).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(forced.last_language(), Some("en"));
 }
 
 #[test]
 fn english_only_model_always_reports_english() {
-    let Some(tiny) = model("ggml-tiny.en.bin") else {
+    let (Some(tiny), Some(french)) = (model("ggml-tiny.en.bin"), mac_clip("french.wav")) else {
         return;
     };
     // Asking a .en model for Hindi is a warning, not an error.
@@ -97,8 +111,7 @@ fn english_only_model_always_reports_english() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(w.last_language(), Some("en"));
     let mut auto = Whisper::open_with_language(&tiny, 4, None).unwrap_or_else(|e| panic!("{e}"));
-    auto.transcribe(&clip("french.wav"))
-        .unwrap_or_else(|e| panic!("{e}"));
+    auto.transcribe(&french).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(auto.last_language(), Some("en"));
 }
 

@@ -1,0 +1,50 @@
+# GLYDI on a Jetson, windowed: the same as glydi.service but with the egui
+# face on the screen. Installed *as* glydi.service by
+# `install-service.sh --kiosk`, so only one of the two is ever enabled.
+#
+# Needs the user auto-logged into a graphical session (kiosk.md,
+# "Auto-login"): the window is drawn on that session's X display. On
+# JetPack 6 the desktop is GNOME on X11 under GDM, so DISPLAY and
+# XAUTHORITY are what winit needs; on a Wayland session it would be
+# WAYLAND_DISPLAY=wayland-0 and XDG_RUNTIME_DIR instead.
+
+[Unit]
+Description=GLYDI: the bot in the foyer (window)
+Documentation=file://__REPO__/deploy/jetson/kiosk.md
+Wants=network-online.target ollama.service
+After=network-online.target ollama.service
+# The display server, and GDM's auto-login, must be up first.
+After=graphical.target display-manager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+SupplementaryGroups=video audio
+WorkingDirectory=__REPO__
+EnvironmentFile=__REPO__/.env
+Environment=GLYDI_ROOT=__REPO__
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/user/__UID__/gdm/Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+# Uncomment for a Wayland session (and drop DISPLAY/XAUTHORITY):
+#Environment=WAYLAND_DISPLAY=wayland-0
+# --no-strip: just the face, no camera thumbnail or state line, for a
+# screen the public looks at. Drop it while tuning.
+ExecStart=__REPO__/rust/target/release/glydi run --no-strip
+# The session takes a few seconds to bring the display up after
+# graphical.target; the restart loop covers a first failed window.
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+Nice=-5
+# See glydi.service for the reasoning before setting this.
+#MemoryMax=3G
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=glydi
+
+[Install]
+WantedBy=graphical.target

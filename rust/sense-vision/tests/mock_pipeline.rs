@@ -152,16 +152,16 @@ impl FaceDetector for ManyFaces {
     }
 }
 
-/// Sixteen big faces and two tiny ones: only the cap's worth are
+/// Twenty big faces and two tiny ones: only the cap's worth are
 /// tracked, the tiny ones are never reported, and a `crowd` count of the
 /// reported faces follows them, once while the count holds.
 #[test]
 fn a_crowd_is_capped_floored_and_counted() {
-    const { assert!(16 > MAX_LIVE_TRACKS && MAX_LIVE_TRACKS > CROWD_EMIT_ABOVE) };
+    const { assert!(20 > MAX_LIVE_TRACKS && MAX_LIVE_TRACKS > CROWD_EMIT_ABOVE) };
     let (tx, rx) = ObservationRing::bounded(512);
     let clock = Arc::new(FakeClock::new());
     let gallery = Arc::new(InMemoryFaceGallery::default());
-    let det = ManyFaces { big: 16, tiny: 2 };
+    let det = ManyFaces { big: 20, tiny: 2 };
     let cfg = VisionConfig {
         emit_interval: Duration::from_millis(100),
         ..config(3)

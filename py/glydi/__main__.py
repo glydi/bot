@@ -7,10 +7,10 @@ about, and because cv2 will not draw a window from anywhere else.
 
     vision ┐                        ┌─> voice thread ─> `say`
     audio  ├─> observations ─> mind ─┤
-           ┘     (Ring)      (here)  └─> window (here, cv2's rule)
+    text   ┘     (Ring)      (here)  └─> window (here, cv2's rule)
 
 Flags exist so you can run the half you are working on:
-`--no-camera`, `--no-mic`, `--headless`.
+`--no-camera`, `--no-mic`, `--headless`, and `--text` to type to it.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 from .config import Config
+from .senses.text import PROMPT
 from .types import PREVIEW, Ring
 
 log = logging.getLogger("glydi")
@@ -36,14 +37,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-camera", action="store_true", help="run deaf to faces")
     ap.add_argument("--no-mic", action="store_true", help="run deaf")
     ap.add_argument("--headless", action="store_true", help="no window")
+    ap.add_argument("--text", action="store_true", help="type to it on the console")
     ap.add_argument("--debug", action="store_true", help="log every fold")
     return ap.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Typing shares the console with the log; keep the log out of the
+    # conversation unless asked for it.
+    level = logging.DEBUG if args.debug else logging.WARNING if args.text else logging.INFO
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=level,
         format="%(asctime)s %(name)-12s %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -95,9 +100,21 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_mic:
         from .senses.audio import AudioSense
 
-        audio = AudioSense(observations, stop, self_speaking)
+        # sounddevice takes an index or a name substring; a machine with no
+        # default input (Windows with nothing plugged in) needs one named.
+        mic: Any = cfg.mic_device or None
+        if mic is not None and mic.isdigit():
+            mic = int(mic)
+        audio = AudioSense(observations, stop, self_speaking, device=mic)
         audio.start()
         joinable.append(audio)
+    if args.text:
+        from .senses.text import TextSense
+
+        print("type to GLYDI; Ctrl-C to stop", flush=True)
+        text = TextSense(observations, stop)
+        text.start()
+        joinable.append(text)
 
     window = None
     if not args.headless:
@@ -121,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
                     speaker.push(cmd)
                 else:
                     ui_commands.push(cmd)
+                    if args.text and cmd.kind == "said":
+                        # The transcript, so a typed conversation reads back
+                        # on the console it was typed on.
+                        print(f"\rglydi> {cmd.payload}\n{PROMPT}", end="", flush=True)
 
             if window is not None and not window.pump():
                 log.info("window closed")

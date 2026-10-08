@@ -92,9 +92,12 @@ pub mod behaviour;
 pub mod debug;
 pub mod expression;
 pub mod face;
+pub mod panel;
 pub mod router;
+pub mod settings;
 pub mod state;
 pub mod strip;
+pub mod visitor;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +110,7 @@ use crossbeam_channel::Receiver;
 pub use behaviour::{Behaviour, Overlay, Reaction};
 pub use debug::{Panel, Sources, Tab};
 pub use expression::{Expression, FaceState};
+pub use panel::Screen;
 pub use router::{CommandRouter, RouterHandle};
 pub use state::{Attend, Faces, UiState};
 pub use strip::{PreviewTexture, StripRow, strip_rows};
@@ -144,6 +148,20 @@ pub struct UiConfig {
     /// owns the main thread and has no channel to poke, so the frame loop
     /// polls this; Cmd-Q and the close button work without it.
     pub quit: Option<Arc<AtomicBool>>,
+    /// Draw the animated face. Off, the window is the [`panel`]: the
+    /// bot's state and transcript in large type and a settings screen,
+    /// for a bare display with no face to animate (`--no-face`,
+    /// `GLYDI_FACE=0`).
+    pub face: bool,
+    /// Fill the display with no window frame (`--fullscreen`,
+    /// `GLYDI_FULLSCREEN=1`).
+    pub fullscreen: bool,
+    /// The `.env` the panel's settings screen writes. `None` makes the
+    /// screen read-only.
+    pub env_path: Option<std::path::PathBuf>,
+    /// Set by the panel's "save and restart": the binary checks it after
+    /// the window closes and starts itself again.
+    pub restart: Option<Arc<AtomicBool>>,
 }
 
 impl Default for UiConfig {
@@ -156,6 +174,10 @@ impl Default for UiConfig {
             strip: true,
             front_on_launch: true,
             quit: None,
+            face: false,
+            fullscreen: false,
+            env_path: None,
+            restart: None,
         }
     }
 }
@@ -186,11 +208,19 @@ pub fn run_ui(
     observations: Option<RingReceiver>,
     sources: Sources,
 ) -> Result<(), Error> {
+    // The panel is laid out for a 10-inch display (1024 x 600 is the
+    // smallest common one); the face keeps the design's stage.
+    let (size, min) = if config.face {
+        (config.size, (260.0, 260.0 / face::ASPECT + TOGGLE_BAR))
+    } else {
+        ((1024.0, 600.0), (640.0, 400.0))
+    };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&config.title)
-            .with_inner_size([config.size.0, config.size.1])
-            .with_min_inner_size([260.0, 260.0 / face::ASPECT + TOGGLE_BAR]),
+            .with_inner_size([size.0, size.1])
+            .with_min_inner_size([min.0, min.1])
+            .with_fullscreen(config.fullscreen),
         // wgpu: the glow backend is not compiled in (see Cargo.toml).
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
@@ -228,6 +258,8 @@ struct FaceApp {
     /// How many `attend`s have already been turned into a glance.
     attends_seen: u64,
     quit: Option<Arc<AtomicBool>>,
+    /// The face-less screens, when the face is off.
+    screens: Option<panel::Panel>,
 }
 
 impl FaceApp {
@@ -250,6 +282,8 @@ impl FaceApp {
             panel: debug::Panel::on(config.tab),
             attends_seen: 0,
             quit: config.quit.clone(),
+            screens: (!config.face)
+                .then(|| panel::Panel::new(config.env_path.clone(), config.restart.clone())),
         }
     }
 
@@ -297,6 +331,14 @@ impl eframe::App for FaceApp {
         self.drain(now);
         let expression = self.state.expression(now);
         self.motion.tick(now, expression);
+
+        if let Some(screens) = &mut self.screens {
+            screens.ui(ui, &self.state, &self.sources, now);
+            // The level line and the state word are the only things that
+            // move; 20 Hz is plenty and keeps a small board cool.
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+            return;
+        }
 
         if self.textures.is_none() {
             match face::FaceTextures::load(ui.ctx()) {

@@ -192,3 +192,45 @@ model-only table over every kind (proactive moments included) in a few minutes:
 
     train/.venv/bin/python train/eval_quick.py --model glydi-3b-pilot --system short
     train/.venv/bin/python train/eval_quick.py --model qwen2.5:3b --system full
+
+## Training on CUDA (Windows PC, Jetson)
+
+`train_cuda.py` / `export_cuda.py` are the MLX scripts' counterparts for an
+NVIDIA card: same data, same prompt masking, same adapter shape. The venv is
+`train/.venv-cuda` (PyTorch cu128 for the Blackwell RTX 5060, transformers 4.x,
+peft; `build_dataset.py` runs from it too and now writes UTF-8).
+
+    train/.venv-cuda/Scripts/python train/build_dataset.py
+    ITERS=30 TAG=pilot train/.venv-cuda/Scripts/python train/train_cuda.py          # pilot, 3 min
+    ITERS=1000 LAYERS=16 RANK=16 LR=1e-4 TAG=1b5 train/.venv-cuda/Scripts/python train/train_cuda.py
+    ADAPTERS=train/adapters-1b5 NAME=glydi-1.5b train/.venv-cuda/Scripts/python train/export_cuda.py
+
+The base loads in bf16 (no bitsandbytes): the 1.5B peaks at 5.8 GB with
+gradient checkpointing at batch 1 x 4 accumulation, ~0.2 steps/s on the 5060,
+so 1,000 steps is about 90 minutes. Ollama must have released the GPU first
+(`ollama stop <model>`).
+
+Export goes HF-merge -> llama.cpp `convert_hf_to_gguf.py` (f16) ->
+`llama-quantize` q4_K_M -> `ollama create`, because this Ollama (0.35) imports
+neither Qwen2 safetensors ("unsupported MLX architecture") nor quantises a GGUF
+with the k-quant names. `tools/llama.cpp` is a shallow clone for the converter;
+`tools/bin` holds a llama.cpp release's Windows binaries for the quantiser (on
+the Jetson, build llama.cpp or put `llama-quantize` on PATH). Neither is in git.
+
+The pilot (30 steps) went through the whole chain and failed the tool-call
+check, as a 30-step adapter should; the 1,000-step run is what to evaluate.
+
+### Scores (eval_quick.py, `--system short`, 155 cases)
+
+| model | answer | proactive | tool | overall |
+| --- | --- | --- | --- | --- |
+| `glydi-1.5b` (adapters-1b5, 1,000 steps) | 61/63 | 44/48 | 34/44 | 139/155 = 0.90 |
+| `glydi-1.5b-tools` (RESUME_FROM=adapters-1b5, TOOL_WEIGHT=3, 14 min) | 60/63 | 48/48 | 37/44 | 145/155 = 0.94 |
+| `qwen2.5:1.5b` untuned | | | | 0.42 |
+
+The tool-weighted continuation is what ships: `models/glydi-1.5b.q4_K_M.gguf`
+is its GGUF (copied from Ollama's blob store; the export's `fused-*-tools`
+files were not kept), and the Jetson creates it under the name `glydi-1.5b`
+(`deploy/jetson/install.sh`). Earlier runs reported 22 "request failed"
+cases: the evaluator sent tool-call `arguments` as objects in the history
+and Ollama's OpenAI endpoint wants strings (`verify_ollama.wire_messages`).

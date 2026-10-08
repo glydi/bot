@@ -365,7 +365,7 @@ pub const EARLY_MATCH_WINDOW: Duration = Duration::from_secs(8);
 /// warm prefix answers in 300-800 ms, a cold prefix or a tool round in
 /// 2-4 s; 1.5 s is where a person starts wondering whether they were
 /// heard.
-pub const FIRST_TOKEN_GRACE: Duration = Duration::from_millis(2500);
+pub const FIRST_TOKEN_GRACE: Duration = Duration::from_millis(900);
 
 /// How long between two "Let me think." lines. At 1.5 s and no gap it
 /// prefaced nearly every reply in a live session, which reads as a tic.
@@ -422,6 +422,29 @@ pub struct Config {
     /// [`PROACTIVE_MIN_GAP`]. Zero in end-to-end tests, which compress a
     /// visit into a few seconds.
     pub proactive_min_gap: Duration,
+    /// Greetings (an arrival, a return, a pair, a group) are spoken as
+    /// their canned line the moment the camera raises them, with no model
+    /// request in front: a hello that comes a second after someone walks
+    /// in is a hello to their back. Every other moment still goes through
+    /// the model when [`Config::proactive_via_model`] is on. On by
+    /// default.
+    pub instant_greetings: bool,
+    /// The school (see [`crate::school_link`]): marks the greeted present
+    /// and answers day questions from its own data. `None` is a bot with
+    /// no ERP.
+    pub school: Option<crate::school_link::SharedSchool>,
+    /// Answer the regular exchanges from templates (see
+    /// [`crate::templates`]) before the model. On by default; the live
+    /// tests of the model path turn it off.
+    pub templates: bool,
+    /// Where the answer cache lives (see [`crate::cache`]); `None`
+    /// keeps it in memory only.
+    pub answer_cache: Option<std::path::PathBuf>,
+    /// Ignore speech from an unidentified voice unless it is addressed
+    /// to the bot or a conversation is open (see
+    /// [`crate::voice::addressed`]). On by default: a kiosk hears the
+    /// whole foyer. Off in the model-path tests.
+    pub attention: bool,
 }
 
 impl Default for Config {
@@ -437,7 +460,12 @@ impl Default for Config {
             max_tool_rounds: MAX_TOOL_ROUNDS,
             adaptive_brevity: true,
             proactive_via_model: true,
+            instant_greetings: true,
             proactive_min_gap: PROACTIVE_MIN_GAP,
+            school: None,
+            templates: true,
+            answer_cache: None,
+            attention: true,
         }
     }
 }
@@ -538,6 +566,34 @@ pub struct Session {
     proactive_via_model: bool,
     /// See [`Config::proactive_min_gap`].
     proactive_min_gap: Duration,
+    /// See [`Config::instant_greetings`].
+    instant_greetings: bool,
+    /// See [`Config::school`].
+    school: Option<crate::school_link::SharedSchool>,
+    /// See [`Config::templates`].
+    templates: bool,
+    /// See [`Config::attention`].
+    attention: bool,
+    /// See [`crate::cache`].
+    cache: crate::cache::AnswerCache,
+    /// The last question the model (or the cache) answered, and the
+    /// reply, judged by the next utterance.
+    last_answer: Option<(String, String)>,
+    /// The person at the kiosk, when nothing identifies the speaker: the
+    /// one who last gave their name. A kiosk has one person at a time
+    /// and no voice recognition; whoever said "my name is Priya" is
+    /// Priya until someone else is identified.
+    current_person: Option<(EntityId, String)>,
+    /// A name heard and read back, waiting for yes or no.
+    pending_confirm: Option<(String, Instant)>,
+    /// This turn is a plain question: the short prompt, no tools (see
+    /// [`crate::voice::is_plain_question`]).
+    plain_lane: bool,
+    /// When the bot last spoke or was spoken to: a conversation is open
+    /// for [`crate::voice::ATTENTION_WINDOW`] after it, and anything
+    /// heard then is for the bot. Outside it, only speech that is
+    /// addressed to the bot starts one (see [`crate::voice::addressed`]).
+    attention_at: Option<Instant>,
     /// How many times in a row the person has just said these same
     /// words ("Hello." for the fourth time is 4); 1 for anything new.
     streak: usize,
@@ -611,6 +667,19 @@ impl Session {
             adaptive_brevity: config.adaptive_brevity,
             proactive_via_model: config.proactive_via_model,
             proactive_min_gap: config.proactive_min_gap,
+            instant_greetings: config.instant_greetings,
+            school: config.school.clone(),
+            templates: config.templates,
+            attention: config.attention,
+            cache: config.answer_cache.as_deref().map_or_else(
+                crate::cache::AnswerCache::default,
+                crate::cache::AnswerCache::load,
+            ),
+            last_answer: None,
+            current_person: None,
+            pending_confirm: None,
+            plain_lane: false,
+            attention_at: None,
             streak: 1,
             crowd: None,
             greeted_at: HashMap::new(),
@@ -620,12 +689,262 @@ impl Session {
         }
     }
 
+    /// The two cases that never reach the model: the bot's own voice back
+    /// through the microphone (dropped), and a question about a day the
+    /// school answers from its own data (spoken at once: "is tomorrow a
+    /// holiday?" has one right answer and a timetable is not something
+    /// to improvise). True when the utterance has been dealt with.
+    fn answered_without_the_model(&mut self, text: &str, speaker: Option<&EntityId>) -> bool {
+        if self.said.echoes(text) {
+            tracing::info!(text, "self-echo dropped");
+            return true;
+        }
+        // Passing speech: the foyer talking to itself is not a turn.
+        let now = self.clock.now();
+        let open = self
+            .attention_at
+            .is_some_and(|t| now.saturating_duration_since(t) < crate::voice::ATTENTION_WINDOW)
+            || self.pending_name.is_some()
+            || self.pending_confirm.is_some();
+        // Someone the senses identified (a face, a voice, a named track)
+        // is talking to us by definition; the rule is for the unknown
+        // voice in the room.
+        if self.attention && !open && speaker.is_none() && !crate::voice::addressed(text) {
+            tracing::info!(text, "not addressed to me; ignored");
+            return true;
+        }
+        self.attention_at = Some(now);
+        // The same question straight after its answer is "I didn't catch
+        // that": say the answer again, verdict withheld.
+        let looks_like_question = text.trim_end().ends_with('?')
+            || [
+                "what", "who", "when", "where", "why", "how", "which", "is", "are", "do", "does",
+                "can",
+            ]
+            .contains(
+                &text
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+            );
+        if let Some((q, a)) = &self.last_answer {
+            if looks_like_question && crate::cache::normalise(q) == crate::cache::normalise(text) {
+                tracing::info!("same question again; repeating the answer");
+                let again = a.clone();
+                self.conversation.push(Message::user(text));
+                self.say(again);
+                return true;
+            }
+        }
+        // What the person says now is the verdict on what was said last.
+        if let Some((q, a)) = self.last_answer.take() {
+            let verdict = crate::cache::judge(&q, text);
+            if self.cache.feedback(&q, &a, verdict) {
+                tracing::debug!(?verdict, question = q, "answer scored");
+                self.cache.save();
+            }
+        }
+        // A typed line or a plain microphone utterance names no speaker;
+        // the mind's view still knows who is talking (the one voice, or
+        // whoever is engaged), and that is who the name and facts belong to.
+        let view = (self.snapshot)();
+        let resolved: Option<EntityId> = speaker
+            .cloned()
+            .or_else(|| view.speaker().map(|p| p.id.clone()))
+            .filter(|id| !id.is_track())
+            .or_else(|| self.current_person.as_ref().map(|(id, _)| id.clone()));
+        let speaker = resolved.as_ref();
+        // Their name: from the room when the room knows them, else the
+        // name they gave (a person with no face or voice on file is not
+        // in the room view, and an id is not a name to say out loud).
+        let name = speaker.and_then(|id| {
+            view.people
+                .iter()
+                .find(|p| &p.id == id)
+                .filter(|p| p.is_known() && p.name.is_some())
+                .map(mind::ViewEntity::label)
+                .or_else(|| {
+                    self.current_person
+                        .as_ref()
+                        .filter(|(cur, _)| cur == id)
+                        .map(|(_, n)| n.clone())
+                })
+        });
+        if self.templates {
+            if let Some(done) = self.template_reply(text, speaker, name.as_deref()) {
+                return done;
+            }
+        }
+        if let Some(school) = &self.school {
+            if let Some(line) = school.answer(text, name.as_deref()) {
+                tracing::info!(line, "school answered");
+                self.conversation.push(Message::user(text));
+                self.speak_line(line);
+                return true;
+            }
+        }
+        if let Some(answer) = self.cache.best(text) {
+            tracing::info!(answer, "answered from the cache");
+            self.conversation.push(Message::user(text));
+            self.speak_line(answer.clone());
+            self.last_answer = Some((text.to_owned(), answer));
+            return true;
+        }
+        false
+    }
+
+    /// A template's answer, applied: the name enrolled, the fact kept,
+    /// the person forgotten, and the line spoken. `Some(true)` when the
+    /// utterance has been dealt with.
+    fn template_reply(
+        &mut self,
+        text: &str,
+        speaker: Option<&EntityId>,
+        name: Option<&str>,
+    ) -> Option<bool> {
+        let now = self.clock.now();
+        let (time, date) = local_clock();
+        let date_tomorrow = local_clock_tomorrow();
+        let cx = crate::templates::Context {
+            last_said: self.said.recent(1).first().map(|s| (*s).to_owned()),
+            date_tomorrow,
+            name: name.map(str::to_owned),
+            facts: speaker.map(|id| self.facts.recall(id)).unwrap_or_default(),
+            time,
+            date,
+            greeted: speaker.is_some_and(|id| {
+                self.greeted_at.get(id).is_some_and(|t| {
+                    now.saturating_duration_since(*t) < crate::voice::GREETING_WINDOW
+                })
+            }),
+            asked_name: self.pending_name.as_ref().is_some_and(|(_, asked)| {
+                now.saturating_duration_since(*asked) < NAME_ANSWER_WINDOW
+            }),
+            confirming: self
+                .pending_confirm
+                .as_ref()
+                .filter(|(_, at)| now.saturating_duration_since(*at) < NAME_ANSWER_WINDOW)
+                .map(|(n, _)| n.clone()),
+        };
+        let reply = crate::templates::respond(text, &cx)?;
+        tracing::info!(kind = reply.kind, line = reply.line, "template answered");
+        let view = (self.snapshot)();
+        match &reply.action {
+            crate::templates::Action::None => {}
+            crate::templates::Action::ConfirmName(n) => {
+                self.pending_confirm = Some((n.clone(), now));
+            }
+            crate::templates::Action::AskName => {
+                self.pending_confirm = None;
+                self.pending_name = Some((speaker.cloned(), now));
+            }
+            crate::templates::Action::RememberName(n) => {
+                self.pending_name = None;
+                self.pending_confirm = None;
+                self.enrol_name(n, &view);
+            }
+            crate::templates::Action::RememberFact(fact) => match (name, speaker) {
+                (Some(n), _) => {
+                    let out = self.tools.invoke(
+                        crate::tools::REMEMBER_FACT,
+                        &serde_json::json!({ "name": n, "fact": fact }),
+                        &view,
+                    );
+                    tracing::debug!(%out, "fact kept");
+                }
+                (None, Some(id)) => self.facts.remember(id, fact),
+                (None, None) => {}
+            },
+            crate::templates::Action::Forget => {
+                if let Some(n) = name {
+                    let out = self.tools.invoke(
+                        crate::tools::FORGET_PERSON,
+                        &serde_json::json!({ "name": n }),
+                        &view,
+                    );
+                    tracing::info!(%out, "forgotten on request");
+                }
+            }
+        }
+        if reply.kind.starts_with("greet") {
+            if let Some(id) = speaker {
+                self.greeted_at.insert(id.clone(), now);
+            }
+        }
+        let asks_name = matches!(
+            reply.kind,
+            "greet_stranger" | "my_name_unknown" | "recall_unknown" | "name_retry"
+        ) || (reply.kind == "fact" && name.is_none());
+        if asks_name {
+            self.pending_name = Some((speaker.cloned(), now));
+        }
+        self.conversation.push(Message::user(text));
+        self.speak_line(reply.line);
+        Some(true)
+    }
+
+    /// The model's reply to `text` (every line said since `said_before`)
+    /// goes into the answer cache, and is held to be judged by what the
+    /// person says next.
+    fn remember_reply(&mut self, text: &str, said_before: usize) {
+        let all = self.said.all();
+        let reply = all[said_before.min(all.len())..].join(" ");
+        if reply.trim().is_empty() {
+            return;
+        }
+        self.cache.observe(text, &reply);
+        self.cache.save();
+        self.last_answer = Some((text.to_owned(), reply));
+    }
+
+    /// Enrol `name` for the speaker: the same binding the model path and
+    /// the introduction regex make.
+    fn enrol_name(&mut self, name: &str, view: &Arc<WorldView>) {
+        let out = self
+            .tools
+            .invoke(REMEMBER_NAME, &serde_json::json!({ "name": name }), view);
+        tracing::info!(name, %out, "name enrolled");
+        // The person at the kiosk is this name from now on, whether or
+        // not the store could bind a track to it (with no face and no
+        // voice there is nothing to bind; the name alone is the record).
+        let id = out
+            .get("entity")
+            .and_then(serde_json::Value::as_str)
+            .map(EntityId::new)
+            .or_else(|| self.facts.resolve_name(name))
+            .unwrap_or_else(|| EntityId::new(name.to_ascii_lowercase()));
+        self.current_person = Some((id, name.to_owned()));
+        if let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) {
+            let track = view
+                .speaker()
+                .map(|p| &p.id)
+                .filter(|id| id.is_track())
+                .and_then(|id| id.as_str().strip_prefix("track:"))
+                .and_then(|n| n.parse::<u32>().ok());
+            let mut payload = serde_json::json!({ "entity": entity, "name": name });
+            if let Some(t) = track {
+                payload["track"] = serde_json::json!(t);
+            }
+            self.commands.push(
+                Command::new(SET_NAME_TARGET, SET_NAME_KIND, Priority::Deliberate)
+                    .with_payload(Payload::Text(payload.to_string())),
+            );
+        }
+    }
+
     /// A moment's line is out: a hello is remembered per person, for
     /// [`GREETING_WINDOW`].
     fn spoke_moment(&mut self, p: &Proactive, line: String) {
         if p.moment.kind() == "greet" {
             if let Some(id) = &p.entity {
                 self.greeted_at.insert(id.clone(), self.clock.now());
+                // The hello is the attendance mark: a person we know by
+                // name has walked in.
+                if let (Some(school), Some(name)) = (&self.school, &p.name) {
+                    school.seen(id, name);
+                }
             }
         }
         self.speak_line(line);
@@ -1161,6 +1480,7 @@ impl Session {
     /// Say a line of our own, ungated, and keep it in the history as an
     /// assistant turn so the model knows it was said.
     fn speak_line(&mut self, line: String) {
+        self.attention_at = Some(self.clock.now());
         tracing::info!(line, "proactive");
         self.conversation.push(Message::assistant(&line));
         self.said.push(&line);
@@ -1351,32 +1671,34 @@ impl Session {
     /// `voice::self_introduction` for what the model did when left to it.
     /// Returns the name as enrolled.
     fn enrol_introduction(&mut self, text: &str, after_name_question: bool) -> Option<String> {
-        crate::voice::self_introduction(text, after_name_question).map(|name| {
-            let view = (self.snapshot)();
-            let out = self
-                .tools
-                .invoke(REMEMBER_NAME, &serde_json::json!({ "name": name }), &view);
-            tracing::info!(name, %out, "self-introduction enrolled");
-            if let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) {
-                // Same shape as the model-path binding: the mind merges the
-                // track into the named entity.
-                let track = view
-                    .speaker()
-                    .map(|p| &p.id)
-                    .filter(|id| id.is_track())
-                    .and_then(|id| id.as_str().strip_prefix("track:"))
-                    .and_then(|n| n.parse::<u32>().ok());
-                let mut payload = serde_json::json!({ "entity": entity, "name": name });
-                if let Some(t) = track {
-                    payload["track"] = serde_json::json!(t);
+        crate::voice::self_introduction(text, after_name_question)
+            .filter(|n| crate::voice::plausible_name(n))
+            .map(|name| {
+                let view = (self.snapshot)();
+                let out =
+                    self.tools
+                        .invoke(REMEMBER_NAME, &serde_json::json!({ "name": name }), &view);
+                tracing::info!(name, %out, "self-introduction enrolled");
+                if let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) {
+                    // Same shape as the model-path binding: the mind merges the
+                    // track into the named entity.
+                    let track = view
+                        .speaker()
+                        .map(|p| &p.id)
+                        .filter(|id| id.is_track())
+                        .and_then(|id| id.as_str().strip_prefix("track:"))
+                        .and_then(|n| n.parse::<u32>().ok());
+                    let mut payload = serde_json::json!({ "entity": entity, "name": name });
+                    if let Some(t) = track {
+                        payload["track"] = serde_json::json!(t);
+                    }
+                    self.commands.push(
+                        Command::new(SET_NAME_TARGET, SET_NAME_KIND, Priority::Deliberate)
+                            .with_payload(Payload::Text(payload.to_string())),
+                    );
                 }
-                self.commands.push(
-                    Command::new(SET_NAME_TARGET, SET_NAME_KIND, Priority::Deliberate)
-                        .with_payload(Payload::Text(payload.to_string())),
-                );
-            }
-            name
-        })
+                name
+            })
     }
 
     /// Everything real the model may draw on right now, lower-cased: the
@@ -1476,14 +1798,29 @@ impl Session {
         });
         // Who the senses say is talking beats who the camera saw talking:
         // voice identity is attached to the utterance itself.
-        let name = speaker.map(|id| {
-            view.people
-                .iter()
-                .find(|p| &p.id == id)
-                .map_or_else(|| id.to_string(), mind::ViewEntity::label)
-        });
+        let name = speaker
+            .map(|id| {
+                view.people
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map_or_else(|| id.to_string(), mind::ViewEntity::label)
+            })
+            .or_else(|| self.current_person.as_ref().map(|(_, n)| n.clone()));
+        // The one at the kiosk gave their name a moment ago: the model
+        // must not ask for it again, whatever the camera shows.
+        if speaker.is_none() {
+            if let Some((_, n)) = &self.current_person {
+                let _ = write!(
+                    note,
+                    "\nThe person talking is {n}; they told you their name already. Do not ask \
+                     for it again and do not say hello again; answer them by name."
+                );
+            }
+        }
         // The turn's own hints, after the note proper (see the constants).
-        let nobody_known = speaker.is_none() && view.people.iter().all(|p| !p.is_known());
+        let nobody_known = speaker.is_none()
+            && self.current_person.is_none()
+            && view.people.iter().all(|p| !p.is_known());
         if nobody_known && !self.lull && view.people.is_empty() {
             note.push('\n');
             note.push_str(NOTE_NOTHING_KNOWN);
@@ -1544,6 +1881,10 @@ impl Session {
     ) -> Result<TurnEnd, LlmError> {
         let started = self.clock.now();
         self.ui("thinking");
+        if self.answered_without_the_model(text, speaker) {
+            self.ui("idle");
+            return Ok(TurnEnd::Done);
+        }
         // The reply to "what's your name?" arrives as an ordinary utterance;
         // the model is told what it is so it enrols rather than just chats.
         let answering_name = self.pending_name.take().is_some_and(|(_, asked)| {
@@ -1625,7 +1966,11 @@ impl Session {
         self.conversation.push(Message::user(content));
         self.absent_hint = !introduced && names_someone_absent(text, &(self.snapshot)());
         self.memory_request = asks_to_be_forgotten(text);
-        let result = self.respond(speaker, obs, &cancel).await;
+        let said_before = self.said.all().len();
+        let result = self.respond_in_lane(text, speaker, obs, &cancel).await;
+        if matches!(result, Ok(TurnEnd::Done)) {
+            self.remember_reply(text, said_before);
+        }
         self.absent_hint = false;
         self.memory_request = false;
         // An early start that the person talked over answered a question
@@ -1741,6 +2086,24 @@ impl Session {
         result
     }
 
+    /// [`Session::respond`] in the lane the utterance calls for: the fast
+    /// lane for a plain question, the full one otherwise.
+    async fn respond_in_lane(
+        &mut self,
+        text: &str,
+        speaker: Option<&EntityId>,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: &CancellationToken,
+    ) -> Result<TurnEnd, LlmError> {
+        self.plain_lane = crate::voice::is_plain_question(text);
+        if self.plain_lane {
+            tracing::info!(text, "plain question: fast lane");
+        }
+        let result = self.respond(speaker, obs, cancel).await;
+        self.plain_lane = false;
+        result
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn respond(
         &mut self,
@@ -1762,7 +2125,37 @@ impl Session {
         let mut round = 0;
         loop {
             let (view, note, name) = self.room(speaker);
-            let mut messages = self.conversation.prepare(&note, name.as_deref());
+            let (mut messages, tools, max_tokens) = if self.plain_lane {
+                // The fast lane: the question alone under a sixty-token
+                // prompt, no room note, no tools. A plain question needs
+                // no history; a follow-up that does is the full lane's.
+                let question = self
+                    .conversation
+                    .history()
+                    .last()
+                    .filter(|m| m.role == Role::User)
+                    .map(|m| {
+                        let said = strip_note(&m.content);
+                        Message::user(match &name {
+                            Some(n) if !said.starts_with(&format!("{n} says:")) => {
+                                format!("{n} says: {said}")
+                            }
+                            _ => said,
+                        })
+                    });
+                let mut msgs = vec![Message::system(crate::voice::PLAIN_PROMPT)];
+                msgs.extend(question);
+                (msgs, Vec::new(), 120)
+            } else {
+                (
+                    self.conversation.prepare(&note, name.as_deref()),
+                    // The whole surface the local prompt names, so the model can
+                    // enrol a stranger (`remember_name`) and not just note
+                    // facts, plus the reach tools the policy allows.
+                    self.tools.specs(),
+                    self.turn_budget,
+                )
+            };
             if let Some(h) = retry_hint.take() {
                 messages.push(Message::user(h));
             }
@@ -1772,11 +2165,8 @@ impl Session {
 
             let mut stream = self.backend.chat(ChatRequest {
                 messages,
-                // The whole surface the local prompt names, so the model can
-                // enrol a stranger (`remember_name`) and not just note
-                // facts, plus the reach tools the policy allows.
-                tools: self.tools.specs(),
-                max_tokens: self.turn_budget,
+                tools,
+                max_tokens,
                 temperature: self.temperature,
                 json_object: false,
             });
@@ -2012,6 +2402,27 @@ impl Session {
         };
         if is_generic(&sentence) {
             tracing::info!(sentence, "generic sentence dropped");
+            dropped.generic = true;
+            return;
+        }
+        if crate::voice::leaks_instructions(&sentence) {
+            tracing::info!(sentence, "instruction leak dropped");
+            dropped.generic = true;
+            return;
+        }
+        // The question read back as the answer: a small model's way of
+        // saying nothing. Drop it; the fallback opener will do.
+        let asked = self
+            .conversation
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| crate::cache::normalise(m.content.lines().last().unwrap_or("")));
+        if asked.as_deref().is_some_and(|q| {
+            q.split_whitespace().count() >= 3 && q == crate::cache::normalise(&sentence)
+        }) {
+            tracing::info!(sentence, "question echoed back; dropped");
             dropped.generic = true;
             return;
         }
@@ -2356,7 +2767,10 @@ impl Session {
         let Some(turn) = turn_intent(&cmd) else {
             match self.plan_intent(&cmd) {
                 Some(Planned::Line(line)) => self.speak_line(line),
-                Some(Planned::Turn(p)) if !self.proactive_via_model => {
+                Some(Planned::Turn(p))
+                    if !self.proactive_via_model
+                        || (self.instant_greetings && p.moment.kind() == "greet") =>
+                {
                     let line = p.canned.clone();
                     self.spoke_moment(&p, line);
                 }
@@ -2418,6 +2832,83 @@ impl Session {
             .retain(|_, at| now.saturating_duration_since(*at) < IGNORE_TTL);
         self.ignore.remove(id).is_some()
     }
+}
+
+/// A user turn without the `[room]` note and hints the full lane
+/// prefixed to it: the last line is what the person actually said.
+fn strip_note(content: &str) -> String {
+    content
+        .lines()
+        .rev()
+        .find(|l| !l.starts_with('[') && !l.trim().is_empty())
+        .map_or_else(
+            || content.to_owned(),
+            |l| {
+                l.trim_start_matches(|c: char| !c.is_alphanumeric())
+                    .to_owned()
+            },
+        )
+}
+
+/// Tomorrow's "Thursday 8 October", same zone as [`local_clock`].
+fn local_clock_tomorrow() -> String {
+    clock_at(now_local_secs() + 86_400).1
+}
+
+/// Seconds since the epoch shifted into the machine's zone.
+fn now_local_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        + crate::tools::local_utc_offset()
+}
+
+/// `(HH:MM, "Wednesday 7 October")` now, in the machine's zone
+/// (`GLYDI_UTC_OFFSET`, as the tools read it).
+fn local_clock() -> (String, String) {
+    clock_at(now_local_secs())
+}
+
+/// `(HH:MM, "Wednesday 7 October")` at `secs`, already in local time.
+fn clock_at(secs: i64) -> (String, String) {
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let s = secs.rem_euclid(86_400);
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
+    (
+        format!("{:02}:{:02}", s / 3600, (s % 3600) / 60),
+        format!("{weekday} {d} {}", MONTHS[(m - 1) as usize]),
+    )
 }
 
 /// Why sentences of a reply were not spoken (see [`Session::emit`]).
@@ -2884,6 +3375,16 @@ impl Drop for DeliberatorHandle {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// The model path: templates off, so a test sees what the model is
+    /// sent and says.
+    fn model_config() -> Config {
+        Config {
+            templates: false,
+            attention: false,
+            ..Config::default()
+        }
+    }
+
     use std::time::Instant;
 
     use common::{EntityHint, FakeClock};
@@ -2925,14 +3426,29 @@ mod tests {
         obs_rx: mpsc::Receiver<Observation>,
     }
 
+    /// A session on the model path: templates off, so each test sees
+    /// what the model is sent and says. `rig_with_templates` is the
+    /// template path.
     fn rig(scripts: Vec<Script>, people: Vec<ViewEntity>) -> Rig {
+        rig_with(
+            scripts,
+            people,
+            Config {
+                templates: false,
+                attention: false,
+                ..Config::default()
+            },
+        )
+    }
+
+    fn rig_with(scripts: Vec<Script>, people: Vec<ViewEntity>, config: Config) -> Rig {
         let llm = MockLlm::new(scripts);
         let commands = Arc::new(CommandQueue::new());
         let facts = Arc::new(InMemoryFacts::new());
         let clock = Arc::new(FakeClock::new());
         let session = Session::new(
             llm.clone(),
-            Config::default(),
+            config,
             room_with(people),
             facts.clone(),
             commands.clone(),
@@ -3059,7 +3575,7 @@ mod tests {
         let commands = Arc::new(CommandQueue::new());
         let mut session = Session::new(
             llm.clone(),
-            Config::default(),
+            model_config(),
             room_with(vec![person("john", true)]),
             facts,
             commands.clone(),
@@ -3356,7 +3872,7 @@ mod tests {
         let commands = Arc::new(CommandQueue::new());
         let handle = Deliberator::spawn_with(
             llm,
-            Config::default(),
+            model_config(),
             obs_rx,
             room_with(vec![person("john", true)]),
             Arc::new(InMemoryFacts::new()),
@@ -3402,7 +3918,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let mut session = Session::new(
             MockLlm::new(vec![]),
-            Config::default(),
+            model_config(),
             room_with(vec![person("john", false)]),
             Arc::new(InMemoryFacts::new()),
             commands.clone(),
@@ -3476,7 +3992,7 @@ mod tests {
         let commands = Arc::new(CommandQueue::new());
         let mut session = Session::new(
             llm.clone(),
-            Config::default(),
+            model_config(),
             room_with(vec![person("john", true)]),
             facts.clone(),
             commands.clone(),
@@ -3554,7 +4070,7 @@ mod tests {
         let commands = Arc::new(CommandQueue::new());
         let mut session = Session::new(
             llm.clone(),
-            Config::default(),
+            model_config(),
             room_with(vec![stranger]),
             Arc::new(Enrolling),
             commands.clone(),
@@ -3616,7 +4132,7 @@ mod tests {
         let commands = Arc::new(CommandQueue::new());
         let handle = Deliberator::spawn_with(
             MockLlm::new(vec![]),
-            Config::default(),
+            model_config(),
             obs_rx,
             room_with(vec![person("john", false)]),
             Arc::new(InMemoryFacts::new()),
@@ -3927,7 +4443,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(common::RealClock);
         let session = Session::new(
             llm.clone(),
-            Config::default(),
+            model_config(),
             room_with(vec![person("john", true)]),
             facts,
             commands.clone(),
@@ -3977,13 +4493,29 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    /// The loop with greetings going through the model, which is what
+    /// most of these tests look at; see `start_with` for the instant
+    /// path.
     fn start(scripts: Vec<Script>, people: Vec<ViewEntity>) -> Loop {
+        start_with(
+            scripts,
+            people,
+            Config {
+                instant_greetings: false,
+                templates: false,
+                attention: false,
+                ..Config::default()
+            },
+        )
+    }
+
+    fn start_with(scripts: Vec<Script>, people: Vec<ViewEntity>, config: Config) -> Loop {
         let llm = MockLlm::new(scripts);
         let commands = Arc::new(CommandQueue::new());
         let clock = Arc::new(FakeClock::new());
         let session = Session::new(
             llm.clone(),
-            Config::default(),
+            config,
             room_with(people),
             Arc::new(InMemoryFacts::new()),
             commands.clone(),
@@ -4774,6 +5306,26 @@ mod tests {
     // ------------------------------------------------------ own voice
 
     #[tokio::test]
+    async fn instant_greeting_speaks_the_canned_line_with_no_request() {
+        let l = start_with(
+            vec![Script::text(&["Two days, John.", " Long ones?"])],
+            vec![person("john", false)],
+            model_config(),
+        );
+        l.itx
+            .send(intent(
+                r#"{"decision":"greet","name":"John","entity":"john","goal":"greet"}"#,
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (reqs, cmds) = l.stop().await;
+        assert!(reqs.is_empty(), "a greeting cost a model request");
+        let said = says(&cmds);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("John"), "{said:?}");
+    }
+
+    #[tokio::test]
     async fn greet_is_a_model_turn_with_the_note_and_the_canned_fallback() {
         let l = start(
             vec![Script::text(&["Two days, John.", " Long ones?"])],
@@ -4971,6 +5523,32 @@ mod tests {
     /// repeat is asked again with the hint, and six hellos get six
     /// different lines.
     #[tokio::test]
+    async fn templates_answer_the_regulars_without_the_model() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        for (said, expect) in [
+            ("hello", "name"),
+            ("my name is QB", "QB. Did I get that right?"),
+            ("yes", "Nice to meet you, QB"),
+            ("I am 19", "Got it, QB"),
+            ("what do you remember about me", "QB: I am 19."),
+            ("what can you do for me?", "attendance"),
+            ("thank you", "QB"),
+        ] {
+            r.session
+                .handle_utterance(said, None, &mut r.obs_rx, CancellationToken::new())
+                .await
+                .unwrap();
+            let lines = says(&drain(&r.commands));
+            assert_eq!(lines.len(), 1, "{said}: {lines:?}");
+            assert!(lines[0].contains(expect), "{said}: {lines:?}");
+        }
+        assert!(
+            r.llm.requests().is_empty(),
+            "no model request for template turns"
+        );
+    }
+
+    #[tokio::test]
     async fn six_hellos_get_six_different_lines() {
         let canned = [
             "Hello! ",
@@ -5057,10 +5635,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // First answer spoken; the second (and its retry, the same line
-        // again) dropped: nothing generic, so no opener either.
-        assert_eq!(says(&drain(&r.commands)), ["I'm Glydi."]);
-        assert_eq!(r.llm.requests().len(), 3);
+        // The same question straight after its answer is "I didn't catch
+        // that": the answer is said again, from memory, with no second
+        // model request and no repeat filter in the way.
+        assert_eq!(says(&drain(&r.commands)), ["I'm Glydi.", "I'm Glydi."]);
+        assert_eq!(r.llm.requests().len(), 1);
     }
 
     /// Why the six hellos got the same reply: not lost history. The lines
@@ -5131,7 +5710,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let mut s = Session::new(
             MockLlm::new(vec![]),
-            Config::default(),
+            model_config(),
             room_with(vec![]),
             Arc::new(InMemoryFacts::new()),
             Arc::new(CommandQueue::new()),
@@ -5232,7 +5811,7 @@ mod tests {
         let (_tx, mut obs_rx) = mpsc::channel(1);
         let mut session = Session::new(
             llm.clone(),
-            Config::default(),
+            model_config(),
             Box::new(move || Arc::clone(&view)),
             Arc::new(InMemoryFacts::new()),
             commands,

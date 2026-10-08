@@ -74,10 +74,11 @@ fn speaking_obs(obs: &RingReceiver) -> Vec<bool> {
 }
 
 /// Drain the ring into "modality:detail" lines, skipping `audio_level`
-/// (rate-driven, so its count is not deterministic).
+/// (rate-driven, so its count is not deterministic) and `synthesised`
+/// (timing only, one per job).
 fn trace(obs: &RingReceiver) -> Vec<String> {
     std::iter::from_fn(|| obs.try_recv())
-        .filter(|o| o.modality != "audio_level")
+        .filter(|o| o.modality != "audio_level" && o.modality != "synthesised")
         .map(|o| match &o.payload {
             Payload::Bool(b) => format!("{}:{b}", o.modality),
             Payload::Text(t) => format!("{}:{t}", o.modality),

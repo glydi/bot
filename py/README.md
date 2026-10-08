@@ -32,6 +32,7 @@ Flags, for running the half you are working on:
 | `--no-camera` | no vision thread; nobody is ever visible |
 | `--no-mic` | no audio thread; it can only speak |
 | `--headless` | no window (the mind still runs) |
+| `--text` | type to it on the console; each line is an utterance, replies print as `glydi>` (quiets the log unless `--debug`) |
 | `--config FILE` | read settings from `FILE` instead of the repo's `.env` |
 | `--debug` | log every fold, not just every turn |
 
@@ -39,6 +40,18 @@ Ctrl-C stops every thread. Tests:
 
 ```sh
 py/.venv/bin/python -m pytest py/tests -q
+```
+
+### Windows
+
+The same three scripts, for PowerShell 5.1 (the venv lands in
+`py\.venv\Scripts`, so the `.sh` ones do not run):
+
+```powershell
+py\setup.ps1              # create py\.venv (Python 3.12) and install everything
+py\run.ps1 --headless     # the bot; the same flags as run.sh
+py\run.ps1 --no-camera --no-mic --text   # no webcam or mic? talk to it by typing
+py\enrol.ps1 "Kalyan"     # teach it a face
 ```
 
 ## Settings
@@ -104,7 +117,9 @@ each would cost this one the property that you can read all of it.
   time". Two people at once gets one room-wide answer.
 - **Kokoro.** `voice.py` shells out to macOS `say`, one subprocess per
   sentence. `GLYDI_TTS=kokoro` is honoured by the Rust build; here it is
-  logged and ignored.
+  logged and ignored. On Windows the subprocess is PowerShell driving
+  SAPI (`System.Speech`) instead, and `GLYDI_MAC_VOICE` names the SAPI
+  voice.
 - **The trained model.** No fine-tune, no learned thresholds, no
   outcome tracking: no `Outcomes`, no `Curiosity`, no `SelfModel`. The
   numbers in `mind.py` are constants somebody chose.

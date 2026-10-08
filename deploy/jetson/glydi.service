@@ -1,0 +1,73 @@
+# GLYDI on a Jetson: a system unit that runs the bot as the login user.
+# install-service.sh fills in __REPO__ and __USER__ and copies the result
+# to /etc/systemd/system/glydi.service; edit that copy (or this template
+# and re-run the installer), then `sudo systemctl daemon-reload`.
+#
+# System unit rather than a user unit: it must start at boot with nobody
+# logged in, survive the user's session ending, and order itself after
+# ollama.service, which is itself a system unit. User= drops the
+# privileges; SupplementaryGroups= gives it the camera and the sound card.
+
+[Unit]
+Description=GLYDI: the bot in the foyer
+Documentation=file://__REPO__/deploy/jetson/kiosk.md
+# Ollama must be listening before the first LLM turn; network-online for
+# the day the model server moves off-box. Wants= (not Requires=) so a
+# broken Ollama still lets glydi start and log why it cannot think.
+Wants=network-online.target ollama.service
+After=network-online.target ollama.service
+# No start-rate limiting: a foyer machine must keep trying forever, even
+# through a burst of crashes (a camera unplugged and replugged, say).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+SupplementaryGroups=video audio
+WorkingDirectory=__REPO__
+# The binary reads its configuration from the environment; .env is the
+# one file to edit (deploy/jetson/env.jetson is the template). Relative
+# paths in it resolve against GLYDI_ROOT.
+EnvironmentFile=__REPO__/.env
+Environment=GLYDI_ROOT=__REPO__
+# Headless: no window, the face state goes to the journal. This is the
+# default because it needs no display server and no logged-in session.
+ExecStart=__REPO__/rust/target/release/glydi run --headless
+#
+# Windowed kiosk (the egui face on the foyer screen) instead: comment the
+# line above, uncomment these, and make sure the user is auto-logged into
+# a graphical session (kiosk.md, "Auto-login"). The window needs the
+# session's display; on JetPack 6 that is X11 via GDM, so DISPLAY and
+# XAUTHORITY, not WAYLAND_DISPLAY. Or use glydi-kiosk.service, which is
+# this unit with those lines already in place.
+#ExecStart=__REPO__/rust/target/release/glydi run --no-strip
+#Environment=DISPLAY=:0
+#Environment=XAUTHORITY=/run/user/__UID__/gdm/Xauthority
+#Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+#
+# Always back, five seconds later, whatever the exit status.
+Restart=always
+RestartSec=5
+# SIGINT is what Ctrl-C sends and what the binary handles cleanly (drains
+# the speaker, ends the visit, closes the gallery). Then SIGKILL.
+KillSignal=SIGINT
+TimeoutStopSec=20
+# A little ahead of the desktop and Ollama's housekeeping: the reflex
+# thread wants its < 1 ms.
+Nice=-5
+# Memory ceiling. The board has 8 GB shared between CPU and GPU with no
+# separate VRAM; Ollama (a separate service) takes 1.2-2.2 GB, the desktop
+# ~1 GB. glydi itself sits around 1.5-2 GB with Parakeet + Kokoro + the
+# face models loaded. A cap stops a leak from taking the whole board down
+# but, being a hard limit, kills the bot instead of slowing it: set it
+# only once you have watched `systemctl status glydi` for a week and know
+# the number. See kiosk.md, "Memory budget".
+#MemoryMax=3G
+# Journal gets stdout/stderr; `journalctl -u glydi -f` to follow.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=glydi
+
+[Install]
+WantedBy=multi-user.target

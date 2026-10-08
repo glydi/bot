@@ -1389,7 +1389,7 @@ def build(target: int, seed: int, teacher: Path | None, max_tokens: int = 1500):
     out = HERE / "data"
     out.mkdir(exist_ok=True)
     for name, rows in (("train", train), ("valid", valid)):
-        with (out / f"{name}.jsonl").open("w") as f:
+        with (out / f"{name}.jsonl").open("w", encoding="utf-8") as f:
             for ex in rows:
                 row = {"messages": ex["messages"]}
                 if "tools" in ex:
@@ -1402,7 +1402,7 @@ def build(target: int, seed: int, teacher: Path | None, max_tokens: int = 1500):
              "groups": {k: f"{v} ({v * 100 // total}%)" for k, v in groups.items()},
              "kinds": dict(sorted(kinds.items())), "rejected_by_gate": dict(g.rejected),
              "generated_before_dedupe": len(g.out)}
-    (out / "stats.json").write_text(json.dumps(stats, indent=2))
+    (out / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     print(json.dumps(stats, indent=2))
 
 

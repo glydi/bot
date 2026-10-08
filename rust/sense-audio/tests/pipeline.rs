@@ -145,7 +145,7 @@ fn silero_model() -> Option<std::path::PathBuf> {
         );
         return None;
     }
-    let ort = AudioConfig::default().ort_lib;
+    let ort = common::ort_lib();
     if !ort.is_file() {
         eprintln!("skipping: onnxruntime not present at {}", ort.display());
         return None;
@@ -172,6 +172,7 @@ fn silero_ignores_a_tone_and_hears_speech() {
     };
     let mut cfg = AudioConfig::default().without_models();
     cfg.vad_model = Some(model.clone());
+    cfg.ort_lib = common::ort_lib();
 
     // Frame-level probabilities first, so a failure says how close it was.
     let mut vad = SileroVad::open(&model, &cfg.ort_lib).unwrap_or_else(|e| panic!("{e}"));

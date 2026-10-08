@@ -85,6 +85,40 @@ tccutil reset Camera com.glydi.bot; tccutil reset Microphone com.glydi.bot
 `glydi people` lists who it knows; `glydi people --forget NAME` removes
 someone.
 
+- **Jetson / Linux camera.** On Linux (Jetson Orin Nano on JetPack 6 /
+  Ubuntu 22.04 included) the camera is a V4L2 device and a USB UVC camera
+  (e-con See3CAM_CU27, Arducam IMX462 USB3, any webcam) works out of the
+  box: the bot asks for MJPEG at 1280x720@15 and falls back to YUYV.
+  `v4l2-ctl --list-formats-ext -d /dev/video0` (package `v4l-utils`) shows
+  the modes a camera offers; `GLYDI_CAMERA_INDEX=N` picks `/dev/videoN`
+  (a UVC camera also registers a metadata node, usually the next index,
+  which `glydi check` leaves out). The process needs the device node:
+  `sudo usermod -aG video $USER`, then log out and in. CSI cameras on the
+  Jetson's ribbon connector need a GStreamer/Argus source that does not
+  exist yet.
+
+No webcam or microphone? `cargo run -p glydi -- run --headless --no-camera
+--no-mic --text` talks over the console: each typed line is an utterance
+and replies print as `glydi> ...`.
+
+Windows: build the same way, then `rust\run.ps1 --headless --no-camera
+--no-mic --text` (PowerShell 5.1). It loads `.env` into the process
+(the binary reads only the environment) and runs `target\release\glydi.exe`.
+
+## Jetson
+
+Jetson Orin Nano 8 GB (JetPack 6.x, Ubuntu 22.04, aarch64) as a foyer
+kiosk: `deploy/jetson/install.sh` does the whole of sections 1-5 for Linux
+(apt, rustup, ONNX Runtime 1.28.2 CPU build from the microsoft release
+tarball, Ollama with `qwen2.5:1.5b` as the 8 GB-safe default, the models,
+the release build, `glydi check`). `deploy/jetson/env.jetson` is the
+`.env` template (`parakeet` + `kokoro`, espeak paths for aarch64);
+`deploy/jetson/install-service.sh` installs the systemd unit (headless,
+or `--kiosk` for the window); `deploy/jetson/kiosk.md` is the runbook
+(auto-login, clocks, memory budget, troubleshooting, what is not done:
+the GPU EP for ORT, CSI cameras). `.github/workflows/rust.yml` type-checks
+the aarch64 build on every push.
+
 ## 6. Build and run the Python one
 
 ```sh
@@ -93,6 +127,9 @@ py/run.sh            # the bot, with a window
 py/run.sh --headless --no-camera     # any subset of the senses
 py/enrol.sh "Ada"    # teach it a face on purpose, eight shots
 ```
+
+On Windows the same three exist as `py\setup.ps1`, `py\run.ps1` and
+`py\enrol.ps1`, with the same flags (PowerShell 5.1 is enough).
 
 It reads the same `data/people.db` and the same `models/`, so the two
 builds can take turns. It has no echo canceller (it is deaf while it
@@ -122,6 +159,8 @@ py/.venv/bin/python -m pytest py/tests -q -m live
 | what you see | why |
 | --- | --- |
 | black camera frames | the app was not granted Camera, or you ran it from the terminal |
+| `camera: cannot open /dev/video0: permission denied` (Linux) | the user is not in the `video` group |
+| `VIDIOC_STREAMON: No space left on device` (Linux) | USB bandwidth: another camera or a YUYV mode on the same controller; prefer MJPEG, or move one device to another port |
 | starts, never speaks | espeak-ng missing (Kokoro cannot phonemise) |
 | `libonnxruntime` not found | set `ORT_DYLIB_PATH` |
 | every face is a stranger | the gallery's samples are poor — `py/enrol.sh "Name"`, and read the `no match candidates=...` line in the log for the actual scores |
@@ -145,3 +184,36 @@ data/            people.db, launch.log (gitignored)
 ALGORITHM.md     the whole loop in one page
 STACK.txt        every model, size and source
 ```
+
+## The voice on the GPU (Windows, NVIDIA)
+
+Kokoro on the CPU needs 440-1070 ms to start a reply; on CUDA the same
+chunk takes 130-320 ms, which is what keeps a whole turn under a second.
+The runtime is not in git. Fill `models/onnxruntime-cuda/` from the pip
+wheels (about 1.8 GB), then point `.env` at it:
+
+```powershell
+python -m venv $env:TEMP\ortgpu
+& $env:TEMP\ortgpu\Scripts\pip install onnxruntime-gpu "nvidia-cuda-runtime>=13,<14" "nvidia-cublas>=13,<14" "nvidia-cufft>=12" nvidia-curand "nvidia-cuda-nvrtc>=13,<14" nvidia-cudnn-cu13 "nvidia-nvjitlink>=13,<14"
+$sp = "$env:TEMP\ortgpu\Lib\site-packages"
+New-Item -ItemType Directory -Force models\onnxruntime-cuda
+Copy-Item "$sp\onnxruntime\capi\onnxruntime*.dll" models\onnxruntime-cuda
+Copy-Item "$sp\nvidia\cu13\bin\x86_64\*.dll" models\onnxruntime-cuda
+Copy-Item "$sp\nvidia\cudnn\bin\*.dll" models\onnxruntime-cuda
+```
+
+```
+ORT_DYLIB_PATH=C:\path\to\bot\models\onnxruntime-cuda\onnxruntime.dll
+GLYDI_TTS_GPU=1
+```
+
+The onnxruntime-gpu wheel decides the CUDA major it wants (1.30 wants
+CUDA 13: `cudart64_13.dll`, `cublas64_13.dll`); if the start-up log says
+a `*_13.dll` was not loaded, the wheels and the runtime disagree. The
+senses keep running on the CPU provider of the same library unless
+`GLYDI_STT_GPU=1` (Parakeet's encoder) and `GLYDI_VISION_GPU=1` (the face
+and object models) say otherwise; `GLYDI_TRT=1` puts TensorRT in front of
+CUDA for all of them, which is the Jetson setting (`rust/accel` is the one
+place the choice is made). DirectML was tried and cannot run
+Kokoro: it rejects the depthwise `ConvTranspose` with output padding the
+model uses.

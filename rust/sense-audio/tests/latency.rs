@@ -96,20 +96,51 @@ fn run(cfg: &AudioConfig, name: &str, samples: &[f32]) -> (f64, f64, u64) {
 
 #[test]
 fn speech_end_to_utterance() {
-    let Some(cfg) = config_with_models() else {
+    let Some(mut cfg) = config_with_models() else {
         return;
     };
+    // `GLYDI_LATENCY_HANGOVER_FRAMES` tries another silence hangover (32 ms
+    // frames); the default is the pipeline's.
+    if let Some(frames) = std::env::var("GLYDI_LATENCY_HANGOVER_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        cfg.vad.hangover_frames = frames;
+    }
     let full = clip("complete.wav");
     let one_second = full[..16_000].to_vec();
-    let hangover_ms = 480.0;
+    let hangover_ms = cfg.vad.hangover_frames as f64 * 32.0;
+    eprintln!(
+        "hangover: {} frames = {hangover_ms:.0} ms",
+        cfg.vad.hangover_frames
+    );
 
     // Components first, so a regression in the total can be placed.
-    let (Some(wm), Some(em), Some(tm)) = (&cfg.whisper_model, &cfg.voiceid_model, &cfg.turn_model)
-    else {
+    let (Some(wm), Some(tm)) = (&cfg.whisper_model, &cfg.turn_model) else {
         return;
     };
-    let mut w = Whisper::open(wm, cfg.whisper_threads).unwrap_or_else(|e| panic!("{e}"));
-    w.warm_up().unwrap_or_else(|e| panic!("{e}"));
+    // Parakeet when its model is on disk (what the bot ships with on
+    // Linux and Windows; `GLYDI_STT_GPU=1` puts its encoder on CUDA),
+    // unless `GLYDI_STT=whisper` asks for whisper. whisper.cpp has no GPU
+    // path off macOS and takes seconds per clip on a Windows CPU, which
+    // is a measurement of the wrong thing.
+    let parakeet_here = cfg.parakeet_model.as_ref().is_some_and(|d| d.is_dir());
+    let want_whisper =
+        std::env::var("GLYDI_STT").is_ok_and(|s| s.trim().eq_ignore_ascii_case("whisper"));
+    if parakeet_here && !want_whisper {
+        cfg.stt = sense_audio::SttKind::Parakeet;
+    }
+    let mut w: Box<dyn Transcriber> = if cfg.stt == sense_audio::SttKind::Parakeet {
+        let dir = cfg.parakeet_model.clone().unwrap_or_default();
+        let mut p = sense_audio::parakeet::Parakeet::open(&dir, &cfg.ort_lib, cfg.whisper_threads)
+            .unwrap_or_else(|e| panic!("{e}"));
+        p.warm_up().unwrap_or_else(|e| panic!("{e}"));
+        Box::new(p)
+    } else {
+        let mut w = Whisper::open(wm, cfg.whisper_threads).unwrap_or_else(|e| panic!("{e}"));
+        w.warm_up().unwrap_or_else(|e| panic!("{e}"));
+        Box::new(w)
+    };
     let tone: Vec<f32> = (0..16_000)
         .map(|i| 0.3 * (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0).sin())
         .collect();
@@ -122,15 +153,18 @@ fn speech_end_to_utterance() {
         let t = Instant::now();
         let text = w.transcribe(s).unwrap_or_else(|e| panic!("{e}"));
         eprintln!(
-            "whisper {name}: {:.0} ms -> {text:?}",
+            "{:?} {name}: {:.0} ms -> {text:?}",
+            cfg.stt,
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    let mut e = Encoder::open(em, &cfg.ort_lib).unwrap_or_else(|e| panic!("{e}"));
-    e.embed(&full).unwrap_or_else(|e| panic!("{e}"));
-    let t = Instant::now();
-    e.embed(&full).unwrap_or_else(|e| panic!("{e}"));
-    eprintln!("ecapa 3.0 s: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    if let Some(em) = &cfg.voiceid_model {
+        let mut e = Encoder::open(em, &cfg.ort_lib).unwrap_or_else(|e| panic!("{e}"));
+        e.embed(&full).unwrap_or_else(|e| panic!("{e}"));
+        let t = Instant::now();
+        e.embed(&full).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("ecapa 3.0 s: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
     let mut j = SmartTurn::open(tm, &cfg.ort_lib).unwrap_or_else(|e| panic!("{e}"));
     j.warm_up().unwrap_or_else(|e| panic!("{e}"));
     let t = Instant::now();
@@ -139,7 +173,7 @@ fn speech_end_to_utterance() {
         "smart-turn 3.0 s: {:.0} ms",
         t.elapsed().as_secs_f64() * 1e3
     );
-    drop((w, e, j));
+    drop((w, j));
 
     let mut sequential = cfg.clone();
     sequential.speculate_after_frames = 0;

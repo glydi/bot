@@ -191,6 +191,20 @@ impl CpalOutput {
         })
     }
 
+    /// The rate the device actually runs at, which is the source rate when
+    /// it would accept it and something else (44.1 or 48 kHz) when it would
+    /// not. For logs and for `tests/synth_timing.rs`, which reports the
+    /// output path's share of time-to-first-audio.
+    pub fn device_rate(&self) -> u32 {
+        self.device_rate
+    }
+
+    /// Channels the device stream carries; every one of them gets the same
+    /// mono sample.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
     /// Convert `pcm` from the source rate to the device rate, linear.
     fn resample(&mut self, pcm: &[i16]) -> Vec<i16> {
         if self.device_rate == self.source_rate {
@@ -255,7 +269,6 @@ impl Output for CpalOutput {
                 }
             }
         }
-        let _ = self.channels;
     }
 
     fn clear(&mut self) {

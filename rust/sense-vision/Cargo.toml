@@ -23,6 +23,7 @@ smol_str = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ort = { workspace = true, features = ["half"] }
+accel = { workspace = true }
 half = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
 
@@ -34,6 +35,9 @@ objc2-core-media = { workspace = true }
 objc2-core-video = { workspace = true }
 dispatch2 = { workspace = true }
 block2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

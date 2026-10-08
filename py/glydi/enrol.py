@@ -56,18 +56,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Import the camera late: it is the slow, permission-bound part.
-    import cv2
-
-    from .senses.vision import VisionSense
+    from .senses.vision import VisionSense, open_capture
 
     # The sense knows how to open the camera and the detector; borrow
     # both rather than keeping a second copy of that knowledge here.
     sense = VisionSense.__new__(VisionSense)
     detector = sense.open_detector()
-    cam = cv2.VideoCapture(config.camera_index, cv2.CAP_AVFOUNDATION)
-    if not cam.isOpened():
-        log.error("no camera. On macOS, grant the terminal camera access in "
-                  "System Settings > Privacy & Security > Camera.")
+    try:
+        cam = open_capture(config.camera_index)
+    except RuntimeError as exc:
+        log.error("no camera: %s", exc)
         return 1
     log.info("look at the camera -- taking %d shots", args.shots)
     kept: list = []

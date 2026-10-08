@@ -74,6 +74,7 @@ fn scrfd_matches_the_python_reference_on_the_sample_face() {
         cfg.det_size,
         cfg.score_threshold,
         cfg.nms_threshold,
+        cfg.intra_threads,
     )
     .unwrap_or_else(|e| panic!("open scrfd: {e}"));
     let faces = det.detect(&img).unwrap_or_else(|e| panic!("detect: {e}"));
@@ -113,9 +114,10 @@ fn arcface_matches_the_python_reference_and_is_stable() {
         cfg.det_size,
         cfg.score_threshold,
         cfg.nms_threshold,
+        cfg.intra_threads,
     )
     .unwrap_or_else(|e| panic!("open scrfd: {e}"));
-    let mut rec = ArcFace::open(&cfg.recogniser_path(), &cfg.ort_lib)
+    let mut rec = ArcFace::open(&cfg.recogniser_path(), &cfg.ort_lib, cfg.intra_threads)
         .unwrap_or_else(|e| panic!("open arcface: {e}"));
     let faces = det.detect(&img).unwrap_or_else(|e| panic!("detect: {e}"));
     let crop = norm_crop(&img, &faces[0].landmarks, CROP_SIZE);

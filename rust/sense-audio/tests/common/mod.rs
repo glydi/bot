@@ -18,18 +18,40 @@ pub fn repo_root() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// The runtime the tests load: `ORT_DYLIB_PATH` when set (which is what
+/// `onnx::init` would use anyway), else the platform default, resolved
+/// against the repo root when it is relative. The Windows default is
+/// `models/onnxruntime/onnxruntime.dll` relative to the root, and a test's
+/// working directory is the crate, not the root; the macOS default is
+/// absolute and never noticed.
+pub fn ort_lib() -> PathBuf {
+    if let Some(p) = std::env::var_os("ORT_DYLIB_PATH") {
+        return PathBuf::from(p);
+    }
+    let default = PathBuf::from(sense_audio::onnx::DEFAULT_ORT_LIBRARY);
+    if default.is_relative() {
+        repo_root().join(default)
+    } else {
+        default
+    }
+}
+
 /// Config pointing at the repo's model files, or `None` (with a note) if
 /// any is missing so the test can bail out rather than fail.
 pub fn config_with_models() -> Option<AudioConfig> {
-    let cfg = AudioConfig::with_models_dir(repo_root().join("models"));
-    for p in [&cfg.turn_model, &cfg.whisper_model, &cfg.voiceid_model]
-        .into_iter()
-        .flatten()
-    {
+    let mut cfg = AudioConfig::with_models_dir(repo_root().join("models"));
+    cfg.ort_lib = ort_lib();
+    for p in [&cfg.turn_model, &cfg.whisper_model].into_iter().flatten() {
         if !p.is_file() {
             eprintln!("skipping: model not present at {}", p.display());
             return None;
         }
+    }
+    // Speaker-id is the one model the fetch script cannot download; the
+    // pipeline runs without it, so the tests do too.
+    if cfg.voiceid_model.as_ref().is_some_and(|p| !p.is_file()) {
+        eprintln!("note: no voice-id model; running without speaker-id");
+        cfg.voiceid_model = None;
     }
     if !cfg.ort_lib.is_file() {
         eprintln!(

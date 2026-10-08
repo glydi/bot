@@ -27,16 +27,22 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod cache;
+pub mod claude;
 pub mod condense;
 pub mod deliberator;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod prompt;
+pub mod school_link;
 pub mod sentence;
+pub mod templates;
 pub mod tools;
 pub mod voice;
 
 pub use backend::{ChatBackend, ChatEvent, ChatRequest, EventStream, LlmError, OpenAiBackend};
+pub use cache::{AnswerCache, Verdict};
+pub use claude::{ClaudeBackend, Effort, Fallback};
 pub use deliberator::{
     Config, Deliberator, DeliberatorHandle, INTENT_KIND, INTENT_SAY_GAP, INTENT_TARGET,
     MAX_TOOL_ROUNDS, SET_NAME_KIND, SET_NAME_TARGET, Session, Snapshot, TurnEnd,
@@ -45,7 +51,11 @@ pub use prompt::{
     Conversation, EARLIER, EXAMPLES, LOCAL_SYSTEM_PROMPT, MARKER, MAX_HISTORY, Message, Role,
     SYSTEM_PROMPT, TRIM_SLACK, ToolCall,
 };
+pub use school_link::{NoSchool, SchoolLink, SharedSchool};
 pub use sentence::{SentenceSplitter, ends_sentence};
+pub use templates::{
+    Action, Context as TemplateContext, Reply as TemplateReply, respond as template,
+};
 pub use tools::{
     FactSource, InMemoryFacts, ToolSpec, Tools, full_tool_specs, memory_tool_specs, tool_specs,
 };

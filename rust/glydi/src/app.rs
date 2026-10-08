@@ -16,6 +16,7 @@
 //! error out of [`App::build`]: the Python worker fell back to voice-only
 //! when the camera failed and the bot kept talking, and this keeps that.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -43,6 +44,7 @@ use smol_str::SmolStr;
 
 use crate::config::{Config, Tts};
 use crate::tee::{self, Recorder, TeeHandle};
+use crate::text::{TextSense, TextSenseHandle};
 
 /// Observations the ring holds before the oldest is evicted. Audio levels
 /// arrive at ~10 Hz per source and faces at 10 Hz per track, so 256 is
@@ -101,6 +103,10 @@ pub struct Parts {
     pub no_camera: bool,
     /// Skip the microphone (and the mock source, if any).
     pub no_mic: bool,
+    /// Read lines typed on the console as utterances (`text.rs`) and echo
+    /// every reply there as `glydi> ...`. How a machine with no microphone
+    /// gets a conversation.
+    pub text: bool,
     /// Play nothing: the speaker synthesises and discards at real-time
     /// speed, keeping the `self_speaking` timing honest.
     pub silent: bool,
@@ -156,6 +162,7 @@ pub struct App {
     #[cfg(feature = "vision")]
     vision: Option<DeferredVision>,
     audio: Option<AudioSenseHandle>,
+    text: Option<TextSenseHandle>,
     speaker: Option<SpeakerHandle>,
     bridges: Vec<JoinHandle<()>>,
     router: Option<RouterHandle>,
@@ -169,6 +176,15 @@ pub struct App {
     commitments: Option<(crossbeam_channel::Sender<()>, JoinHandle<()>)>,
     /// What reached the `ui` route, headless runs only (tests read it).
     ui_tap: Option<UiTap>,
+}
+
+/// The answer cache that goes with the gallery at `db`: the same
+/// directory, `<stem>.answers.json`.
+pub fn answer_cache_path(db: &std::path::Path) -> PathBuf {
+    let stem = db
+        .file_stem()
+        .map_or_else(|| "glydi".to_owned(), |s| s.to_string_lossy().into_owned());
+    db.with_file_name(format!("{stem}.answers.json"))
 }
 
 impl App {
@@ -244,7 +260,18 @@ impl App {
             "gallery open"
         );
 
-        let (chat, extractor) = backends(config, parts.backend.take());
+        // -- health -----------------------------------------------------
+        // First: the mind's fallback and the screen read it.
+        let health = crate::health::Health::spawn(crate::health::Hosts {
+            cloud: std::env::var(deliberate::claude::API_KEY_ENV)
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+                .and_then(|_| crate::health::host_port(deliberate::claude::DEFAULT_BASE_URL)),
+            erp: std::env::var("GLYDI_ERP_URL")
+                .ok()
+                .and_then(|u| crate::health::host_port(&u)),
+        });
+        let (chat, extractor) = backends(config, parts.backend.take(), Some(&health));
         let (tap_tx, tap_rx) = crossbeam_channel::bounded::<Event>(EVENT_TAP_CAPACITY);
         let worker = MemoryWorker::new(Arc::clone(&store), extractor, session_id.as_str())
             .context("starting memory worker")?;
@@ -294,12 +321,23 @@ impl App {
             Err(e) => tracing::warn!(error = %e, "could not list people"),
         }
 
+        // -- school -----------------------------------------------------
+        // Before the mind and the window: both read it.
+        let school = crate::school::SchoolService::from_env(&config.root);
+
         // -- deliberate -------------------------------------------------
         let deliberator = match chat {
             Some(backend) => {
                 let view = reflex.view();
                 let snapshot: deliberate::Snapshot = Box::new(move || view.load_full());
                 let cfg = deliberate::Config {
+                    school: school.clone().map(|s| s as deliberate::SharedSchool),
+                    // Beside the gallery, named after it (`glydi.db` ->
+                    // `glydi.answers.json`): a test's or a simulation's
+                    // throwaway gallery gets a throwaway cache, so a
+                    // scripted answer never serves the real door, and the
+                    // real cache never skips a test's model turn.
+                    answer_cache: Some(answer_cache_path(&db)),
                     base_url: config.local_llm_url.clone(),
                     model: config.local_model.clone(),
                     max_tokens: config.max_tokens,
@@ -363,7 +401,8 @@ impl App {
         let (speaker_cmd_tx, speaker_cmd_rx) = crossbeam_channel::unbounded();
         bridges.push(spawn_named("glydi-speaker-bridge", {
             let tl = Arc::clone(&timeline);
-            move || speaker_bridge(&speaker_rx, &speaker_cmd_tx, &last_reply, &tl)
+            let echo = parts.text;
+            move || speaker_bridge(&speaker_rx, &speaker_cmd_tx, &last_reply, &tl, echo)
         })?);
         bridges.push(spawn_named("glydi-intent-bridge", {
             let intents = deliberator.as_ref().map(DeliberatorHandle::intent_sender);
@@ -392,7 +431,10 @@ impl App {
         // loop. Everything below is either instant or deferred to a helper
         // thread, so a microphone stuck behind the permission prompt no
         // longer stands between the person and the window.
-        let sources = ui_sources(&reflex, &timeline, Arc::clone(&store), epoch);
+        let mut sources = ui_sources(&reflex, &timeline, Arc::clone(&store), epoch);
+        if let Some(school) = school.clone() {
+            sources.school = Box::new(move || Some(school.view()));
+        }
         let mut ui_tap = None;
         let (ui, headless) = if parts.headless {
             // Through a tap, so a test can see what the face was told
@@ -439,6 +481,22 @@ impl App {
             speaker.as_ref().map(act_speaker::SpeakerHandle::far_end),
         );
 
+        // -- text -------------------------------------------------------
+        // The console as a sense, beside the microphone rather than
+        // instead of it: both publish into the same ring and the mind
+        // sees one stream of utterances.
+        let text = if parts.text {
+            match TextSense::spawn(obs_tx.clone(), Arc::clone(&clock)) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "console reader not started; typing is off");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // -- vision -----------------------------------------------------
         #[cfg(feature = "vision")]
         let vision = spawn_vision(
@@ -461,6 +519,7 @@ impl App {
             #[cfg(feature = "vision")]
             vision,
             audio,
+            text,
             speaker,
             bridges,
             router: Some(router),
@@ -590,6 +649,12 @@ impl App {
         if let Some(mut a) = self.audio.take() {
             join_timeout("audio", move || a.stop(), JOIN_TIMEOUT);
         }
+        // Only a flag: the reader is blocked in `stdin` and cannot be
+        // joined (see `text::TextSenseHandle`). It is detached and dies
+        // with the process.
+        if let Some(mut t) = self.text.take() {
+            t.stop();
+        }
         if let Some(mut s) = self.speaker.take() {
             join_timeout("speaker", move || s.stop(), JOIN_TIMEOUT);
         }
@@ -661,6 +726,7 @@ impl App {
 fn backends(
     config: &Config,
     injected: Option<Arc<dyn ChatBackend>>,
+    health: Option<&Arc<crate::health::Health>>,
 ) -> (Option<Arc<dyn ChatBackend>>, Arc<dyn ChatBackend>) {
     if let Some(b) = injected {
         return (Some(Arc::clone(&b)), b);
@@ -704,11 +770,65 @@ fn backends(
             }
         }
     };
-    let chat = open(&config.local_model);
-    let extractor = if config.memory_model == config.local_model {
-        chat.clone()
+    let local_chat = open(&config.local_model);
+    let local_extractor = if config.memory_model == config.local_model {
+        local_chat.clone()
     } else {
         open(&config.memory_model)
+    };
+
+    // The cloud mind, when there is a key: it answers, and the local
+    // model (if any) takes over when it cannot be reached. Fact
+    // extraction goes to the small cloud model unless `GLYDI_MEMORY_MODEL`
+    // names a Claude model itself.
+    let cloud = |model: &str| -> Option<Arc<dyn ChatBackend>> {
+        match deliberate::ClaudeBackend::from_env(model, config.llm_timeout)? {
+            Ok(b) => {
+                tracing::info!(model = b.model(), "cloud mind");
+                Some(Arc::new(b))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cloud client not built");
+                None
+            }
+        }
+    };
+    let online = health.map(|h| Arc::clone(h.online_flag()));
+    let behind = |cloud: Arc<dyn ChatBackend>, local: Option<Arc<dyn ChatBackend>>| {
+        local.map_or_else(
+            || Arc::clone(&cloud),
+            |l| {
+                let mut f = deliberate::Fallback::new(cloud.clone(), l);
+                if let Some(g) = &online {
+                    f = f.gated(Arc::clone(g));
+                }
+                Arc::new(f) as Arc<dyn ChatBackend>
+            },
+        )
+    };
+    let (chat, extractor) = match cloud(deliberate::claude::DEFAULT_MODEL) {
+        Some(c) => {
+            let memory_model = if config.memory_model.starts_with("claude-") {
+                config.memory_model.clone()
+            } else {
+                deliberate::claude::DEFAULT_MEMORY_MODEL.to_owned()
+            };
+            let extractor = std::env::var(deliberate::claude::API_KEY_ENV)
+                .ok()
+                .and_then(|key| {
+                    deliberate::ClaudeBackend::new(
+                        key.trim(),
+                        &memory_model,
+                        deliberate::Effort::Low,
+                        config.llm_timeout,
+                    )
+                    .ok()
+                })
+                .map(|b| Arc::new(b) as Arc<dyn ChatBackend>)
+                .map(|b| behind(b, local_extractor.clone()));
+            (Some(behind(c, local_chat)), extractor.or(local_extractor))
+        }
+        None => (local_chat, local_extractor),
     };
     let extractor = extractor.unwrap_or_else(|| Arc::new(NoLlm));
     (chat, extractor)
@@ -728,13 +848,20 @@ impl ChatBackend for NoLlm {
 /// Forward speaker commands, telling the memory worker what the bot said
 /// so the next fact extraction reads the exchange, not a monologue. When
 /// there is no speaker the reply is logged instead, which is what a
-/// headless run without `ttsd` shows.
+/// headless run without `ttsd` shows. With `echo` (`--text`) each `say` is
+/// also printed as `glydi> ...` on the console the person is typing on,
+/// so the conversation reads back where it was had.
 fn speaker_bridge(
     from: &Receiver<Command>,
     to: &crossbeam_channel::Sender<Command>,
     last_reply: &Mutex<String>,
     timeline: &common::TurnTimeline,
+    echo: bool,
 ) {
+    // The prompt is re-armed under each reply only when someone is at a
+    // terminal; a piped transcript gets the replies alone. Decided once:
+    // the answer does not change during a run.
+    let prompt = echo && std::io::stdin().is_terminal();
     for c in from {
         timeline.command(&c);
         // The transcript's other half: what was heard is logged by the
@@ -749,6 +876,9 @@ fn speaker_bridge(
             && let Some(text) = c.payload.as_text()
         {
             text.clone_into(&mut last_reply.lock());
+            if echo {
+                crate::text::echo_reply(text, prompt);
+            }
         }
         if to.send(c).is_err() {
             break;
@@ -1036,7 +1166,19 @@ fn spawn_speaker(
         Tts::Kokoro => Backend::Kokoro {
             model_dir: None,
             voice: config.kokoro_voice.clone(),
-            speed: 1.0,
+            // `GLYDI_KOKORO_SPEED`, 0.5..2.0; a touch under 1 reads as
+            // talking rather than reading.
+            speed: std::env::var("GLYDI_KOKORO_SPEED")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .map_or(0.95, |v| v.clamp(0.5, 2.0)),
+            // The same runtime the senses load, resolved against the
+            // repository root by the config. Left to its own default the
+            // synth would search by name, and on Windows that finds the
+            // OS's WinML `onnxruntime.dll` (1.17), which `ort` was not
+            // built against: it synthesises, then aborts the process on
+            // exit.
+            ort_dylib: Some(config.ort_lib.clone()),
         },
     };
     let cfg = SpeakerConfig {
@@ -1058,7 +1200,9 @@ fn spawn_speaker(
             // A voice that cannot start (Kokoro not compiled in, its model
             // files missing) falls back to the system voice rather than
             // leaving the bot mute: a plainer voice beats a silent one, and
-            // the config choice is reported so it can be fixed.
+            // the config choice is reported so it can be fixed. Only on
+            // macOS: elsewhere there is no system voice to fall back to,
+            // and the original error is the one worth reading.
             match Speaker::spawn(
                 &cfg,
                 commands.clone(),
@@ -1066,7 +1210,7 @@ fn spawn_speaker(
                 self_speaking.clone(),
                 clock.clone(),
             ) {
-                Err(e) if tts != Tts::Mac => {
+                Err(e) if tts != Tts::Mac && cfg!(target_os = "macos") => {
                     tracing::warn!(error = %e, ?tts, "configured voice unavailable; using the macOS voice");
                     let mac = SpeakerConfig {
                         backend: Backend::Mac(MacConfig {
@@ -1117,6 +1261,7 @@ fn spawn_audio(
         return None;
     }
     let mut cfg = AudioConfig::with_models_dir(&config.models_dir);
+    apply_hangover(&mut cfg);
     // Echo cancellation: the speaker's far-end blocks let the mic stay
     // open while the bot talks. The two crates keep their own block
     // types (sense-audio must not depend on act-speaker), mapped here.
@@ -1349,6 +1494,43 @@ fn spawn_vision(
 /// How often the panel's "gallery: N known" row re-reads the store. The
 /// panel asks once per frame; a `SELECT COUNT` at 60 Hz would be silly.
 const KNOWN_COUNT_REFRESH: Duration = Duration::from_secs(2);
+
+/// How long a pause must be before the turn is judged over
+/// (`GLYDI_HANGOVER_MS`, in 32 ms frames). The default is the pipeline's
+/// 480 ms; the smart-turn judge holds a turn open when the sentence is
+/// plainly unfinished, which is what makes a shorter hangover safe. 640
+/// of the ~680 ms a reply used to wait after the last word was this (see
+/// `sense_audio::pipeline`), so it is the first knob for a faster
+/// reaction. Not below 96 ms: under that the VAD's own gaps between words
+/// end turns.
+fn apply_hangover(cfg: &mut AudioConfig) {
+    // `GLYDI_SPEECH_THRESHOLD`: how sure the detector must be that a
+    // frame is speech before a turn starts (Silero, 0.1..0.95, default
+    // 0.5). A foyer with a television or people talking across the room
+    // wants it higher; it is the first thing to raise when the bot
+    // answers conversations it was not part of.
+    if let Some(p) = std::env::var("GLYDI_SPEECH_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+    {
+        cfg.vad.speech_threshold = p.clamp(0.1, 0.95);
+        tracing::info!(
+            threshold = cfg.vad.speech_threshold,
+            "speech threshold from GLYDI_SPEECH_THRESHOLD"
+        );
+    }
+    if let Some(ms) = std::env::var("GLYDI_HANGOVER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        cfg.vad.hangover_frames = (ms / 32).max(3) as usize;
+        tracing::info!(
+            ms,
+            frames = cfg.vad.hangover_frames,
+            "vad hangover from GLYDI_HANGOVER_MS"
+        );
+    }
+}
 
 /// The debug panel's readers, over the reflex's lock-free snapshots and,
 /// throttled, the store.

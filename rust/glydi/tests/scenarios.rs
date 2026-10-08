@@ -295,6 +295,7 @@ fn stranger_is_asked_for_name_then_remembered() {
             .with_payload(Payload::Bool(true)),
     );
     rig.utterance(track.clone(), "I'm Ada");
+    confirm_name(&rig, track.clone());
 
     assert!(
         wait_for(Duration::from_secs(3), || {
@@ -326,6 +327,19 @@ fn stranger_is_asked_for_name_then_remembered() {
     );
 }
 
+/// A name is never taken on the first hearing: the templates read it
+/// back ("Ada. Did I get that right?") and a yes enrols it, without the
+/// model. Wait for the question, then answer it.
+fn confirm_name(rig: &Rig, track: EntityHint) {
+    assert!(
+        wait_for(Duration::from_secs(3), || rig
+            .said_containing("get that right")),
+        "the name was not read back; spoken = {:?}",
+        rig.spoken()
+    );
+    rig.utterance(track, "yes");
+}
+
 fn onehot(i: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; FACE_DIM];
     v[i] = 1.0;
@@ -350,6 +364,7 @@ fn introduction_names_the_stranger_track() {
             .with_payload(Payload::Bool(true)),
     );
     rig.utterance(track.clone(), "I'm Ada");
+    confirm_name(&rig, track.clone());
 
     assert!(
         wait_for(Duration::from_secs(4), || {
@@ -513,8 +528,10 @@ fn leave_and_return_is_remembered() {
             .all(|w| it.any(|t| t == w)),
         "{tags:?}"
     );
-    // One utterance, one model turn; the question itself was not a turn.
-    assert_eq!(rig.llm.requests().len(), 1);
+    // "I'm working on ..." is a fact the templates take without the
+    // model, and the question on his return is the planner's: no model
+    // turn at all.
+    assert_eq!(rig.llm.requests().len(), 0);
     rig.finish();
     assert!(
         started.elapsed() < Duration::from_secs(8),

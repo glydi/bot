@@ -79,6 +79,16 @@ fn barge_in_stop() {
     r.world_mut().set_bot_speaking(false);
     r.on_observation(&voice(clock.at_secs(4.0), None, true));
     assert!(r.tick(clock.at_secs(4.5)).is_empty());
+
+    // A line typed on the console while the bot talks stops it at once:
+    // there is no voice to sustain. A microphone transcript does not (it
+    // could be our own echo; its voice edges already did the job).
+    r.world_mut().set_bot_speaking(true);
+    let typed = common::Observation::new("text", "utterance", clock.at_secs(5.0))
+        .with_payload(common::Payload::Text("wait".to_owned()));
+    assert!(kinds(&r.on_observation(&typed)).contains(&"speaker/stop".to_owned()));
+    let heard = utterance(clock.at_secs(5.5), "john", "wait");
+    assert!(!kinds(&r.on_observation(&heard)).contains(&"speaker/stop".to_owned()));
 }
 
 /// One second of the conversation: a voiced frame (keeps the run alive,

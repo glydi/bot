@@ -1,7 +1,8 @@
 """The mouth: one thread, one `say` at a time, interruptible.
 
 Kokoro is the Rust build's voice -- a neural TTS with a warm voice and a
-model to load. This build uses macOS's own `say` instead, because a
+model to load. This build uses the system's own voice instead -- macOS
+`say`, or SAPI through a PowerShell one-liner on Windows -- because a
 subprocess per sentence is twenty lines nobody has to debug, and the
 point of the Python build is that you can read all of it.
 
@@ -15,8 +16,10 @@ who starts talking over the bot wins.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import subprocess
+import sys
 import threading
 
 from .types import SAY, STOP, Command, Ring
@@ -25,6 +28,19 @@ log = logging.getLogger("glydi.voice")
 
 #: How often a sentence in flight checks whether it has been cut off.
 POLL = 0.05
+
+#: Windows has no `say`; SAPI via .NET is the closest thing, and
+#: PowerShell can reach it without a pip dependency. The text comes in
+#: on stdin (no quoting rules to get wrong), the voice name in the
+#: environment. `Speak` blocks until the audio is done, so killing the
+#: process cuts it off exactly like killing `say` does.
+SAPI = (
+    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
+    "Add-Type -AssemblyName System.Speech; "
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+    "if ($env:GLYDI_SAPI_VOICE) { try { $s.SelectVoice($env:GLYDI_SAPI_VOICE) } catch {} }; "
+    "$s.Speak([Console]::In.ReadToEnd())"
+)
 
 
 class Voice:
@@ -91,19 +107,31 @@ class Voice:
     # --- one sentence -------------------------------------------------
 
     def _say(self, text: str) -> None:
-        argv = ["say"]
-        if self.voice_name:
-            argv += ["-v", self.voice_name]
-        argv.append(text)
+        popen: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if sys.platform == "win32":
+            argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", SAPI]
+            popen["stdin"] = subprocess.PIPE
+            popen["creationflags"] = subprocess.CREATE_NO_WINDOW
+            # GLYDI_MAC_VOICE doubles as the SAPI voice name ("Microsoft
+            # Zira Desktop"); an unknown name falls back to the default.
+            popen["env"] = {**os.environ, "GLYDI_SAPI_VOICE": self.voice_name}
+        else:
+            argv = ["say"]
+            if self.voice_name:
+                argv += ["-v", self.voice_name]
+            argv.append(text)
 
         self.self_speaking.set()
         try:
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            proc = subprocess.Popen(argv, **popen)
+            if proc.stdin is not None:
+                # One sentence fits the pipe buffer, so this cannot block.
+                proc.stdin.write(text.encode("utf-8"))
+                proc.stdin.close()
         except OSError as err:
-            # No `say` means we are not on a Mac. Say so once per sentence
-            # rather than dying: the rest of the bot still works.
+            # No `say` (or `powershell`) means we cannot speak here. Say so
+            # once per sentence rather than dying: the rest of the bot
+            # still works.
             self.self_speaking.clear()
             log.warning("cannot speak (%s): %s", err, text)
             return

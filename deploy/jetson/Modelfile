@@ -1,0 +1,18 @@
+# The model glydi talks to on the Jetson, built by install.sh as
+# `glydi-1.5b` (`ollama create glydi-1.5b -f` this file, __BASE__ filled
+# in first):
+#
+#   __BASE__ = models/glydi-1.5b.q4_K_M.gguf  if that file exists (the
+#              fine-tuned Qwen2.5-1.5B from train/export*.py, copied over
+#              from the training PC; the chat template below is appended
+#              from qwen2.5:1.5b so tool calls render as trained), else
+#            = qwen2.5:1.5b                    the untuned base, same size.
+#
+# `ollama show glydi-1.5b --modelfile` says which one was used.
+FROM __BASE__
+# 2048 tokens of context: glydi's system prompt + tools + a short foyer
+# exchange fits in well under that, and the KV cache (q8_0, see
+# ollama-override.conf) is sized by it: ~0.1 GB at 2048 versus ~0.2 GB
+# at the 4096 the training export used. Ollama's own default is 4096
+# (2048 before 0.5); the bot sends no num_ctx, so this is the value.
+PARAMETER num_ctx 2048

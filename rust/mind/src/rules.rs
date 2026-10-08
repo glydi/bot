@@ -25,6 +25,11 @@ pub const VOICE_ACTIVITY: &str = "voice_activity";
 pub const TURN_ENDED: &str = "turn_ended";
 /// Modality the speaker actuator reports its own playback on.
 pub const SELF_SPEAKING: &str = "self_speaking";
+/// Modality of a finished transcript (the audio sense) or a typed line
+/// (the console).
+pub const UTTERANCE: &str = "utterance";
+/// `Observation.source` of lines typed on the console (`glydi --text`).
+pub const TYPED_SOURCE: &str = "text";
 
 fn voice_started(o: &Observation) -> bool {
     o.modality == VOICE_ACTIVITY && o.payload.as_bool().unwrap_or(true)
@@ -417,6 +422,16 @@ impl Rule for BargeInStop {
             } else if !voice_started(o) {
                 self.armed.set(None);
             }
+        }
+        // A typed line has no duration to sustain: by the time a spoken
+        // utterance arrives the voice has lasted far past SUSTAIN and the
+        // stop went out from the tick, so the console gets the same on the
+        // line itself. Only the console: a microphone transcript while we
+        // talk may be our own echo, which the deliberate path filters.
+        if o.modality == UTTERANCE && o.source == TYPED_SOURCE && w.bot_speaking() {
+            self.armed.set(None);
+            out.push(Command::new("speaker", "stop", Priority::Reflex));
+            return;
         }
         self.check(o.at, w, out);
     }

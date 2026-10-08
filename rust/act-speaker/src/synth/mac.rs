@@ -131,6 +131,14 @@ pub struct MacSpeech {
 impl MacSpeech {
     /// Spawn the helper and wait for it to warm up.
     pub fn open(cfg: &MacConfig) -> Result<Self, SynthError> {
+        // The helper is AVSpeech behind a pipe; there is nothing to build
+        // or find on another OS, and "ttsd not found" would send someone
+        // looking for it. Say what the fix is instead.
+        if !cfg!(target_os = "macos") {
+            return Err(SynthError::Unavailable(
+                "the mac voice is AVSpeech and needs macOS; use GLYDI_TTS=kokoro".into(),
+            ));
+        }
         let bin = find_helper(cfg.helper.as_deref())?;
         let mut cmd = Command::new(&bin);
         cmd.arg("-rate")

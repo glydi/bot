@@ -8,7 +8,10 @@
 pub mod app;
 pub mod check;
 pub mod config;
+pub mod health;
+pub mod school;
 pub mod tee;
+pub mod text;
 
 pub use app::{App, Parts, UiParts};
 pub use config::{Config, Tts};

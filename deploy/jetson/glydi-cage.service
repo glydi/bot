@@ -1,0 +1,69 @@
+# GLYDI on a Jetson, windowed, without a desktop: cage (a single-window
+# Wayland kiosk compositor, `apt install cage`) owns the chest screen and
+# runs the bot as its one client. Installed *as* glydi.service by
+# `install-service.sh --cage`, so only one of the three templates is
+# ever enabled. Headless (glydi.service, multi-user.target) stays the
+# default; this is for the day the chest screen is fitted.
+#
+# Against glydi-kiosk.service (GNOME on X11 under GDM, ~1 GB): cage is
+# ~120 MB, needs no auto-login, no screensaver settings, no DISPLAY /
+# XAUTHORITY. The unit is its own logind session (PAMName= + TTYPath=),
+# which is what gives cage the seat (DRM and input) without root, so GDM
+# must not be fighting for the same VT: `sudo systemctl disable gdm3`
+# and `sudo systemctl set-default graphical.target`, or keep
+# multi-user.target and `enable` this unit anyway (it only Wants
+# graphical.target's ordering, not the target). kiosk.md, "Chest screen
+# under cage".
+
+[Unit]
+Description=GLYDI: the bot in the foyer (cage kiosk)
+Documentation=file://__REPO__/deploy/jetson/kiosk.md
+Wants=network-online.target ollama.service
+After=network-online.target ollama.service systemd-user-sessions.service
+# The VT and seat must be free: no getty and no display manager on it.
+Conflicts=getty@tty7.service display-manager.service
+After=getty@tty7.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+# video: camera and DRM; input: evdev under cage (the touch screen);
+# render: /dev/dri/renderD* for wgpu; audio: the sound card.
+SupplementaryGroups=video input render audio
+WorkingDirectory=__REPO__
+EnvironmentFile=__REPO__/.env
+Environment=GLYDI_ROOT=__REPO__
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+Environment=XDG_SESSION_TYPE=wayland
+# winit picks Wayland when WAYLAND_DISPLAY is set; cage sets it for its
+# child, so nothing to add. Vulkan (wgpu) through the NVIDIA ICD.
+# A logind session on tty7, which hands cage the seat.
+PAMName=login
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+UtmpIdentifier=tty7
+UtmpMode=user
+# -s: allow VT switching (Ctrl-Alt-F2 for a console while debugging);
+# drop it for the public. -d: no cursor. The client is fullscreen by
+# construction; GLYDI_FULLSCREEN=1 in .env does the rest.
+ExecStart=/usr/bin/cage -s -d -- __REPO__/rust/target/release/glydi run --no-strip
+Restart=always
+RestartSec=5
+# cage forwards SIGINT/SIGTERM to its client; glydi drains the speaker on
+# SIGINT and exits, cage exits after it.
+KillSignal=SIGINT
+TimeoutStopSec=20
+Nice=-5
+# See glydi.service for the reasoning before setting this.
+#MemoryMax=3G
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=glydi
+
+[Install]
+WantedBy=graphical.target

@@ -276,18 +276,28 @@ impl Yolo {
         ort_lib: &Path,
         score_threshold: f32,
         nms_threshold: f32,
+        intra_threads: usize,
     ) -> Result<Self, Error> {
-        sense_audio::onnx::init(ort_lib)?;
+        // Model before runtime, as in `Scrfd::open`.
         if !model_path.is_file() {
             return Err(Error::MissingModel {
                 what: "YOLO object detector",
                 path: PathBuf::from(model_path),
             });
         }
-        // Two threads like SCRFD: this runs at 2 fps on its own thread
-        // and must not take the audio path's cores.
+        sense_audio::onnx::init(ort_lib)?;
+        // The same `VisionConfig::intra_threads` as SCRFD and ArcFace:
+        // this runs at 2 fps on its own thread and must not take the face
+        // path's or the audio path's cores.
         let session = Session::builder()?
-            .with_intra_threads(2)
+            .with_intra_threads(intra_threads.max(1))
+            .map_err(ort::Error::from)?
+            .with_inter_threads(1)
+            .map_err(ort::Error::from)?
+            // `GLYDI_VISION_GPU`: CUDA or TensorRT (see `crate::VISION_GPU_ENV`).
+            .with_execution_providers(
+                crate::vision_accel().providers(&crate::trt_cache_dir(model_path), "yolo"),
+            )
             .map_err(ort::Error::from)?
             .commit_from_file(model_path)?;
         let input = session

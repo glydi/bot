@@ -237,24 +237,41 @@ impl Scrfd {
         input_size: usize,
         score_threshold: f32,
         nms_threshold: f32,
+        intra_threads: usize,
     ) -> Result<Self, Error> {
-        sense_audio::onnx::init(ort_lib)?;
+        // The model before the runtime: a missing file is the more specific
+        // report, and checking it is free, whereas the runtime's default
+        // path is relative to the repository root on Windows and would
+        // fail first from any other working directory.
         if !model_path.is_file() {
             return Err(Error::MissingModel {
                 what: "SCRFD detector",
                 path: PathBuf::from(model_path),
             });
         }
+        sense_audio::onnx::init(ort_lib)?;
         if input_size == 0 || input_size % 32 != 0 {
             return Err(Error::InvalidConfig(format!(
                 "SCRFD input size {input_size} must be a multiple of 32"
             )));
         }
-        // Two intra-op threads: SCRFD-500M at 320 is ~5 ms single-threaded
-        // on an M-series core, and the audio path wants the rest of the
-        // machine more than we want the last millisecond here.
+        // Intra-op threads come from the config (`VisionConfig::
+        // intra_threads`, default `crate::DEFAULT_INTRA_THREADS`): SCRFD-500M
+        // at 320 is ~5 ms single-threaded on an M-series core, and the audio
+        // path wants the rest of the machine more than we want the last
+        // millisecond here. `examples/perf.rs` sweeps the value; see
+        // `crate::DEFAULT_INTRA_THREADS` for what was measured.
         let session = Session::builder()?
-            .with_intra_threads(2)
+            .with_intra_threads(intra_threads.max(1))
+            .map_err(ort::Error::from)?
+            // One inter-op thread: the graph is a single serial chain, so a
+            // second op-level thread only adds a pool that spins.
+            .with_inter_threads(1)
+            .map_err(ort::Error::from)?
+            // `GLYDI_VISION_GPU`: CUDA or TensorRT (see `crate::VISION_GPU_ENV`).
+            .with_execution_providers(
+                crate::vision_accel().providers(&crate::trt_cache_dir(model_path), "scrfd"),
+            )
             .map_err(ort::Error::from)?
             .commit_from_file(model_path)?;
         let input_name = session

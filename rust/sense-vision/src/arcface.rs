@@ -38,17 +38,30 @@ pub struct ArcFace {
 }
 
 impl ArcFace {
-    /// Load `w600k_mbf.onnx` from `model_path`.
-    pub fn open(model_path: &Path, ort_lib: &Path) -> Result<Self, Error> {
-        sense_audio::onnx::init(ort_lib)?;
+    /// Load `w600k_mbf.onnx` from `model_path`. `intra_threads` is
+    /// `VisionConfig::intra_threads`; see `crate::DEFAULT_INTRA_THREADS`
+    /// for the measurement behind its default.
+    pub fn open(model_path: &Path, ort_lib: &Path, intra_threads: usize) -> Result<Self, Error> {
+        // Model before runtime, as in `Scrfd::open`.
         if !model_path.is_file() {
             return Err(Error::MissingModel {
                 what: "ArcFace recogniser",
                 path: PathBuf::from(model_path),
             });
         }
+        sense_audio::onnx::init(ort_lib)?;
         let session = Session::builder()?
-            .with_intra_threads(2)
+            .with_intra_threads(intra_threads.max(1))
+            .map_err(ort::Error::from)?
+            // MobileFaceNet is one serial chain of depthwise convolutions;
+            // a second inter-op thread has nothing to run in parallel and
+            // its pool spins next to the detector's.
+            .with_inter_threads(1)
+            .map_err(ort::Error::from)?
+            // `GLYDI_VISION_GPU`: CUDA or TensorRT (see `crate::VISION_GPU_ENV`).
+            .with_execution_providers(
+                crate::vision_accel().providers(&crate::trt_cache_dir(model_path), "arcface"),
+            )
             .map_err(ort::Error::from)?
             .commit_from_file(model_path)?;
         let input_name = session

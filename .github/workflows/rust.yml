@@ -1,0 +1,125 @@
+# Linux CI for the Rust workspace: fmt, clippy and tests on x86_64
+# Ubuntu 22.04 (the same release JetPack 6 is built on), plus a
+# type-check of the Jetson binary for aarch64. No Ollama, no models, no
+# devices: every hardware crate has a `mock` feature and the model tests
+# skip when the files are absent (BUILD.md, "Tests").
+name: rust
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  check:
+    name: fmt, clippy, test (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same list as deploy/jetson/install.sh minus Ollama, the
+      # models and the runtime-only bits. cmake + a C++ compiler build
+      # whisper.cpp; clang/libclang for bindgen (whisper-rs-sys,
+      # v4l2-sys); libasound2-dev for cpal; the X/Wayland dev packages
+      # for the egui window's build-time probes.
+      - name: apt dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config \
+            libasound2-dev libssl-dev curl unzip espeak-ng libespeak-ng1 \
+            v4l-utils alsa-utils libxkbcommon-dev libwayland-dev libx11-dev
+
+      # rust-toolchain.toml pins `stable` with rustfmt + clippy; this
+      # action installs that channel and the components.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: >
+          cargo clippy --workspace --all-targets
+          --features glydi/mock,glydi/vision,glydi/kokoro,sense-audio/mock,act-speaker/mock,act-ui/mock,deliberate/mock,sense-vision/mock
+          -- -D warnings
+
+      - name: cargo test
+        run: >
+          cargo test --workspace
+          --features glydi/mock,glydi/vision,glydi/kokoro,sense-audio/mock,act-speaker/mock,act-ui/mock,deliberate/mock,sense-vision/mock
+
+  aarch64-check:
+    name: cargo check (aarch64, Jetson)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Plain cross toolchain rather than `cross`: `cargo check` never
+      # links, so all the target needs is a C/C++ compiler for the build
+      # scripts (whisper.cpp via cmake, bundled sqlite via cc) and the
+      # aarch64 headers for bindgen. The cross-rs images lack libclang,
+      # which bindgen needs, and pulling Docker + a custom image in for a
+      # type-check is more moving parts than this.
+      #
+      # gcc-aarch64-linux-gnu brings libc6-dev-arm64-cross and
+      # linux-libc-dev-arm64-cross, i.e. /usr/aarch64-linux-gnu/include
+      # with the libc headers and linux/videodev2.h for v4l2-sys.
+      # libasound2-dev (host) exists only so alsa-sys's pkg-config probe
+      # succeeds; nothing is linked against it.
+      - name: apt dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: aarch64
+
+      - name: cargo check --target aarch64-unknown-linux-gnu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # cc / cmake crates pick the cross compilers up from these
+          # (cmake-rs also sets CMAKE_SYSTEM_NAME=Linux and
+          # CMAKE_SYSTEM_PROCESSOR=aarch64 when host != target, which
+          # turns ggml's -mcpu=native off).
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          # alsa-sys probes pkg-config for the target; allow it to find
+          # the host alsa.pc (only link flags come out, and check does
+          # not link).
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          # bindgen runs host libclang with --target=aarch64; point it
+          # at the cross toolchain's headers instead of the x86_64 ones
+          # in /usr/include (clang searches <sysroot>/include for
+          # exactly this Debian cross layout).
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include
+        run: cargo check -p glydi --features vision,kokoro --target aarch64-unknown-linux-gnu

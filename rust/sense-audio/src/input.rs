@@ -160,9 +160,21 @@ pub struct MicInput {
     description: String,
 }
 
+/// Whether `wanted` (`GLYDI_MIC_DEVICE`) picks the device called `name`:
+/// a case-insensitive substring match. Substring, because the full names
+/// are long and unstable (`ReSpeaker 4 Mic Array (UAC1.0): USB Audio
+/// (hw:2,0)` under ALSA, `MacBook Air Microphone` under `CoreAudio`) while
+/// the part a person types -- `ReSpeaker` -- is the same on every host.
+/// Case-insensitive because ALSA and WASAPI do not agree on the vendor's
+/// capitalisation, and "respeaker" in a `.env` should not fail on that.
+pub fn device_name_matches(name: &str, wanted: &str) -> bool {
+    let wanted = wanted.trim();
+    !wanted.is_empty() && name.to_lowercase().contains(&wanted.to_lowercase())
+}
+
 impl MicInput {
     /// Open the microphone. `device` selects by substring of the device
-    /// name; `None` is the system default input.
+    /// name ([`device_name_matches`]); `None` is the system default input.
     ///
     /// Blocks for as long as macOS shows the microphone-permission prompt
     /// (TCC): `stream.play()` on an input unit does not return until the
@@ -175,7 +187,10 @@ impl MicInput {
             Some(name) => host
                 .input_devices()
                 .map_err(|e| Error::Device(e.to_string()))?
-                .find(|d| d.description().is_ok_and(|d| d.name().contains(name)))
+                .find(|d| {
+                    d.description()
+                        .is_ok_and(|d| device_name_matches(d.name(), name))
+                })
                 .ok_or_else(|| Error::Device(format!("no input device matching {name:?}")))?,
             None => host
                 .default_input_device()
@@ -303,6 +318,17 @@ impl FrameSource for MicInput {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_match_is_case_insensitive_substring() {
+        let alsa = "ReSpeaker 4 Mic Array (UAC1.0): USB Audio (hw:2,0)";
+        assert!(device_name_matches(alsa, "ReSpeaker"));
+        assert!(device_name_matches(alsa, "respeaker"));
+        assert!(device_name_matches(alsa, " hw:2,0 "));
+        assert!(!device_name_matches(alsa, "MacBook"));
+        // An empty wanted string would match everything; it must match nothing.
+        assert!(!device_name_matches(alsa, ""));
+    }
 
     #[test]
     fn resampler_identity_is_passthrough() {

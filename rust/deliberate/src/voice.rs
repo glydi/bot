@@ -179,6 +179,49 @@ impl Said {
             .any(|old| overlap(line, old) > REPEAT_OVERLAP)
     }
 
+    /// Whether `heard` is the bot's own voice coming back through the
+    /// microphone: a short transcript that is most of one of the last
+    /// three lines it said. Echo cancellation catches most of it; what
+    /// leaks through is a few words of a sentence just spoken, and a
+    /// turn answered to that is the bot talking to itself ("which
+    /// kind?" -> "What kind?" -> "The gun's all I have"). A person
+    /// genuinely repeating the bot word for word is rarer than the leak.
+    pub fn echoes(&self, heard: &str) -> bool {
+        // A question is a person asking, even one made of the answer's
+        // words ("what is the capital of France" after "The capital of
+        // France is Paris").
+        // ...unless it is a two-word fragment like "What kind?", which is
+        // the leak's usual shape.
+        let h = heard.trim();
+        let first = h
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let question = h.ends_with('?')
+            || [
+                "what", "who", "when", "where", "why", "how", "which", "is", "are", "do", "does",
+                "can",
+            ]
+            .contains(&first.as_str());
+        if question && h.split_whitespace().count() >= 4 {
+            return false;
+        }
+        let heard_words = words(heard);
+        // One word ("hello", "yes") is a person; the leak is a clause.
+        if heard_words.len() < 2 || heard_words.len() > 6 {
+            return false;
+        }
+        self.lines.iter().rev().take(3).any(|said| {
+            let said_words = words(said);
+            let shared = heard_words
+                .iter()
+                .filter(|w| said_words.contains(w))
+                .count();
+            shared * 10 >= heard_words.len() * 8
+        })
+    }
+
     /// The most recent `n` lines, oldest first.
     pub fn recent(&self, n: usize) -> Vec<&str> {
         self.lines
@@ -771,6 +814,69 @@ pub fn same_words_streak<'a>(text: &str, earlier: impl Iterator<Item = &'a str>)
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn passing_speech_is_not_addressed_to_the_bot() {
+        assert!(addressed("hello"));
+        assert!(addressed("Hi there"));
+        assert!(addressed("what period is it"));
+        assert!(addressed("is tomorrow a holiday?"));
+        assert!(addressed("Glydi, are you there"));
+        assert!(addressed("my name is Priya"));
+        assert!(!addressed("That's enough. That's what I'm going to do."));
+        assert!(!addressed("I am not sure if I can speak to you."));
+        assert!(!addressed(
+            "more now my friends and to just go to the first thing"
+        ));
+        assert!(!addressed("Okay."));
+    }
+
+    #[test]
+    fn plain_questions_are_told_from_personal_ones() {
+        assert!(is_plain_question("what is the capital of France?"));
+        assert!(is_plain_question("how many legs does a spider have"));
+        assert!(is_plain_question("who wrote Hamlet"));
+        assert!(!is_plain_question("who is Bob?"));
+        assert!(!is_plain_question("what is my name"));
+        assert!(!is_plain_question("what do you remember about me"));
+        assert!(!is_plain_question("is tomorrow a holiday"));
+        assert!(!is_plain_question("who teaches maths to class 7 b"));
+        assert!(!is_plain_question("sing me a song"));
+        assert!(!is_plain_question("hello there"));
+    }
+
+    #[test]
+    fn prompt_talk_is_recognised_as_a_leak() {
+        assert!(leaks_instructions(
+            "[note] You just asked this person a question, and they answered."
+        ));
+        assert!(leaks_instructions(
+            "Call recall_person with the name \"Mukesh\"."
+        ));
+        assert!(!leaks_instructions("Nice to meet you, Mukesh."));
+        assert!(plausible_name("Mukesh"));
+        assert!(plausible_name("Priya Nair"));
+        assert!(!plausible_name("Feeling Hungry"));
+        assert!(!plausible_name("Back"));
+    }
+
+    #[test]
+    fn an_echo_of_what_was_just_said_is_recognised() {
+        let mut said = Said::default();
+        said.push("Gun's mine; which kind?");
+        said.push("The gun's all I have; what kind?");
+        assert!(said.echoes("What kind?"));
+        assert!(said.echoes("which kind"));
+        assert!(!said.echoes("What is my name?"));
+        said.push("The capital of France is Paris.");
+        assert!(!said.echoes("what is the capital of France?"));
+        assert!(!said.echoes("what is the capital of France"));
+        assert!(!said.echoes("Yeah."));
+        said.push("Hello! I noticed you back after a while.");
+        assert!(!said.echoes("Hello."));
+        // A long transcript that merely shares words is a person talking.
+        assert!(!said.echoes("what kind of gun do you think the school would ever allow here"));
+    }
+
     use super::*;
 
     #[test]
@@ -1225,6 +1331,229 @@ const NOT_NAMES: [&str; 64] = [
     "now",
     "today",
 ];
+
+/// How long after the bot last spoke, or was spoken to, a conversation
+/// is open: anything said in that window is for the bot.
+pub const ATTENTION_WINDOW: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Whether `text`, heard with no conversation open, is addressed to the
+/// bot at all. A kiosk hears the whole foyer: people talking to each
+/// other, a phone, a television. Those are statements about nothing the
+/// bot was asked ("that's enough, that's what I'm going to do"). What
+/// opens a conversation is a greeting, the bot's name, a question, or
+/// an introduction.
+pub fn addressed(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("glydi") || t.contains("robot") || t.contains("excuse me") {
+        return true;
+    }
+    let greeting = [
+        "hello",
+        "hi ",
+        "hi.",
+        "hi!",
+        "hi,",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "namaste",
+        "morning",
+    ];
+    if greeting.iter().any(|g| t.starts_with(g)) || t == "hi" {
+        return true;
+    }
+    if t.ends_with('?') {
+        return true;
+    }
+    let first = t.split_whitespace().next().unwrap_or("");
+    let question = [
+        "what", "what's", "whats", "who", "who's", "when", "where", "why", "how", "which", "is",
+        "are", "can", "could", "do", "does", "did", "tell", "say",
+    ];
+    if question.contains(&first) {
+        return true;
+    }
+    self_introduction(text, false).is_some()
+}
+
+/// Whether `text` is a plain question about the world -- "what is the
+/// capital of France", "how many legs does a spider have", "who wrote
+/// Hamlet" -- rather than about the person, the bot or the room. Such a
+/// question gets the fast lane: a sixty-token prompt, no tools, the
+/// last few turns. The foyer prompt is 2,800 tokens of room notes and
+/// tool specs that a small model drowns in, and none of it helps with a
+/// capital city.
+pub fn is_plain_question(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if words.len() < 3 {
+        return false;
+    }
+    let openers = [
+        "what", "what's", "whats", "who", "who's", "when", "where", "why", "how", "which", "is",
+        "are", "was", "were", "does", "do", "did", "can", "could", "should", "tell", "explain",
+        "define", "name", "give", "say",
+    ];
+    if !openers.contains(&words[0]) {
+        return false;
+    }
+    // "Who is Bob?" is about a person the bot may know: the full lane,
+    // with its memory tools, owns every "who is".
+    if t.starts_with("who is ") || t.starts_with("who's ") || t.starts_with("who was ") {
+        return false;
+    }
+    // Anything about us or them is the full lane's business.
+    let personal = [
+        " my ",
+        " me ",
+        " me?",
+        " i ",
+        " i'm ",
+        " you ",
+        " your ",
+        " we ",
+        " our ",
+        "remember",
+        "glydi",
+        "school",
+        "class",
+        "period",
+        "teacher",
+        "holiday",
+        "exam",
+        "attendance",
+        "today",
+        "tomorrow",
+        "yesterday",
+        "name",
+    ];
+    let padded = format!(" {t} ");
+    !personal.iter().any(|p| padded.contains(p))
+}
+
+/// The fast lane's whole prompt.
+pub const PLAIN_PROMPT: &str = "You are Glydi, a robot at a school door, talking out loud. Answer the question directly and correctly in one or two short sentences, in plain words a child follows. If you do not know, say so in one sentence. No greeting, no question back, no list.";
+
+/// Whether a sentence is the prompt talking rather than the bot: a
+/// `[note]` hint read back, or a tool named as text ("Call `recall_person`
+/// with the name"). A small model does this when it is confused, and
+/// the person must never hear it.
+pub fn leaks_instructions(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("[note]")
+        || lower.contains("[room]")
+        || [
+            "remember_name",
+            "recall_person",
+            "remember_fact",
+            "forget_person",
+            "remember_reminder",
+            "list_reminders",
+            "tool call",
+            "the model",
+        ]
+        .iter()
+        .any(|t| lower.contains(t))
+}
+
+/// Whether a string the introduction regex pulled out can be a name at
+/// all: one or two words, letters only, and none of them a word people
+/// say about themselves that is not a name. "I am feeling hungry" and
+/// "I am back" match the regex; neither names anyone (the live log
+/// enrolled a "Hang Hungry").
+pub fn plausible_name(name: &str) -> bool {
+    const NOT_NAMES: &[&str] = &[
+        "feeling",
+        "hungry",
+        "tired",
+        "angry",
+        "bored",
+        "sad",
+        "happy",
+        "fine",
+        "okay",
+        "ok",
+        "good",
+        "great",
+        "here",
+        "back",
+        "sorry",
+        "done",
+        "ready",
+        "busy",
+        "late",
+        "early",
+        "cold",
+        "hot",
+        "sick",
+        "ill",
+        "well",
+        "not",
+        "so",
+        "very",
+        "just",
+        "a",
+        "an",
+        "the",
+        "going",
+        "leaving",
+        "coming",
+        "new",
+        "old",
+        "young",
+        "lost",
+        "alone",
+        "home",
+        "in",
+        "at",
+        "on",
+        "from",
+        "to",
+        "student",
+        "teacher",
+        "glad",
+        "sure",
+        "afraid",
+        "nothing",
+        "something",
+        "everything",
+        "hmm",
+        "hm",
+        "um",
+        "uh",
+        "er",
+        "yeah",
+        "yes",
+        "yep",
+        "no",
+        "nope",
+        "ok",
+        "okay",
+        "right",
+        "what",
+        "sorry",
+        "pardon",
+        "again",
+        "wait",
+        "hello",
+        "hi",
+        "hey",
+    ];
+    let words: Vec<&str> = name.split_whitespace().collect();
+    if words.is_empty() || words.len() > 2 {
+        return false;
+    }
+    words.iter().all(|w| {
+        let lower = w.to_ascii_lowercase();
+        w.chars()
+            .all(|c| c.is_alphabetic() || c == '-' || c == '\'')
+            && !NOT_NAMES.contains(&lower.as_str())
+    })
+}
 
 /// The name in a self-introduction: "I'm Kalyan", "I am Kalyan", "my
 /// name is Kalyan", "call me Kalyan", "this is Kalyan", "it's Kalyan

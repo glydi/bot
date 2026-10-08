@@ -178,9 +178,60 @@ adding a thread; nothing in the mind changes.
    - Stop the senses, drain the speaker, end the open visit, write the
      episode, close the gallery.
 
+9. SCHOOL SCENE MODEL (docs/school/09-scene-model.md)
+   Sections 1-8 assume a room. A school corridor holds 5-30 visible
+   people, nearly all of whom are not interacting, so presence stops
+   being enough.
+   1. A participant ladder replaces PRESENT/ABSENT: ABSENT, SEEN,
+      NEARBY, CANDIDATE, PARTICIPANT, ENGAGED, SPEAKER. Track many
+      (16-24), interact with few (<= 4).
+   2. Engagement gets asymmetric hysteresis -- enter 0.70 held 800 ms,
+      exit 0.40 held 2.5 s -- in place of today's single symmetric
+      300 ms, which flickers in a crowd.
+   3. Tracking becomes predict -> cost -> Hungarian, not IoU alone;
+      students crossing each other switch identities otherwise.
+   4. ArcFace embeds are budgeted per frame and scheduled by the
+      ladder. Today every track is embedded every frame, which cannot
+      hold 15 fps on an Orin Nano with a crowd.
+   5. Identity is three layers -- track, session, persistent. Session
+      is memory-only and purged daily; persistent needs an authorised
+      enrolment, never the bot's own inference (docs/school/privacy.md).
+   6. Addressing and speaker attribution become scores with an
+      uncertain band and an address lease, so turn 2 of a conversation
+      needs no name and background speech is not conversation.
+   7. Unknown context takes the most conservative policy, not the
+      normal one.
+
+10. SCHEMA LEARNING (docs/school/10-schema-learning.md)
+   The bot learns a declarative model of the school -- places, routines,
+   rhythms -- without modifying its code, its reflex rules or its
+   policy. Episodes -> learner (slow, off the hot path) -> schema store
+   -> read-only context back into the world note.
+   1. The order that holds everything:
+         REFLEX > SAFETY > PERMISSION > LEARNED SCHEMA
+      A schema never overrides barge-in, privacy, actuator limits,
+      identity gates or safety.
+   2. OBSERVATION -> HYPOTHESIS -> CANDIDATE -> CONFIRMED, gated on 5
+      occurrences across 3 distinct days, and on the Beta posterior's
+      5th percentile rather than its mean: 4/4 and 40/40 have the same
+      raw mean, and lower bounds of 0.55 and 0.93.
+   3. Temporal schemas are conditioned on day type. Otherwise every
+      weekend manufactures contradictions and true schemas decay over a
+      term break.
+   4. Schemas are typed and closed-set; the model may propose a
+      candidate, but promotion is deterministic and statistical.
+   5. Learned facts are not policy. experience -> schema -> context ->
+      an approved policy table -> behaviour. Never a bot that invents a
+      behavioural rule and executes it.
+   6. Adaptation is bounded: learned context picks a value inside a
+      permitted range, it does not mutate a VAD threshold freely.
+   7. The learner is falsifiable -- synthetic school days replayed
+      through the bench harness, held out days, a surprise metric.
+
 TWO BUILDS
    - Rust: the fast one. Reflex p99 ~10 us, echo cancellation, speculative
-     transcription, crowd rules, Kokoro, 15 fps vision.
+     transcription, crowd rules, Kokoro, 15 fps vision. Builds on macOS,
+     Windows and Linux (Jetson Orin Nano: deploy/jetson/).
    - Python: the readable one. Same models, same gallery file, same gates
      and the same name blocklist; no echo cancellation (deaf while it
      speaks), no reflex layer, ~4 fps vision, system voice.

@@ -37,13 +37,41 @@ type TextToPhonemesFn = unsafe extern "C" fn(*mut *const c_void, c_int, c_int) -
 /// Where to find the library and its data.
 #[derive(Clone, Debug, Default)]
 pub struct EspeakPaths {
-    /// `libespeak-ng.dylib`. `None` searches `$PHONEMIZER_ESPEAK_LIBRARY`,
-    /// the `.venv` wheel under the working directory and its parents, then
-    /// Homebrew.
+    /// `libespeak-ng.dylib` (`.dll` on Windows, `.so.1` on Linux). `None`
+    /// searches `$PHONEMIZER_ESPEAK_LIBRARY`, the `.venv` wheel under the
+    /// working directory and its parents, then Homebrew (on Windows the
+    /// espeak-ng MSI's install directory; on Linux the distro's multiarch
+    /// directory, `/usr/lib`, `/usr/local/lib`), then the bare name.
     pub library: Option<PathBuf>,
-    /// `espeak-ng-data`. `None` looks next to the library, then Homebrew.
+    /// `espeak-ng-data`. `None` looks next to the library, then Homebrew
+    /// (the MSI's directory; on Linux the multiarch directory, then
+    /// `/usr/share`).
     pub data: Option<PathBuf>,
 }
+
+/// The shared library's file name on this platform.
+#[cfg(target_os = "windows")]
+const LIBRARY_FILE: &str = "libespeak-ng.dll";
+/// The soname, not `libespeak-ng.so`: Ubuntu's `libespeak-ng1` package
+/// (which is what JetPack's apt has) ships only the versioned file; the
+/// unversioned symlink comes with `-dev`, which nobody installs to run.
+#[cfg(target_os = "linux")]
+const LIBRARY_FILE: &str = "libespeak-ng.so.1";
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+const LIBRARY_FILE: &str = "libespeak-ng.dylib";
+
+/// Debian multiarch directory for this CPU: `/usr/lib/x86_64-linux-gnu`
+/// on a PC, `/usr/lib/aarch64-linux-gnu` on the Jetson. Both the library
+/// and `espeak-ng-data` live there when installed from apt.
+#[cfg(target_os = "linux")]
+fn multiarch_dir() -> PathBuf {
+    PathBuf::from(format!("/usr/lib/{}-linux-gnu", std::env::consts::ARCH))
+}
+
+/// Where the espeak-ng MSI (winget `eSpeak-NG.eSpeak-NG`) installs; the
+/// data directory sits next to the DLL there.
+#[cfg(target_os = "windows")]
+const WINDOWS_INSTALL_DIR: &str = r"C:\Program Files\eSpeak NG";
 
 /// Candidate library paths, most specific first.
 fn library_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
@@ -62,7 +90,8 @@ fn library_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
                 for e in entries.flatten() {
                     let p = e
                         .path()
-                        .join("site-packages/espeakng_loader/libespeak-ng.dylib");
+                        .join("site-packages/espeakng_loader")
+                        .join(LIBRARY_FILE);
                     if p.is_file() {
                         out.push(p);
                     }
@@ -70,10 +99,44 @@ fn library_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    out.push(PathBuf::from("/opt/homebrew/lib/libespeak-ng.dylib"));
-    out.push(PathBuf::from("/usr/local/lib/libespeak-ng.dylib"));
-    out.push(PathBuf::from("libespeak-ng.dylib"));
+    #[cfg(target_os = "windows")]
+    out.push(Path::new(WINDOWS_INSTALL_DIR).join(LIBRARY_FILE));
+    #[cfg(target_os = "linux")]
+    {
+        out.push(multiarch_dir().join(LIBRARY_FILE));
+        out.push(PathBuf::from("/usr/lib").join(LIBRARY_FILE));
+        out.push(PathBuf::from("/usr/local/lib").join(LIBRARY_FILE));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        out.push(PathBuf::from("/opt/homebrew/lib").join(LIBRARY_FILE));
+        out.push(PathBuf::from("/usr/local/lib").join(LIBRARY_FILE));
+    }
+    // The bare name: the platform loader's own search (`PATH` on Windows).
+    out.push(PathBuf::from(LIBRARY_FILE));
     out
+}
+
+/// The system-wide `espeak-ng-data` directories, most likely first, for
+/// when the one next to the library is not there (the library was found
+/// by bare name, say). One place on macOS and Windows; on Linux apt puts
+/// it in the multiarch directory and a source install in `/usr/share`.
+fn system_data_dirs() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![Path::new(WINDOWS_INSTALL_DIR).join("espeak-ng-data")]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            multiarch_dir().join("espeak-ng-data"),
+            PathBuf::from("/usr/share/espeak-ng-data"),
+        ]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        vec![PathBuf::from("/opt/homebrew/share/espeak-ng-data")]
+    }
 }
 
 /// A loaded, initialised espeak-ng.
@@ -109,13 +172,19 @@ impl Espeak {
             )));
         };
 
-        let data = paths.data.clone().or_else(|| {
-            let sibling = lib_path.parent().map(|d| d.join("espeak-ng-data"));
-            sibling.filter(|p| p.is_dir()).or_else(|| {
-                let brew = PathBuf::from("/opt/homebrew/share/espeak-ng-data");
-                brew.is_dir().then_some(brew)
-            })
-        });
+        // `ESPEAK_DATA_PATH` is what espeak-ng itself would consult when
+        // handed a null path, so honouring it here keeps the log truthful
+        // about which data directory is in use.
+        let data = paths
+            .data
+            .clone()
+            .or_else(|| std::env::var_os("ESPEAK_DATA_PATH").map(PathBuf::from))
+            .or_else(|| {
+                let sibling = lib_path.parent().map(|d| d.join("espeak-ng-data"));
+                sibling
+                    .filter(|p| p.is_dir())
+                    .or_else(|| system_data_dirs().into_iter().find(|p| p.is_dir()))
+            });
 
         // SAFETY: each symbol is looked up by the name and signature espeak-ng
         // declares in speak_lib.h; the pointers are copied out and used only

@@ -22,7 +22,9 @@
 //! 50 Hz, each sent as its block starts playing, and a final `0.0` just
 //! before `self_speaking` goes false) while speaking,
 //! `spoke` (`Payload::Text`, the first 40 chars) as each chunk (a sentence,
-//! or the opening clause of the first one) starts playing, and
+//! or the opening clause of the first one) starts playing,
+//! `synthesised` (`Payload::Text`, the first 40 chars) as each chunk's
+//! first audio comes out of the backend, before it is queued to play, and
 //! `speaker_latency` (`Payload::Level`, milliseconds) once per reply: the
 //! backend's time to first audio for the reply's first chunk, sent as
 //! that audio appears and so always before the `self_speaking` it
@@ -73,7 +75,10 @@ pub use engine::{INFLIGHT_HOLD, SPEAKING_HOLD, SPOKE_CHARS, spoke_text};
 pub use output::{CpalOutput, FarBlock, FarEnd, NullOutput, Output, OutputError};
 pub use sentence::{ends_sentence, first_clause, phrases, sentences};
 #[cfg(feature = "kokoro")]
-pub use synth::kokoro::{Kokoro, KokoroConfig};
+pub use synth::kokoro::{
+    DEFAULT_INTRA_THREADS, Gpu, Kokoro, KokoroConfig, Optimize,
+    gpu_from_env as kokoro_gpu_from_env, preload_cuda_libraries,
+};
 pub use synth::mac::{MacConfig, MacSpeech};
 #[cfg(feature = "mock")]
 pub use synth::mock::MockSynth;
@@ -95,6 +100,11 @@ pub enum Backend {
         voice: String,
         /// 0.5..2.0, 1.0 normal.
         speed: f32,
+        /// The onnxruntime shared library. `None` means `$ORT_DYLIB_PATH`,
+        /// else the platform default (`synth::kokoro::DEFAULT_ORT_DYLIB`).
+        /// The `glydi` binary passes the path its senses use, so one
+        /// process never loads two runtimes.
+        ort_dylib: Option<PathBuf>,
     },
     /// Silence synth and null output, for tests. Only with `--features mock`.
     Mock,
@@ -289,11 +299,14 @@ fn open_synth(backend: &Backend) -> Result<Box<dyn Synth>, Error> {
             model_dir,
             voice,
             speed,
+            ort_dylib,
         } => {
             let cfg = KokoroConfig {
                 model_dir: model_dir.clone(),
                 voice: voice.clone(),
                 speed: *speed,
+                ort_dylib: ort_dylib.clone(),
+                gpu: synth::kokoro::gpu_from_env(),
                 ..KokoroConfig::default()
             };
             Ok(Box::new(Kokoro::open(&cfg)?))

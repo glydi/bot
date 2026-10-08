@@ -13,7 +13,7 @@ mock = []
 # Kokoro in-process: ort against libonnxruntime.dylib plus espeak-ng dlopen'd
 # for phonemes. Off by default: see the crate docs for why the always-on
 # path is the macOS voice.
-kokoro = ["dep:ort", "dep:libloading"]
+kokoro = ["dep:ort", "dep:libloading", "dep:accel"]
 
 [dependencies]
 common = { workspace = true }
@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 cpal = { workspace = true }
 ort = { workspace = true, optional = true }
+accel = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
 
 [dev-dependencies]

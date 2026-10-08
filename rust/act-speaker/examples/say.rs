@@ -20,18 +20,26 @@ fn main() {
         .init();
     let mut config = SpeakerConfig::default();
     let mut text = String::new();
-    for arg in std::env::args().skip(1) {
+    // `--voice NAME` picks a Kokoro voice (`GLYDI_KOKORO_VOICE` otherwise,
+    // `af_bella` by default); `voices-v1.0.bin` lists them.
+    let mut voice = std::env::var("GLYDI_KOKORO_VOICE").unwrap_or_else(|_| "af_bella".into());
+    let mut args = std::env::args().skip(1);
+    let mut kokoro = false;
+    while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--kokoro" => {
-                config.backend = Backend::Kokoro {
-                    model_dir: None,
-                    voice: "af_bella".into(),
-                    speed: 1.0,
-                };
-            }
+            "--kokoro" => kokoro = true,
+            "--voice" => voice = args.next().unwrap_or(voice),
             "--silent" => config.silent = true,
             _ => text = arg,
         }
+    }
+    if kokoro {
+        config.backend = Backend::Kokoro {
+            model_dir: None,
+            voice,
+            speed: 1.0,
+            ort_dylib: None,
+        };
     }
     if text.is_empty() {
         text = "Hello there. This is the speaker actuator, talking for real.".into();

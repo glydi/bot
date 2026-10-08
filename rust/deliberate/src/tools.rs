@@ -288,8 +288,10 @@ pub const MESSAGE_MAX_CHARS: usize = 300;
 /// decided by the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolPolicy {
-    /// `run_shortcut`: on by default. A Shortcut is something the owner
-    /// wrote and named, so running one is within what they asked for.
+    /// `run_shortcut`: on by default on macOS. A Shortcut is something the
+    /// owner wrote and named, so running one is within what they asked
+    /// for. Off elsewhere: `/usr/bin/shortcuts` is a macOS binary, and a
+    /// tool that always fails only teaches the model to stop calling tools.
     pub shortcuts: bool,
     /// `open_facetime` / `send_message`: off by default. These reach
     /// someone *else*, and a misheard name calls the wrong person.
@@ -299,13 +301,19 @@ pub struct ToolPolicy {
 impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
-            shortcuts: true,
+            shortcuts: Self::SHORTCUTS_DEFAULT,
             contact: false,
         }
     }
 }
 
 impl ToolPolicy {
+    /// Whether `run_shortcut` is on before the environment is consulted:
+    /// only where `/usr/bin/shortcuts` exists. A named constant rather
+    /// than an inline `cfg!`, so the platform where this is `false` does
+    /// not read as a derivable `Default` to clippy.
+    pub const SHORTCUTS_DEFAULT: bool = cfg!(target_os = "macos");
+
     /// Nothing allowed: the policy for tests and headless runs.
     pub const NONE: Self = Self {
         shortcuts: false,
@@ -325,7 +333,7 @@ impl ToolPolicy {
     pub fn from_vars(shortcuts: Option<&str>, contact: Option<&str>) -> Self {
         let on = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         Self {
-            shortcuts: shortcuts.is_none_or(on),
+            shortcuts: shortcuts.map_or(Self::default().shortcuts, on),
             contact: contact.is_some_and(on),
         }
     }
@@ -535,9 +543,10 @@ pub fn parse_utc_offset(s: &str) -> Option<i64> {
 }
 
 /// The machine's UTC offset in seconds: [`UTC_OFFSET_ENV`] when set,
-/// else `date +%z` once (macOS and Linux both print `+0100`), else 0.
-/// Cached: the zone does not move while the bot runs, and a `date` spawn
-/// per reminder would be silly.
+/// else the system asked once (`date +%z` on macOS and Linux, which both
+/// print `+0100`; Windows has no `date +%z`, so PowerShell's `zzz` format,
+/// which prints `+01:00`), else 0. Cached: the zone does not move while
+/// the bot runs, and a process spawn per reminder would be silly.
 pub fn local_utc_offset() -> i64 {
     static OFFSET: OnceLock<i64> = OnceLock::new();
     *OFFSET.get_or_init(|| {
@@ -547,9 +556,21 @@ pub fn local_utc_offset() -> i64 {
         {
             return v;
         }
-        std::process::Command::new("date")
-            .arg("+%z")
-            .output()
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = std::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-Date).ToString('zzz')",
+            ]);
+            c
+        } else {
+            let mut c = std::process::Command::new("date");
+            c.arg("+%z");
+            c
+        };
+        cmd.output()
             .ok()
             .filter(|o| o.status.success())
             .and_then(|o| parse_utc_offset(&String::from_utf8_lossy(&o.stdout)))
@@ -1612,7 +1633,8 @@ mod tests {
     #[test]
     fn policy_defaults_and_env_overrides() {
         assert_eq!(ToolPolicy::default(), ToolPolicy::from_vars(None, None));
-        assert!(ToolPolicy::default().shortcuts);
+        // Shortcuts exist on macOS only; the default follows.
+        assert_eq!(ToolPolicy::default().shortcuts, cfg!(target_os = "macos"));
         assert!(!ToolPolicy::default().contact);
         let p = ToolPolicy::from_vars(Some("0"), Some("1"));
         assert!(!p.shortcuts && p.contact);
@@ -1629,7 +1651,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(names(ToolPolicy::NONE), Vec::<&str>::new());
-        assert_eq!(names(ToolPolicy::default()), [RUN_SHORTCUT]);
+        assert_eq!(names(MAC_DEFAULT), [RUN_SHORTCUT]);
         assert_eq!(
             names(ToolPolicy {
                 shortcuts: true,
@@ -1638,10 +1660,18 @@ mod tests {
             [RUN_SHORTCUT, OPEN_FACETIME, SEND_MESSAGE]
         );
         assert_eq!(
-            full_tool_specs_with(ToolPolicy::default()).len(),
+            full_tool_specs_with(MAC_DEFAULT).len(),
             full_tool_specs().len() + 1
         );
     }
+
+    /// What `ToolPolicy::default()` is on macOS: Shortcuts on, contact
+    /// tools off. Spelled out so the spec tests read the same on every
+    /// platform.
+    const MAC_DEFAULT: ToolPolicy = ToolPolicy {
+        shortcuts: true,
+        contact: false,
+    };
 
     #[test]
     fn reach_tools_go_through_the_runner_and_the_policy() {
@@ -1705,8 +1735,8 @@ mod tests {
 
         // A failing Shortcut answers with the names that exist.
         let runner = Arc::new(MockRunner::answering(Err("not found".into())));
-        let tools = Tools::new(Arc::new(InMemoryFacts::new()))
-            .with_reach(ToolPolicy::default(), runner.clone());
+        let tools =
+            Tools::new(Arc::new(InMemoryFacts::new())).with_reach(MAC_DEFAULT, runner.clone());
         let r = tools.invoke(RUN_SHORTCUT, &json!({"name": "Nope"}), &view);
         assert_eq!(r["status"], "failed");
         assert_eq!(r["reason"], "not found");

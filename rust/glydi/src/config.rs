@@ -3,9 +3,21 @@
 //! The variable names are the Python build's (`src/glydi_bot/config.py`,
 //! `.env.example`), so an existing `.env` keeps working. Precedence, lowest
 //! to highest: built-in defaults, the TOML file (`~/.config/glydi/config.toml`
-//! unless `--config` says otherwise; a missing file is not an error), then
-//! the environment. Every path is resolved against the repository root so
-//! `glydi` behaves the same from any working directory.
+//! unless `--config` says otherwise; a missing file is not an error), the
+//! repository `.env` ([`dotenv_path`], applied by the binary before anything
+//! reads the environment, never over a variable the process already has),
+//! then the environment itself. Every path is resolved against the
+//! repository root so `glydi` behaves the same from any working directory.
+//!
+//! Jetson Orin Nano (8 GB, `JetPack` 6) notes, since that is the Linux target:
+//! `GLYDI_STT=parakeet` is the transcriber to use there -- whisper.cpp's
+//! GPU path is Metal-only, so on Linux it runs on the CPU while Parakeet
+//! goes through onnxruntime like everything else -- and
+//! `GLYDI_LOCAL_MODEL=qwen2.5:1.5b` is the model that leaves room for the
+//! speech models in 8 GB of shared memory (the 3b default is sized for a
+//! laptop whose GPU has its own). Both are documented in `.env.example`;
+//! neither is a code default, because the defaults describe the
+//! development machine and the `.env` describes the deployment.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,7 +27,9 @@ use serde::Deserialize;
 
 /// The model Ollama runs by default. `.env.example` explains the choice:
 /// it calls tools reliably, has no thinking phase, and fits next to the
-/// speech models on an 8 GB machine.
+/// speech models on an 8 GB laptop. On an 8 GB Jetson, where the GPU
+/// shares that memory with everything else, `qwen2.5:1.5b` is the safe
+/// size; set it in `.env` rather than here (see the module docs).
 pub const DEFAULT_LOCAL_MODEL: &str = "qwen2.5:3b";
 /// The Ollama `OpenAI`-compatible endpoint.
 pub const DEFAULT_LOCAL_LLM_URL: &str = "http://localhost:11434/v1";
@@ -34,12 +48,22 @@ pub const DEFAULT_MODELS_DIR: &str = "models";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tts {
-    /// The macOS system voice through the `ttsd` helper (the default: it is
-    /// always available and never produces silence).
+    /// The macOS system voice through the `ttsd` helper (the default there:
+    /// it is always available and never produces silence).
     Mac,
     /// Kokoro in-process; needs `--features kokoro`, the model files and
-    /// espeak-ng.
+    /// espeak-ng. The default everywhere else, where there is no `AVSpeech`.
     Kokoro,
+}
+
+impl Default for Tts {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else {
+            Self::Kokoro
+        }
+    }
 }
 
 impl std::str::FromStr for Tts {
@@ -139,7 +163,7 @@ pub struct Config {
 impl Config {
     /// The default file location: `~/.config/glydi/config.toml`.
     pub fn default_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/glydi/config.toml"))
+        home_dir().map(|h| h.join(".config/glydi/config.toml"))
     }
 
     /// Load from `path` (or the default location when `None`), then overlay
@@ -204,7 +228,7 @@ impl Config {
             .get("GLYDI_TTS")
             .and_then(|v| v.parse::<Tts>().ok())
             .or(file.tts)
-            .unwrap_or(Tts::Mac);
+            .unwrap_or_default();
         let identity = env
             .get("GLYDI_IDENTITY")
             .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off" | ""))
@@ -240,15 +264,23 @@ impl Config {
             ),
             face_models_dir: insightface,
             db: abs(&root, &pick("GLYDI_DB", file.db, DEFAULT_DB)),
-            models_dir,
-            ort_lib: abs(
-                &root,
-                &pick(
-                    "ORT_DYLIB_PATH",
-                    file.ort_lib,
-                    sense_audio::onnx::DEFAULT_ORT_LIBRARY,
+            // Named explicitly, or the platform's default: one fixed path
+            // on macOS and Windows, on Linux the first of the fixed places
+            // that exists (`sense_audio::onnx::default_library`), which
+            // needs the resolved models dir because that is where an
+            // unpacked Microsoft tarball goes.
+            ort_lib: env
+                .get("ORT_DYLIB_PATH")
+                .filter(|v| !v.trim().is_empty())
+                .or(file.ort_lib)
+                .map_or_else(
+                    || {
+                        let d = sense_audio::onnx::default_library(&models_dir);
+                        if d.is_absolute() { d } else { root.join(d) }
+                    },
+                    |p| abs(&root, &p),
                 ),
-            ),
+            models_dir,
             tts,
             mac_voice: pick_opt("GLYDI_MAC_VOICE", file.mac_voice),
             kokoro_voice: pick("GLYDI_KOKORO_VOICE", file.kokoro_voice, "af_bella"),
@@ -308,12 +340,21 @@ fn whisper_path(models_dir: &Path, name: &str) -> PathBuf {
     models_dir.join(format!("whisper/ggml-{name}.bin"))
 }
 
+/// The user's home: `HOME`, or `USERPROFILE`, which is what Windows sets
+/// instead (the Python build's `~` landed in the same place there, so the
+/// cached model directories are where this expects).
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// `~/.insightface/models`, falling back to `<root>/models/insightface`
 /// when `HOME` is unset so the model check reports a clear path.
 fn default_insightface_dir(root: &Path) -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
+    home_dir().map_or_else(
         || root.join("models/insightface"),
-        |h| PathBuf::from(h).join(".insightface/models"),
+        |h| h.join(".insightface/models"),
     )
 }
 
@@ -321,9 +362,9 @@ fn default_insightface_dir(root: &Path) -> PathBuf {
 fn abs(root: &Path, p: &str) -> PathBuf {
     let p = p.trim();
     if let Some(rest) = p.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     let path = Path::new(p);
     if path.is_absolute() {
@@ -331,6 +372,73 @@ fn abs(root: &Path, p: &str) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+/// The `.env` the binary applies at start-up: `<repository root>/.env`,
+/// the file `.env.example` says to copy. Root-relative, not working
+/// directory relative, for the same reason every model path is.
+pub fn dotenv_path() -> PathBuf {
+    repo_root().join(".env")
+}
+
+/// Parse a `.env` file's text into `(key, value)` pairs, in file order.
+///
+/// The dialect is what a shell `source .env` accepts for the lines people
+/// actually write (the Mac launcher sourced the file; `rust/run.ps1`
+/// re-implemented these rules in PowerShell before the binary took over):
+/// blank lines and `#` comments are skipped, a leading `export ` is
+/// tolerated so a file written for a Unix shell still loads, and one layer
+/// of matching quotes (`".."` or `'..'`) is stripped so a value with
+/// spaces survives. Nothing else: no `$VAR` expansion, no escapes, no
+/// trailing `# comment` on a value line, because a path such as
+/// `C:\Program Files\x` or a URL with `#` must come through untouched. A
+/// line without `=` or with a key that is not an identifier is ignored,
+/// not an error: this is the same leniency the shell had, and a config
+/// file that stops the bot starting over a stray line helps no one.
+pub fn parse_dotenv(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let mut chars = key.chars();
+            let ident = chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !ident {
+                return None;
+            }
+            Some((key.to_owned(), unquote(value.trim()).to_owned()))
+        })
+        .collect()
+}
+
+/// The pairs from [`parse_dotenv`] that should actually be applied: the
+/// first occurrence of each key, and only keys `already_set` does not
+/// know. That predicate is the process environment in the binary and a
+/// map in the tests; it is what makes `environment > .env` hold, so a
+/// `GLYDI_TTS=kokoro rust/run.ps1` still wins over the file.
+pub fn dotenv_overlay(
+    pairs: Vec<(String, String)>,
+    already_set: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    pairs
+        .into_iter()
+        .filter(|(k, _)| seen.insert(k.clone()) && !already_set(k))
+        .collect()
+}
+
+/// One layer of matching quotes, as a shell would strip.
+fn unquote(v: &str) -> &str {
+    let quoted = v.len() >= 2
+        && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')));
+    if quoted { &v[1..v.len() - 1] } else { v }
 }
 
 /// The repository root: `GLYDI_ROOT` if set, else the checkout this binary
@@ -374,7 +482,7 @@ mod tests {
         assert!(c.db.ends_with("data/glydi.db"));
         assert!(c.db.is_absolute());
         assert!(c.face_models_dir.ends_with("buffalo_s"));
-        assert_eq!(c.tts, Tts::Mac);
+        assert_eq!(c.tts, Tts::default());
         assert!(c.identity);
     }
 
@@ -388,16 +496,23 @@ mod tests {
             "#,
         )
         .unwrap();
+        // An absolute path must pass through untouched; on Windows only a
+        // drive-prefixed one counts as absolute.
+        let abs_db = if cfg!(windows) {
+            r"C:\tmp\x.db"
+        } else {
+            "/tmp/x.db"
+        };
         let env = Map(HashMap::from([
             ("GLYDI_LOCAL_MODEL", "from-env"),
-            ("GLYDI_DB", "/tmp/x.db"),
+            ("GLYDI_DB", abs_db),
             ("GLYDI_IDENTITY", "0"),
         ]));
         let c = Config::from_parts(file, &env);
         assert_eq!(c.local_model, "from-env");
         assert_eq!(c.memory_model, "from-env");
         assert!(c.whisper_model.ends_with("ggml-base.en.bin"));
-        assert_eq!(c.db, PathBuf::from("/tmp/x.db"));
+        assert_eq!(c.db, PathBuf::from(abs_db));
         assert_eq!(c.tts, Tts::Kokoro);
         assert!(!c.identity);
     }
@@ -422,5 +537,76 @@ mod tests {
     #[test]
     fn unknown_file_key_is_an_error() {
         assert!(toml::from_str::<FileConfig>("nope = 1").is_err());
+    }
+
+    #[test]
+    fn dotenv_skips_comments_blanks_and_junk() {
+        let pairs = parse_dotenv(
+            "# GLYDI configuration\n\n   \nGLYDI_TTS=kokoro\n#GLYDI_AEC=1\nnot a pair\n1BAD=x\nGLYDI_MAX_TOKENS = 300\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("GLYDI_TTS".to_owned(), "kokoro".to_owned()),
+                ("GLYDI_MAX_TOKENS".to_owned(), "300".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotenv_strips_one_layer_of_matching_quotes() {
+        let pairs = parse_dotenv(
+            "A=\"MacBook Air Microphone\"\nB='single'\nC=\"'nested'\"\nD=\"unbalanced'\nE=\"\"\nF=\"\nG=C:\\Program Files\\x\n",
+        );
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("A"), Some("MacBook Air Microphone"));
+        assert_eq!(get("B"), Some("single"));
+        assert_eq!(get("C"), Some("'nested'"));
+        assert_eq!(get("D"), Some("\"unbalanced'"));
+        assert_eq!(get("E"), Some(""));
+        assert_eq!(get("F"), Some("\""));
+        assert_eq!(get("G"), Some("C:\\Program Files\\x"));
+    }
+
+    #[test]
+    fn dotenv_tolerates_export_prefix() {
+        let pairs = parse_dotenv(
+            "export GLYDI_STT=parakeet\nexport   ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so\nexported=1\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("GLYDI_STT".to_owned(), "parakeet".to_owned()),
+                (
+                    "ORT_DYLIB_PATH".to_owned(),
+                    "/usr/lib/libonnxruntime.so".to_owned()
+                ),
+                // `exported` is a key, not the prefix.
+                ("exported".to_owned(), "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotenv_never_overrides_process_env() {
+        let process = HashMap::from([("GLYDI_TTS", "mac")]);
+        let pairs = parse_dotenv("GLYDI_TTS=kokoro\nGLYDI_STT=parakeet\nGLYDI_STT=whisper\n");
+        let applied = dotenv_overlay(pairs, |k| process.contains_key(k));
+        // The process value wins; within the file the first line wins,
+        // as it would when each line is applied in turn.
+        assert_eq!(
+            applied,
+            vec![("GLYDI_STT".to_owned(), "parakeet".to_owned())]
+        );
+    }
+
+    #[test]
+    fn dotenv_path_is_under_the_root() {
+        assert_eq!(dotenv_path(), repo_root().join(".env"));
     }
 }

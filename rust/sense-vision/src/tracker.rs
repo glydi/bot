@@ -35,11 +35,112 @@ pub const DEFAULT_MAX_AGE_FRAMES: u32 = 15;
 /// Python `VisionConfig.votes_to_confirm`.
 pub const DEFAULT_VOTES_TO_CONFIRM: usize = 5;
 /// The most faces followed at once. A school corridor can put twenty in
-/// frame; past a dozen the mind cannot hold a conversation with any of
-/// them anyway, and every extra track is an `ArcFace` crop per frame
-/// (~1 ms each) plus four observations per tick on the ring. The twelve
-/// kept are the largest and most central: the people who walked up.
-pub const MAX_LIVE_TRACKS: usize = 12;
+/// frame; the ones kept are the largest and most central, i.e. the people
+/// who walked up (`select_crowd`).
+///
+/// RAISED 12 -> 16 for `docs/school/09-scene-model.md` §9.1's
+/// `MAX_TRACKED_PEOPLE` 16-24, which only became affordable with
+/// [`MAX_EMBEDS_PER_FRAME`]. The old comment said "every extra track is an
+/// `ArcFace` crop per frame (~1 ms each)" -- that 1 ms was measured on an
+/// M2, the real number here is 4.0 ms (see [`MAX_EMBEDS_PER_FRAME`]), and
+/// with the budget in place the per-frame model cost no longer scales with
+/// the track count at all: it is one detection plus at most
+/// [`MAX_EMBEDS_PER_FRAME`] embeds, whatever `MAX_LIVE_TRACKS` says.
+///
+/// WHY 16 and not 24, the top of §9.1's range: what still scales linearly
+/// is the ring. `docs/school/plan.md` §5 costs peak production at 12
+/// tracks as ~192 observations/s against a 256-slot ring; 16 is ~256/s and
+/// 24 would be ~384/s, and the eviction budget is the thing nothing
+/// currently counts. Take the bottom of the range, and raise it when
+/// `ReflexStats` can prove nothing was dropped.
+pub const MAX_LIVE_TRACKS: usize = 16;
+
+/// How many `ArcFace` forward passes one frame may spend
+/// (`docs/school/09-scene-model.md` §9.3, the Orin Nano constraint).
+///
+/// MEASURED on the desk machine this was written on (`x86_64`, ORT 1.28.2,
+/// CPU EP, 2 intra-op threads, `cargo run -p sense-vision --release
+/// --example perf`): SCRFD-500M at 320 is **7.3 ms** on a 1280x720 frame
+/// and one `ArcFace` (`w600k_mbf`) forward is **4.0 ms**. The old comment
+/// here claimed "~1 ms each" for the embed; it was measured on an M2 and
+/// is wrong by four times on this machine and by more on a Jetson.
+///
+/// The arithmetic, on the measured numbers, for a 15 fps frame of 66.7 ms:
+/// unbudgeted, 12 assigned tracks cost 7.3 + 12 x 4.0 = **55 ms** here and
+/// scale straight past the frame on the Jetson's A78 cores. At this cap
+/// the frame is 7.3 + 2 x 4.0 = **15.3 ms** whatever the crowd does.
+///
+/// WHY 2 and not §9.3's 4: `docs/school/plan.md` §4 makes the argument and
+/// the measurements agree with it. The Orin Nano runs ONNX Runtime on the
+/// **CPU** execution provider (CUDA/`TensorRT` is "not done yet" in
+/// `kiosk.md`), six A78 cores at 15 W shared with the LLM, the audio
+/// pipeline, `YOLOv5n`, the grey downscale, the gestures and the preview.
+/// Scaling this machine's 4.0 ms by the ~2x an A78 at 1.5 GHz gives away
+/// against these cores puts one embed at ~8 ms there, so §9.3's 4 x 10 ms
+/// = 40 ms leaves 26 ms for a detection that will itself cost ~15 ms --
+/// and nothing for anything else. Two embeds is ~16 ms beside ~15 ms of
+/// detection: half the frame, which is the half this sense may have.
+/// Raise it against a `tegrastats` reading, not against this comment.
+pub const MAX_EMBEDS_PER_FRAME: usize = 2;
+
+/// Frames a confidently named track goes without an `ArcFace` re-check
+/// while its box is holding still. Skipping these is the single biggest
+/// win in a stable crowd: in a room of eight people the bot has met, it
+/// takes the per-frame embed count from eight to zero.
+///
+/// 45 frames is 3 s at the configured 15 fps, chosen to match the mind's
+/// `PRESENCE_TTL` of 3 s (`rust/ARCHITECTURE.md`): a name is then never
+/// staler than the presence claim it rides on. A track whose box moves
+/// ([`REVERIFY_BOX_CHANGE`]) is re-checked at once regardless, which is
+/// the case that matters -- a still, named face is not where identities
+/// go wrong.
+pub const REVERIFY_FRAMES: u32 = 45;
+
+/// How far a named track's box may drift from where it was when the track
+/// was last embedded before the name is re-checked early, as a fraction of
+/// the box diagonal (centre move) or of the width (size change).
+///
+/// A quarter: SCRFD's box jitters a percent or two frame to frame and a
+/// person walking at 1 m/s across 1.5 m of corridor moves about a tenth of
+/// a box diagonal per frame at 15 fps, so this fires on the third frame of
+/// real movement and never on jitter.
+pub const REVERIFY_BOX_CHANGE: f32 = 0.25;
+
+/// Frames a track goes unembedded before the oldest of its identity votes
+/// is dropped (`docs/school/09-scene-model.md` §9.3 item 3: votes DECAY,
+/// they do not reset).
+///
+/// WHY 16: the decay must be slower than the worst-case round-robin gap,
+/// or a background track loses votes faster than the budget lets it cast
+/// them and never confirms at all -- which is exactly the failure §9.3
+/// warns about for a reset. At [`MAX_LIVE_TRACKS`] 16 and
+/// [`MAX_EMBEDS_PER_FRAME`] 2 the worst case is a turn every 8 frames, so
+/// 16 frames (~1 s at 15 fps) is two gained votes per one lost: the
+/// [`VOTE_WINDOW`] still fills, just at half speed, and
+/// `DEFAULT_VOTES_TO_CONFIRM` 5 is still reached. A vote 16 skipped frames
+/// old is also simply out of date -- the window itself is only 24.
+pub const VOTE_DECAY_FRAMES: u32 = 16;
+
+/// Predicted-box `IoU` at or above which two tracks count as crossing
+/// (`docs/school/09-scene-model.md` §9.2, CORRECTION "crossings").
+///
+/// DEGRADED, deliberately: §9.2 wants the *predicted* boxes of a Kalman
+/// (or constant-velocity) filter, which this tracker does not have yet, so
+/// the last observed boxes stand in. That is one frame late on a fast
+/// crossing and identical to §9.2 on a slow one. See `Track::crossing` for
+/// what is and is not done with it here.
+pub const CROSSING_IOU: f32 = 0.2;
+
+/// `facing` at or above which a track is "looking at the device". A local
+/// copy of `mind::engage::FACING_GATE` -- a sense crate may not depend on
+/// `mind` (`rust/ARCHITECTURE.md`, MODALITY-BLIND MIND), and this is used
+/// only to *rank* tracks for the embed budget, never to decide anything
+/// the mind decides.
+pub const FACING_GATE: f32 = 0.6;
+
+/// `lip_motion` at or above which a track is "talking". A local copy of
+/// `mind::engage::LIP_GATE`; see [`FACING_GATE`] for why it is copied.
+pub const LIP_GATE: f32 = 0.5;
 
 /// Keep the `cap` detections a crowd is about: the largest and most
 /// central faces. The score is face width weighted by how close the
@@ -96,6 +197,48 @@ pub fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     if union > 0.0 { inter / union } else { 0.0 }
 }
 
+/// Where a track sits on the embed-budget ladder this frame, best first.
+/// `Ord` follows the declaration order, so sorting a frame's tracks by
+/// this is the ladder of `docs/school/09-scene-model.md` §9.3 item 2:
+/// SPEAKER, then ENGAGED, then CANDIDATEs, then recently recognised, then
+/// everyone else.
+///
+/// TODO(§9.1): these are approximations of the seven-rung participant
+/// ladder, which lives in `mind` and does not exist yet
+/// (`docs/school/plan.md` slice 2 lands `mind/src/scene.rs`). They are
+/// built from what a `Track` already knows -- facing, lip motion, whether
+/// the vote has settled on a name, how long since the last embed, face
+/// width as a stand-in for NEARBY -- and no distance estimate, no
+/// enter/exit hysteresis and no wakeword. When the real ladder exists this
+/// should read the rung off the world snapshot instead of re-deriving it,
+/// and the two must not be allowed to disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EmbedPriority {
+    /// Facing the camera with the jaw moving: the person holding the floor
+    /// (§9.1 SPEAKER, approximated by [`FACING_GATE`] + [`LIP_GATE`]).
+    Speaker,
+    /// Facing the camera (§9.1 ENGAGED, approximated by [`FACING_GATE`]
+    /// with none of §9.1's enter/exit holds).
+    Engaged,
+    /// Overlapping another track's box while carrying a name: position
+    /// cannot separate the two here and appearance is the only independent
+    /// signal left (§9.2's crossing correction). Ranked above the ordinary
+    /// candidates because a name on the wrong face is §9.6's records
+    /// problem, not a bug the next turn corrects.
+    Reidentify,
+    /// Not yet named and big enough to be reported to the mind at all
+    /// (>= `pipeline::MIN_EMIT_FACE_PX`), which without a range sensor is
+    /// the only NEARBY estimate there is (§9.1 DEGRADATION).
+    Candidate,
+    /// Named, and due a cheap re-check ([`REVERIFY_FRAMES`]).
+    Reverify,
+    /// Tracked, unnamed, and too small to be reported: someone crossing
+    /// the corridor behind the person we are talking to. §9.3's "the far
+    /// end is embedded every few seconds, which is what a person walking
+    /// past is worth".
+    Background,
+}
+
 /// One face followed across frames.
 #[derive(Clone, Debug)]
 pub struct Track {
@@ -135,6 +278,38 @@ pub struct Track {
     /// Rolling facing / lip-motion windows, fed from the landmarks of every
     /// matched frame and cleared on a miss.
     pub attention: AttentionState,
+    /// Frames since this track last had an `ArcFace` forward pass spent on
+    /// it, counted by [`Tracker::update`] and reset by
+    /// [`Track::note_embedded`]. The budget's fairness term: within one
+    /// rung of the ladder the stalest track goes first, which is §9.3's
+    /// round robin.
+    pub frames_since_embed: u32,
+    /// How many `ArcFace` passes this track has been given, ever. Only for
+    /// the counters and the tests.
+    pub embeds: u64,
+    /// The box as it stood when this track was last embedded; `None`
+    /// before the first embed. See [`REVERIFY_BOX_CHANGE`].
+    pub bbox_at_embed: Option<[f32; 4]>,
+    /// Another live track's box overlaps this one's by at least
+    /// [`CROSSING_IOU`]. Set by [`Tracker::update`].
+    ///
+    /// DELIBERATELY NARROW. §9.2's correction is to raise the face
+    /// embedding's weight in the *assignment cost* for the crossing pair,
+    /// which presupposes a cost matrix and a per-detection embedding, and
+    /// this tracker has neither: association is greedy best-`IoU` per
+    /// detection, and the embedding is computed *after* the assignment,
+    /// from the track it was assigned to. Using appearance in the
+    /// association would mean embedding every detection before assigning
+    /// it -- the one thing [`MAX_EMBEDS_PER_FRAME`] exists to forbid. So
+    /// what this flag does is the part that is cheap and contained: it
+    /// promotes the crossing pair to [`EmbedPriority::Reidentify`], so the
+    /// frames where position fails are exactly the frames where the budget
+    /// is spent on appearance and the vote gets fresh evidence.
+    /// `docs/school/plan.md` slice 4 (predict -> cost -> Hungarian) is
+    /// where the assignment itself changes.
+    pub crossing: bool,
+    /// Frames since a vote was last dropped by [`Track::decay_vote`].
+    decay_frames: u32,
 }
 
 impl Track {
@@ -154,6 +329,11 @@ impl Track {
             confidence: 0.0,
             last_emitted: None,
             attention: AttentionState::default(),
+            frames_since_embed: 0,
+            embeds: 0,
+            bbox_at_embed: None,
+            crossing: false,
+            decay_frames: 0,
         }
     }
 
@@ -175,9 +355,45 @@ impl Track {
             *best = best.max(score);
         }
         self.votes.push_back(key);
+        // A fresh vote restarts the decay clock: the window is only going
+        // stale while nothing new is arriving.
+        self.decay_frames = 0;
+        self.settle(votes_to_confirm);
+    }
 
-        // Most common recent vote; ties broken by first appearance, like
-        // `Counter.most_common`.
+    /// One frame in which this track was NOT embedded, because the budget
+    /// ([`MAX_EMBEDS_PER_FRAME`]) went elsewhere. Every
+    /// [`VOTE_DECAY_FRAMES`] such frames the oldest vote is dropped and the
+    /// identity is re-settled.
+    ///
+    /// This is `docs/school/09-scene-model.md` §9.3 item 3, and the
+    /// distinction it insists on is the whole point: the votes DECAY, they
+    /// are not reset. Resetting would restart a skipped track from zero
+    /// every time the budget passed it over, and in a crowd a background
+    /// track would then never reach `votes_to_confirm` at all. Decay only
+    /// bleeds the window slower than the round robin refills it (see
+    /// [`VOTE_DECAY_FRAMES`]), so the N-frame vote still converges -- just
+    /// slower, which is correct for someone who is background.
+    ///
+    /// Note what decay cannot do: [`Track::settle`] only ever *changes* a
+    /// name for a winner that clears `votes_to_confirm`, so draining the
+    /// window never un-names a track by itself. A name is still only lost
+    /// to a confident "stranger" consensus, exactly as before.
+    pub fn decay_vote(&mut self, votes_to_confirm: usize) {
+        self.decay_frames = self.decay_frames.saturating_add(1);
+        if self.decay_frames < VOTE_DECAY_FRAMES {
+            return;
+        }
+        self.decay_frames = 0;
+        if self.votes.pop_front().is_some() {
+            self.settle(votes_to_confirm);
+        }
+    }
+
+    /// Re-read the confirmed identity off the current vote window. The
+    /// tally is the Python `Counter.most_common`: most common recent vote,
+    /// ties broken by first appearance.
+    fn settle(&mut self, votes_to_confirm: usize) {
         let mut counts: Vec<(Option<EntityId>, usize)> = Vec::new();
         for v in &self.votes {
             match counts.iter_mut().find(|(k, _)| k == v) {
@@ -207,6 +423,76 @@ impl Track {
         }
     }
 
+    /// One `ArcFace` pass was spent on this track this frame: restart the
+    /// staleness and re-verify clocks and remember where the box was.
+    pub fn note_embedded(&mut self) {
+        self.frames_since_embed = 0;
+        self.embeds = self.embeds.saturating_add(1);
+        self.bbox_at_embed = Some(self.bbox);
+    }
+
+    /// Whether the box has moved or resized by more than
+    /// [`REVERIFY_BOX_CHANGE`] since the last embed. `true` when the track
+    /// has never been embedded: there is nothing to compare against, and an
+    /// unembedded track is due by definition.
+    pub fn box_changed_since_embed(&self) -> bool {
+        let Some(was) = self.bbox_at_embed else {
+            return true;
+        };
+        let (w, h) = ((was[2] - was[0]).max(1.0), (was[3] - was[1]).max(1.0));
+        let diag = w.hypot(h).max(1.0);
+        let dx = f32::midpoint(self.bbox[0], self.bbox[2]) - f32::midpoint(was[0], was[2]);
+        let dy = f32::midpoint(self.bbox[1], self.bbox[3]) - f32::midpoint(was[1], was[3]);
+        if dx.hypot(dy) / diag > REVERIFY_BOX_CHANGE {
+            return true;
+        }
+        let now_w = (self.bbox[2] - self.bbox[0]).max(0.0);
+        (now_w - w).abs() / w > REVERIFY_BOX_CHANGE
+    }
+
+    /// Where this track sits on the embed ladder this frame, or `None`
+    /// when it should be skipped entirely.
+    ///
+    /// The skip is the important half. A track whose vote has settled on a
+    /// name, whose box is holding still and whose re-verify timer has not
+    /// elapsed learns nothing from another 4 ms of `ArcFace`: it would
+    /// cast the vote it has already cast, `votes_to_confirm` times over.
+    /// In a stable crowd of people the bot has already met this takes the
+    /// per-frame embed count to zero and leaves the whole budget for
+    /// whoever just walked in.
+    ///
+    /// `min_emit_px` is `pipeline::MIN_EMIT_FACE_PX`: a face under it is
+    /// tracked but never reported, which is this crate's only estimate of
+    /// "not NEARBY" until a range sensor exists (§9.1 DEGRADATION).
+    pub fn embed_priority(&self, min_emit_px: f32, reverify_frames: u32) -> Option<EmbedPriority> {
+        let att = self.attention.scores();
+        if self.person.is_some() {
+            // Named. The only reasons to spend an embed are the timer and a
+            // box that moved: being the speaker does not make a settled
+            // name any more settled.
+            let due = self.frames_since_embed >= reverify_frames || self.box_changed_since_embed();
+            if !due {
+                return None;
+            }
+            // A named track overlapping another is §9.2's crossing, which
+            // is exactly where a name gets handed to the wrong face.
+            if self.crossing {
+                return Some(EmbedPriority::Reidentify);
+            }
+            return Some(EmbedPriority::Reverify);
+        }
+        if att.facing >= FACING_GATE && att.lips >= LIP_GATE {
+            return Some(EmbedPriority::Speaker);
+        }
+        if att.facing >= FACING_GATE {
+            return Some(EmbedPriority::Engaged);
+        }
+        if self.bbox[2] - self.bbox[0] >= min_emit_px {
+            return Some(EmbedPriority::Candidate);
+        }
+        Some(EmbedPriority::Background)
+    }
+
     /// Store a unit-length embedding, dropping the oldest past the window.
     pub fn push_embedding(&mut self, emb: Arc<[f32]>) {
         self.push_embedding_scored(emb, 0.0);
@@ -218,11 +504,7 @@ impl Track {
     /// where the person was facing the camera, not whichever frame
     /// happened to be last.
     pub fn push_embedding_scored(&mut self, emb: Arc<[f32]>, quality: f32) {
-        if self
-            .best
-            .as_ref()
-            .is_none_or(|(_, q)| quality > *q)
-        {
+        if self.best.as_ref().is_none_or(|(_, q)| quality > *q) {
             self.best = Some((Arc::clone(&emb), quality));
         }
         if self.embeddings.len() == EMBEDDING_HISTORY {
@@ -296,6 +578,14 @@ impl Tracker {
     /// otherwise starts a new track. Tracks left unmatched age by one frame
     /// and are dropped past `max_age_frames`.
     pub fn update(&mut self, dets: &[Detection]) -> Vec<Assignment> {
+        // Before anything moves: every track is one frame staler, and the
+        // crossing flags describe the boxes as they stood coming in, which
+        // is this tracker's stand-in for §9.2's predicted boxes (see
+        // [`CROSSING_IOU`]).
+        self.mark_crossings();
+        for t in self.tracks.values_mut() {
+            t.frames_since_embed = t.frames_since_embed.saturating_add(1);
+        }
         let mut unmatched: Vec<u32> = self.tracks.keys().copied().collect();
         // Deterministic visiting order so ties resolve the same way every
         // frame (HashMap iteration order is not).
@@ -350,6 +640,68 @@ impl Tracker {
             }
         }
         out
+    }
+
+    /// Flag every pair of live tracks whose boxes overlap by at least
+    /// [`CROSSING_IOU`]. O(n^2) over at most [`MAX_LIVE_TRACKS`] tracks --
+    /// 120 `IoU` evaluations at 16, tens of nanoseconds each, against one
+    /// `ArcFace` forward at ~4 ms.
+    fn mark_crossings(&mut self) {
+        let boxes: Vec<(u32, [f32; 4])> = self
+            .tracks
+            .values()
+            .filter(|t| t.is_live())
+            .map(|t| (t.id, t.bbox))
+            .collect();
+        let mut crossing: Vec<u32> = Vec::new();
+        for (i, (id_a, a)) in boxes.iter().enumerate() {
+            for (id_b, b) in &boxes[i + 1..] {
+                if iou(a, b) >= CROSSING_IOU {
+                    crossing.push(*id_a);
+                    crossing.push(*id_b);
+                }
+            }
+        }
+        for t in self.tracks.values_mut() {
+            t.crossing = crossing.contains(&t.id);
+        }
+    }
+
+    /// Which of this frame's assignments get an `ArcFace` forward pass,
+    /// as indices into `assignments`, best first and at most `cap` of them
+    /// (`cap` 0 means no cap, which is the pre-budget behaviour and what
+    /// `examples/perf.rs` measures against).
+    ///
+    /// This is `docs/school/09-scene-model.md` §9.3 item 2. The ladder is
+    /// [`EmbedPriority`]; within one rung the stalest track goes first,
+    /// which makes the pass over a rung a round robin rather than a
+    /// popularity contest -- without it the same two faces would be
+    /// re-embedded every frame and the twelfth would never be named. Ties
+    /// break on track id so the order is deterministic frame to frame.
+    ///
+    /// Detection is NOT rationed here and must not be: SCRFD is one pass
+    /// over the frame whatever the face count (§9.3 item 4).
+    pub fn schedule_embeds(
+        &self,
+        assignments: &[Assignment],
+        cap: usize,
+        min_emit_px: f32,
+        reverify_frames: u32,
+    ) -> Vec<usize> {
+        let mut ranked: Vec<(EmbedPriority, u32, u32, usize)> = assignments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                let t = self.tracks.get(&a.track)?;
+                let p = t.embed_priority(min_emit_px, reverify_frames)?;
+                Some((p, t.frames_since_embed, t.id, i))
+            })
+            .collect();
+        // Rung ascending (Speaker first), then staleness descending, then
+        // track id ascending.
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        let take = if cap == 0 { ranked.len() } else { cap };
+        ranked.into_iter().take(take).map(|r| r.3).collect()
     }
 
     /// A track by id.
@@ -558,9 +910,12 @@ mod tests {
             dets.iter().any(|d| (d.bbox[0] - 300.0).abs() < 1e-6),
             "centre kept"
         );
-        // ... the smallest edge faces are gone (edge faces score three
-        // quarters of their width: 38 px is the twelfth), the largest stay.
-        assert!(dets.iter().all(|d| d.bbox[2] - d.bbox[0] >= 38.0));
+        // ... the smallest edge faces are gone (edge faces score about
+        // three quarters of their width, so the cap keeps the centre face
+        // plus the `cap - 1` widest edges: 58, 56, ... down to this), the
+        // largest stay.
+        let smallest_kept = 58.0 - 2.0 * (MAX_LIVE_TRACKS - 2) as f32;
+        assert!(dets.iter().all(|d| d.bbox[2] - d.bbox[0] >= smallest_kept));
         assert!(
             dets.iter()
                 .any(|d| (d.bbox[2] - d.bbox[0] - 58.0).abs() < 1e-6)

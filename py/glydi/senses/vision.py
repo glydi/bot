@@ -1,6 +1,8 @@
 """The eyes: a camera, faces, and stable names for them.
 
-Backend: `cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)` at 1280x720, and
+Backend: `cv2.VideoCapture(0, backend)` at 1280x720, where the backend is
+picked per platform by `open_capture` (AVFoundation on macOS, DirectShow
+then Media Foundation on Windows, whatever cv2 finds elsewhere), and
 insightface's `FaceAnalysis(name="buffalo_s")` on the CPU provider with
 `det_size=(320, 320)` -- that path loads the models already on disk at
 `~/.insightface/models/buffalo_s`, so the direct-onnxruntime fallback
@@ -28,6 +30,7 @@ puts `Observation`s on the ring.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections import deque
@@ -244,6 +247,56 @@ def lip_level(history: list[float] | deque[float]) -> float:
     return float(min(1.0, var / LIP_FULL_VARIANCE))
 
 
+# --- the camera -------------------------------------------------------
+
+
+def camera_backends() -> list[int]:
+    """The cv2 capture backends to try for this platform, in order.
+
+    AVFoundation is the only one that works on macOS. On Windows
+    DirectShow opens most webcams and opens them fast; Media Foundation
+    catches the ones it will not; CAP_ANY is the last resort everywhere.
+    """
+    import cv2
+
+    if sys.platform == "darwin":
+        return [cv2.CAP_AVFOUNDATION]
+    if sys.platform == "win32":
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    return [cv2.CAP_ANY]
+
+
+def open_capture(index: int) -> Any:
+    """An opened `cv2.VideoCapture` on `index`, whichever backend takes it.
+
+    Raises RuntimeError with the thing to check on *this* platform: the
+    macOS hint on a Windows box sent one user to a settings pane that
+    does not exist.
+    """
+    import cv2
+
+    for backend in camera_backends():
+        cap = cv2.VideoCapture(index, backend)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    if sys.platform == "darwin":
+        hint = (
+            "On macOS this is usually the privacy prompt: System Settings > "
+            "Privacy & Security > Camera, and the app that launched this process "
+            "must be ticked."
+        )
+    elif sys.platform == "win32":
+        hint = (
+            "On Windows check Settings > Privacy & security > Camera (camera access "
+            "and desktop-app access both on), and that no other app -- Teams, a "
+            "browser tab -- is holding the device."
+        )
+    else:
+        hint = "Check that the device exists and this user may read it."
+    raise RuntimeError(f"camera {index} would not open. {hint}")
+
+
 # --- the tracker ------------------------------------------------------
 
 
@@ -371,16 +424,10 @@ class VisionSense(threading.Thread):
     # -- the pieces, separately, so each can be exercised on its own ---
 
     def open_camera(self) -> Any:
-        """The AVFoundation capture, configured and probed."""
+        """The platform's capture, configured and probed."""
         import cv2
 
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"camera {self.camera_index} would not open. On macOS this is usually "
-                "the privacy prompt: System Settings > Privacy & Security > Camera, "
-                "and the app that launched this process must be ticked."
-            )
+        cap = open_capture(self.camera_index)
         # Requests, not guarantees: a camera that offers neither just keeps
         # its own size and the rest of this file works off frame.shape.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WANT_WIDTH)

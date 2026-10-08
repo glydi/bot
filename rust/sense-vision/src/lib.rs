@@ -36,8 +36,21 @@
 //! - [`coco`], [`objects`]: the COCO labels, the YOLO decode + NMS, the
 //!   per-class presence dedup and the object thread.
 //! - [`gesture`], [`scene`]: the motion and lighting state machines.
-//! - `camera`: `AVFoundation` capture. The only `unsafe` in the crate.
+//! - `camera`: `AVFoundation` capture (macOS). The only `unsafe` in the
+//!   crate.
+//! - `camera_v4l2`: V4L2 capture (Linux), no `unsafe`.
 //! - [`pipeline`]: the loop; [`VisionSense`] spawns it on its own thread.
+//!
+//! # Linux / Jetson
+//!
+//! On Linux (the Jetson Orin Nano under `JetPack` 6 included) the camera is
+//! a V4L2 device: any USB UVC camera works out of the box, `MJPG`
+//! preferred and `YUYV` as the fallback, at the size and rate the config
+//! asks for (`v4l2-ctl --list-formats-ext -d /dev/video0` shows what the
+//! camera offers). The process needs read/write access to `/dev/videoN`,
+//! which means the user is in the `video` group. CSI cameras (the Jetson
+//! camera connector) are not V4L2 capture devices in a usable sense --
+//! they need a GStreamer/Argus source, which does not exist yet.
 
 #![deny(unsafe_code)]
 
@@ -46,6 +59,8 @@ pub mod arcface;
 pub mod attention;
 #[cfg(target_os = "macos")]
 pub mod camera;
+#[cfg(target_os = "linux")]
+pub mod camera_v4l2;
 pub mod coco;
 pub mod gallery;
 pub mod gesture;
@@ -57,7 +72,7 @@ pub mod scrfd;
 pub mod source;
 pub mod tracker;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -95,8 +110,8 @@ pub enum Error {
     /// Opening or reading the camera.
     #[error("camera: {0}")]
     Camera(String),
-    /// Camera capture is only implemented for macOS.
-    #[error("camera capture is only implemented for macOS (AVFoundation)")]
+    /// Camera capture is only implemented for macOS and Linux.
+    #[error("camera capture is only implemented for macOS (AVFoundation) and Linux (V4L2)")]
     Unsupported,
     /// Five consecutive all-black frames: on macOS the signature of a TCC
     /// denial (an unbundled binary has no `NSCameraUsageDescription`), not
@@ -162,7 +177,8 @@ pub enum Error {
 pub enum Source {
     /// A live camera.
     Camera {
-        /// Device index in `AVFoundation` discovery order (`GLYDI_CAMERA_INDEX`).
+        /// Device index (`GLYDI_CAMERA_INDEX`): `AVFoundation` discovery
+        /// order on macOS, the `N` of `/dev/videoN` on Linux.
         index: usize,
         /// Requested capture width. 1280x720 like the Go build: the
         /// detector shrinks it to 320 anyway, but `ArcFace` crops from the
@@ -192,6 +208,22 @@ pub enum Source {
         interval: Duration,
     },
 }
+
+/// Intra-op threads every ONNX session in this crate is opened with.
+///
+/// MEASURED on this build's `x86_64` desk machine (ORT 1.28.2, CPU EP,
+/// `cargo run -p sense-vision --release --example perf`): see the table in
+/// `examples/perf.rs`. Two is the knee for both models on the critical
+/// path -- SCRFD 320 goes 1 -> 2 threads for a real saving and buys almost
+/// nothing at 4, and `ArcFace` (`MobileFaceNet`, 112x112) is small enough that
+/// past two threads the fork/join overhead eats the gain.
+///
+/// It stays low on purpose. On the Jetson Orin Nano the six A78 cores are
+/// shared with the LLM, the audio pipeline and the object thread, so an
+/// over-threaded vision session does not make the frame faster, it makes
+/// everything else slower (`docs/school/plan.md` §4). Raise it only with a
+/// `tegrastats` reading in hand.
+pub const DEFAULT_INTRA_THREADS: usize = 2;
 
 /// Configuration. Defaults are the Python `VisionConfig` values where they
 /// exist and the Go defaults otherwise; each field says which.
@@ -244,6 +276,16 @@ pub struct VisionConfig {
     pub gestures: Option<GestureConfig>,
     /// Lighting thresholds; `None` turns `scene` observations off.
     pub scene: Option<SceneConfig>,
+    /// Intra-op threads for every ONNX session this sense opens (SCRFD,
+    /// `ArcFace`, YOLO). See [`DEFAULT_INTRA_THREADS`]; `examples/perf.rs`
+    /// is the harness that measures it.
+    pub intra_threads: usize,
+    /// How many `ArcFace` forward passes one frame may spend. See
+    /// [`tracker::MAX_EMBEDS_PER_FRAME`], which is the default.
+    pub max_embeds_per_frame: usize,
+    /// Frames between re-verifications of a confidently named, still track.
+    /// See [`tracker::REVERIFY_FRAMES`], which is the default.
+    pub reverify_frames: u32,
     /// Width the frame is shrunk to (by an integer factor) for the motion
     /// and lighting heuristics: 160 px. A hand beside a face is still tens
     /// of pixels wide at that size and the whole frame costs ~0.3 ms.
@@ -275,18 +317,46 @@ impl Default for VisionConfig {
             objects: ObjectConfig::default(),
             gestures: Some(GestureConfig::default()),
             scene: Some(SceneConfig::default()),
+            intra_threads: DEFAULT_INTRA_THREADS,
+            max_embeds_per_frame: tracker::MAX_EMBEDS_PER_FRAME,
+            reverify_frames: tracker::REVERIFY_FRAMES,
             gray_width: 160,
         }
     }
 }
 
+/// The variable that moves the three vision graphs to the GPU:
+/// `GLYDI_VISION_GPU=1` (`GLYDI_TRT=1` on top for `TensorRT`; see
+/// [`accel`]). Off by default: on this desk SCRFD-500M at 320 is ~5 ms on
+/// a core and the GPU is the voice's; on the Jetson, where every core is
+/// spoken for, the `TensorRT` path is the one that keeps the face loop at
+/// frame rate.
+pub const VISION_GPU_ENV: &str = "GLYDI_VISION_GPU";
+
+/// [`VISION_GPU_ENV`] as an [`accel::Accel`].
+pub fn vision_accel() -> accel::Accel {
+    accel::Accel::from_env(VISION_GPU_ENV)
+}
+
+/// Where `TensorRT` keeps the engines for the model at `model_path`:
+/// `trt_cache/` beside it.
+pub fn trt_cache_dir(model_path: &Path) -> PathBuf {
+    model_path
+        .parent()
+        .map(|d| d.join("trt_cache"))
+        .unwrap_or_default()
+}
+
 /// `~/.insightface/models/buffalo_s`, or the current directory if `HOME` is
-/// unset (the model check will then report a clear "not found").
+/// unset (the model check will then report a clear "not found"). Windows
+/// spells the home `USERPROFILE`.
 pub fn default_models_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || PathBuf::from("."),
-        |h| PathBuf::from(h).join(".insightface/models/buffalo_s"),
-    )
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map_or_else(
+            || PathBuf::from("."),
+            |h| PathBuf::from(h).join(".insightface/models/buffalo_s"),
+        )
 }
 
 impl VisionConfig {
@@ -322,8 +392,10 @@ impl VisionConfig {
             self.det_size,
             self.score_threshold,
             self.nms_threshold,
+            self.intra_threads,
         )?;
-        let embedder = arcface::ArcFace::open(&self.recogniser_path(), &self.ort_lib)?;
+        let embedder =
+            arcface::ArcFace::open(&self.recogniser_path(), &self.ort_lib, self.intra_threads)?;
         let objects = self.open_objects();
         Ok(Parts {
             source,
@@ -350,6 +422,7 @@ impl VisionConfig {
             &self.ort_lib,
             self.objects.score_threshold,
             self.objects.nms_threshold,
+            self.intra_threads,
         ) {
             Ok(y) => Some(Box::new(y)),
             Err(e) => {
@@ -400,7 +473,19 @@ fn open_camera(
     Ok(Box::new(camera::Camera::open(index, width, height, fps)?))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn open_camera(
+    index: usize,
+    width: usize,
+    height: usize,
+    fps: u32,
+) -> Result<Box<dyn FrameSource>, Error> {
+    Ok(Box::new(camera_v4l2::Camera::open(
+        index, width, height, fps,
+    )?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_camera(
     _index: usize,
     _width: usize,
@@ -408,6 +493,26 @@ fn open_camera(
     _fps: u32,
 ) -> Result<Box<dyn FrameSource>, Error> {
     Err(Error::Unsupported)
+}
+
+/// The video devices the camera backend of this platform can see, one
+/// line each, in index order (the index is what `Source::Camera` takes).
+/// For `glydi check`: one call whatever the platform, [`Error::Unsupported`]
+/// where there is no backend. On macOS the localized device names; on
+/// Linux `"/dev/video0: <name> (<formats>)"`, capture nodes only.
+pub fn camera_devices() -> Result<Vec<String>, Error> {
+    #[cfg(target_os = "macos")]
+    {
+        camera::devices()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        camera_v4l2::devices()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(Error::Unsupported)
+    }
 }
 
 /// The sense. Only a namespace for [`VisionSense::spawn`].

@@ -21,6 +21,7 @@ tracing = { workspace = true }
 cpal = { workspace = true }
 hound = { workspace = true }
 ort = { workspace = true }
+accel = { workspace = true }
 whisper-rs = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

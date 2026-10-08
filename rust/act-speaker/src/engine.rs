@@ -37,13 +37,16 @@
 //! choppy. Sentence order is untouched -- the two halves are consecutive
 //! jobs on the same FIFO.
 //!
-//! The synth thread reports `speaker_latency` (`Payload::Level`, in
+//! The synth thread reports `synthesised` (`Payload::Text`, the first 40
+//! chars of the sentence) for every job the moment the backend produces
+//! its first audio, and `speaker_latency` (`Payload::Level`, in
 //! milliseconds) for the first chunk of each reply: how long the backend
-//! took to produce its first audio, sent the moment that audio exists and
-//! before it is handed on, so it precedes `self_speaking` on the ring. A
-//! chunk that is stopped or yields no audio reports nothing. Together with
-//! `self_speaking` that is the `tts` leg of `common::TurnTimeline` split
-//! into "synth" and "device start".
+//! took to produce that audio. Both are sent before the audio is handed
+//! on, so they precede `self_speaking` on the ring. A chunk that is
+//! stopped or yields no audio reports nothing. `synthesised` is the `tts`
+//! leg of `common::TurnTimeline`: a reply queued behind one still playing
+//! never flips `self_speaking`, so playback cannot time it, and the
+//! queue wait is not synthesis.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -353,9 +356,17 @@ fn synth_loop(
                 let waited = started.elapsed();
                 first_audio = Some(waited);
                 // Reported here, before the chunk reaches the play thread,
-                // so on the ring `speaker_latency` always precedes the
-                // `self_speaking` / `spoke` it explains -- and so it is
-                // the wait for the first chunk, not for the whole job.
+                // so on the ring `synthesised` and `speaker_latency`
+                // always precede the `self_speaking` / `spoke` they
+                // explain -- and so they are the wait for the first
+                // chunk, not for the whole job.
+                //
+                // `synthesised` goes out for every job: a reply queued
+                // behind one still playing never flips `self_speaking`,
+                // so this is the only mark of when its audio existed
+                // (the `tts` leg of `common::TurnTimeline`). It names
+                // the sentence so the reader can tell whose it is.
+                report.send("synthesised", Payload::Text(spoke_text(&job.text)));
                 if job.first {
                     report.send("speaker_latency", Payload::Level(waited.as_millis() as f32));
                 }

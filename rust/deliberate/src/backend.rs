@@ -123,7 +123,22 @@ pub struct OpenAiBackend {
     api_key: Option<String>,
     model: String,
     http: reqwest::Client,
+    /// `true` while [`Self::warm`] is in flight. Ollama serves one request
+    /// at a time per model (`OLLAMA_NUM_PARALLEL=1`), so a turn sent
+    /// during the warm-up queues behind the model load and the prompt
+    /// pre-fill (~12 s cold on qwen2.5:3b) and looks like a stall; a turn
+    /// waits for the warm-up instead (bounded by `WARM_WAIT`).
+    warming: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
 }
+
+/// How long a turn waits for an in-flight warm-up before sending anyway.
+const WARM_WAIT: Duration = Duration::from_secs(20);
+
+/// Ollama's `keep_alive`: `-1` keeps the model resident instead of unloading
+/// it five minutes after the last request (its default), which otherwise
+/// makes the first turn after a quiet spell pay the load again. Honoured on
+/// the `OpenAI` endpoint; other servers ignore the unknown field.
+const KEEP_ALIVE_FOREVER: i64 = -1;
 
 // --- wire format ---------------------------------------------------------
 
@@ -169,6 +184,7 @@ struct WireRequest<'a> {
     /// `OpenAI` endpoint).
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    keep_alive: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -334,7 +350,31 @@ impl OpenAiBackend {
             api_key,
             model: model.to_owned(),
             http,
+            warming: std::sync::Arc::new(tokio::sync::watch::Sender::new(false)),
         })
+    }
+
+    /// Wait for an in-flight [`Self::warm`] to finish, up to `WARM_WAIT`.
+    async fn await_warm(&self) {
+        let mut rx = self.warming.subscribe();
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        tracing::info!("turn waits for the warm-up");
+        let waited = tokio::time::timeout(WARM_WAIT, async {
+            while rx.changed().await.is_ok() {
+                if !*rx.borrow_and_update() {
+                    break;
+                }
+            }
+        })
+        .await;
+        tracing::info!(
+            ms = started.elapsed().as_millis(),
+            timed_out = waited.is_err(),
+            "warm-up waited for"
+        );
     }
 
     /// The model name in use.
@@ -382,6 +422,7 @@ impl OpenAiBackend {
                 .json_object
                 .then(|| serde_json::json!({"type": "json_object"})),
             reasoning_effort: self.reasoning_effort(),
+            keep_alive: KEEP_ALIVE_FOREVER,
         };
         let mut r = self
             .http
@@ -483,6 +524,13 @@ impl OpenAiBackend {
     /// log shows whether the model was already warm.
     pub async fn warm(&self, system: &str, tools: Vec<ToolSpec>) -> Result<Duration, LlmError> {
         let started = std::time::Instant::now();
+        self.warming.send_replace(true);
+        let result = self.warm_request(system, tools).await;
+        self.warming.send_replace(false);
+        result.map(|()| started.elapsed())
+    }
+
+    async fn warm_request(&self, system: &str, tools: Vec<ToolSpec>) -> Result<(), LlmError> {
         let req = ChatRequest {
             messages: vec![Message::system(system), Message::user("hi")],
             tools,
@@ -504,7 +552,7 @@ impl OpenAiBackend {
                 body: body.trim().to_owned(),
             });
         }
-        Ok(started.elapsed())
+        Ok(())
     }
 }
 
@@ -602,6 +650,7 @@ fn stream_events(
             State::Body(s) => s,
             State::Start(start) => {
                 let (this, req) = *start;
+                this.await_warm().await;
                 let resp = match this.build(&req, true).send().await {
                     Ok(r) => r,
                     Err(e) => return Some((Err(this.transport(e)), State::Done)),
@@ -717,6 +766,7 @@ mod tests {
             stream: true,
             response_format: Some(serde_json::json!({"type": "json_object"})),
             reasoning_effort: Some("none"),
+            keep_alive: KEEP_ALIVE_FOREVER,
         };
         let v = serde_json::to_value(&body).unwrap_or_default();
         assert_eq!(v["messages"][2]["tool_calls"][0]["id"], "call_0");

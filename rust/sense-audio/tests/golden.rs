@@ -25,7 +25,16 @@ fn golden_signal() -> Vec<f32> {
 
 #[test]
 fn features_match_go_golden_vector() {
-    let bytes = include_bytes!("data/golden_features.f32");
+    // Read at run time, not `include_bytes!`: the dump is gitignored
+    // (`data/`), so a fresh clone has none, and a test target that cannot
+    // compile takes the whole crate's test run down with it. Without the
+    // file the test skips and says so.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/golden_features.f32");
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("skipping: no Go golden dump at {}", path.display());
+        return;
+    };
     let want: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

@@ -22,3 +22,5 @@ train/fused-*/
 py/.venv/
 py/**/__pycache__/
 .pytest_cache/
+train/.venv-cuda/
+train/tools/

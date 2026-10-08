@@ -213,11 +213,15 @@ fn db(path: &Path) -> Line {
 
 fn mic(device: Option<&str>) -> Line {
     let host = cpal::default_host();
+    // The same match the sense uses, so what the check names is what the
+    // run opens.
     let found = match device {
-        Some(name) => host
-            .input_devices()
-            .ok()
-            .and_then(|mut it| it.find(|d| d.description().is_ok_and(|d| d.name().contains(name)))),
+        Some(name) => host.input_devices().ok().and_then(|mut it| {
+            it.find(|d| {
+                d.description()
+                    .is_ok_and(|d| sense_audio::input::device_name_matches(d.name(), name))
+            })
+        }),
         None => host.default_input_device(),
     };
     let detail = match &found {
@@ -287,10 +291,22 @@ fn mic_permission(device: Option<&str>) -> Line {
 
 #[cfg(feature = "vision")]
 fn camera() -> Line {
-    let (ok, detail) = match sense_vision::camera::devices() {
+    // One call whatever the backend: AVFoundation on macOS, V4L2 on Linux,
+    // `Unsupported` where there is neither. The sense picks, so the check
+    // reports exactly what the run would open rather than a guess of its
+    // own.
+    let (ok, detail) = match sense_vision::camera_devices() {
         Ok(names) if names.is_empty() => (false, "no video devices".to_owned()),
         Ok(names) => (true, names.join(", ")),
         Err(e) => (false, e.to_string()),
+    };
+    // On Linux the kernel's own list is the thing to compare against: a
+    // UVC camera that is plugged in but missing here is a permissions
+    // (`video` group) or driver problem, and `v4l2-ctl` says which.
+    let detail = if cfg!(target_os = "linux") {
+        format!("{detail} (compare: v4l2-ctl --list-devices)")
+    } else {
+        detail
     };
     Line {
         what: "camera",
@@ -361,17 +377,40 @@ fn speaker(tts: Tts) -> Line {
             },
         },
         Tts::Kokoro => {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let home = crate::config::home_dir();
             let model = home
                 .as_ref()
                 .map(|h| h.join(".cache/pipecat/kokoro-onnx/kokoro-v1.0.onnx"));
-            let espeak = [
-                "/opt/homebrew/lib/libespeak-ng.dylib",
-                "/usr/local/lib/libespeak-ng.dylib",
-            ]
-            .iter()
-            .map(Path::new)
-            .find(|p| p.is_file());
+            // The fixed places the synth looks (`synth::espeak`), minus
+            // the `.venv` wheel and the bare-name loader search, which this
+            // check cannot vouch for. `PHONEMIZER_ESPEAK_LIBRARY` first, as
+            // the synth honours it; on Windows that is how the DLL is
+            // usually named, since there is no conventional library path.
+            let explicit =
+                std::env::var_os("PHONEMIZER_ESPEAK_LIBRARY").map(std::path::PathBuf::from);
+            let fixed: Vec<String> = if cfg!(target_os = "windows") {
+                vec![r"C:\Program Files\eSpeak NG\libespeak-ng.dll".to_owned()]
+            } else if cfg!(target_os = "linux") {
+                // apt's `libespeak-ng1` lands in the multiarch directory
+                // (`aarch64-linux-gnu` on the Jetson) as the soname only.
+                vec![
+                    format!(
+                        "/usr/lib/{}-linux-gnu/libespeak-ng.so.1",
+                        std::env::consts::ARCH
+                    ),
+                    "/usr/lib/libespeak-ng.so.1".to_owned(),
+                    "/usr/local/lib/libespeak-ng.so.1".to_owned(),
+                ]
+            } else {
+                vec![
+                    "/opt/homebrew/lib/libespeak-ng.dylib".to_owned(),
+                    "/usr/local/lib/libespeak-ng.dylib".to_owned(),
+                ]
+            };
+            let espeak = explicit
+                .into_iter()
+                .chain(fixed.iter().map(std::path::PathBuf::from))
+                .find(|p| p.is_file());
             let compiled = cfg!(feature = "kokoro");
             let ok = compiled && model.as_ref().is_some_and(|p| p.is_file()) && espeak.is_some();
             let detail = format!(

@@ -73,7 +73,9 @@ fn utterance_is_answered_and_remembered() {
     app.observations().send(
         Observation::new("mic0", "utterance", app.clock().now())
             .with_entity(EntityHint::Known(EntityId::new("john")))
-            .with_payload(Payload::Text("hello my name is John".to_owned())),
+            .with_payload(Payload::Text(
+                "hello, what do you think of tigers?".to_owned(),
+            )),
     );
 
     // The scripted answer reached synthesis.
@@ -94,7 +96,8 @@ fn utterance_is_answered_and_remembered() {
             .events_of(&session, &EntityId::new("john"))
             .is_ok_and(|ev| {
                 ev.iter().any(|(kind, _, detail)| {
-                    kind == "SAID" && detail.as_deref() == Some("hello my name is John")
+                    kind == "SAID"
+                        && detail.as_deref() == Some("hello, what do you think of tigers?")
                 })
             })
     }));

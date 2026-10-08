@@ -396,5 +396,6 @@ fn demo_sources(faces: bool) -> Sources {
         // What the strip's "heard" line shows; the "said" line comes
         // from the driver's own `spoke` observations.
         heard: Box::new(|| Some("does the library shut at six".to_owned())),
+        school: Box::new(|| None),
     }
 }

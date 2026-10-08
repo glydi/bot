@@ -36,7 +36,9 @@ memory = { path = "../memory" }
 sense-audio = { path = "../sense-audio" }
 sense-vision = { path = "../sense-vision", optional = true }
 act-speaker = { path = "../act-speaker" }
+libloading = { workspace = true }
 act-ui = { path = "../act-ui" }
+school = { workspace = true }
 bench = { path = "../bench" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }

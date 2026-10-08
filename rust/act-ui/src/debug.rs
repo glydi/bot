@@ -48,6 +48,9 @@ pub struct Sources {
     /// that returns `None`) when nothing has been transcribed yet, or
     /// when there is no event log to read.
     pub heard: Getter<Option<String>>,
+    /// The school link's view of attendance (see
+    /// [`crate::visitor::SchoolView`]); `None` when no ERP is configured.
+    pub school: Getter<Option<crate::visitor::SchoolView>>,
 }
 
 impl Sources {
@@ -60,6 +63,7 @@ impl Sources {
             latency: None,
             known_count: None,
             heard: Box::new(|| None),
+            school: Box::new(|| None),
         }
     }
 }
@@ -465,6 +469,7 @@ mod tests {
             latency: Some(Box::new(|| vec![turn(1, Some(310), Some(1420), Some(180))])),
             known_count: Some(Box::new(|| 4)),
             heard: Box::new(|| Some("is the bus late".to_owned())),
+            school: Box::new(|| None),
         };
         assert_eq!((full.heard)().as_deref(), Some("is the bus late"));
         assert_eq!((empty.heard)(), None);

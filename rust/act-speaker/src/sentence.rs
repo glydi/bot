@@ -37,8 +37,18 @@ pub const MIN_FIRST_SPLIT_WORDS: usize = 8;
 /// fragment ("Well,") that sounds clipped when the next chunk is late.
 pub const MIN_HEAD_WORDS: usize = 3;
 
-/// ...and at most this many. Past eight words the head is most of a normal
-/// sentence and the split no longer buys a shorter wait.
+/// ...and at most this many, or half the sentence if that is more. Past
+/// eight words the head is most of a *normal* sentence and the split no
+/// longer buys a shorter wait -- but half of a thirty-word sentence is
+/// not, and the alternative there is worse than a long head: with no
+/// boundary inside the window [`first_clause`] gives up, the whole
+/// sentence becomes one job, and Kokoro's own [`phrases`] cut then starts
+/// on a chunk of [`MIN_SPLIT_CHARS`]-plus. Measured
+/// (`tests/synth_timing.rs`, `kokoro_first_audio_by_length`): Kokoro's
+/// synthesis is ~300 ms fixed plus ~90 ms a word, so on a thirty-six-word
+/// sentence whose first comma falls at word nine, taking that comma is
+/// 2.6 s to first audio down to ~1.1 s. Half is the bound because the
+/// head must still leave a tail worth pipelining behind it.
 pub const MAX_HEAD_WORDS: usize = 8;
 
 /// A head this long may also be cut before a conjunction ("and", "but",
@@ -133,14 +143,17 @@ pub fn phrases(text: &str) -> Vec<String> {
 /// ("Dr.," "e.g.,"): a dotted word before the mark is not a pause, and the
 /// synth would read the fragment with the wrong intonation. Sentences under
 /// [`MIN_FIRST_SPLIT_WORDS`] words, heads outside
-/// [`MIN_HEAD_WORDS`]..=[`MAX_HEAD_WORDS`], and tails under
+/// [`MIN_HEAD_WORDS`]..=[`MAX_HEAD_WORDS`] (or half the sentence, when
+/// that is the longer window -- see [`MAX_HEAD_WORDS`]), and tails under
 /// [`MIN_REST_WORDS`] words all mean `None`.
 pub fn first_clause(sentence: &str) -> Option<(String, String)> {
     let words: Vec<&str> = sentence.split_whitespace().collect();
     if words.len() < MIN_FIRST_SPLIT_WORDS {
         return None;
     }
-    let last_head = MAX_HEAD_WORDS.min(words.len() - MIN_REST_WORDS);
+    let last_head = MAX_HEAD_WORDS
+        .max(words.len() / 2)
+        .min(words.len() - MIN_REST_WORDS);
     for n in MIN_HEAD_WORDS..=last_head {
         let word = words[n - 1];
         if is_abbreviation(word) {
@@ -289,6 +302,33 @@ mod tests {
             None
         );
         // No boundary inside the first eight words: spoken whole.
+        assert_eq!(
+            first_clause(
+                "The whole garden with the shed near the path was under water, sadly enough."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_sentence_may_have_a_longer_head() {
+        // Thirty-six words, first boundary at word nine: outside the
+        // eight-word window a normal sentence gets, inside half of this
+        // one. Without it the whole sentence is one job and Kokoro's
+        // `phrases` cut starts on 60-plus chars (2.6 s to first audio
+        // against ~1.1 s for this head).
+        let long = "I looked through the whole set of notes from yesterday, and the thing \
+                    that stands out is that nobody wrote down who agreed to run the meeting, \
+                    so we should probably sort that out before Friday.";
+        let (head, rest) = first_clause(long).unwrap_or_default();
+        assert_eq!(
+            head,
+            "I looked through the whole set of notes from yesterday,"
+        );
+        assert!(rest.starts_with("and the thing"), "{rest}");
+        // The window is half the sentence, not "any boundary": a
+        // fourteen-word sentence still gets eight words, so its boundary
+        // at word twelve is not taken.
         assert_eq!(
             first_clause(
                 "The whole garden with the shed near the path was under water, sadly enough."

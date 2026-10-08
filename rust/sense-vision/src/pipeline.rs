@@ -125,6 +125,20 @@ pub struct Stats {
     pub scene_changes: AtomicU64,
     /// `camera_preview` frames emitted.
     pub previews: AtomicU64,
+    /// `ArcFace` forward passes spent, summed over frames. With the budget
+    /// in place this is at most `VisionConfig::max_embeds_per_frame` per
+    /// frame whatever the crowd does.
+    pub embeds: AtomicU64,
+    /// Assigned tracks that wanted an embed and did not get one, because
+    /// the frame's budget was already spent. §9.10's `embed skipped:
+    /// budget`, as a counter rather than a log line: one line per skipped
+    /// track per frame in a corridor is not an operator aid, it is a
+    /// flood. The `debug!` below carries the per-frame number.
+    pub embeds_over_budget: AtomicU64,
+    /// Assigned tracks skipped because they are confidently named, their
+    /// box has not moved and their re-verify timer has not elapsed. The
+    /// single biggest saving in a stable crowd; worth being able to see.
+    pub embeds_settled: AtomicU64,
     /// The object thread's counters.
     pub objects: Arc<ObjectStats>,
 }
@@ -428,7 +442,44 @@ fn process_frame(
     bump(&stats.detections, dets.len() as u64);
 
     let assignments = tracker.update(&dets);
-    for a in &assignments {
+    // 9.3's EMBEDDING BUDGET. Everything above this line is one pass over
+    // the frame whatever the face count; everything below is per face and
+    // is the reason a crowd used to blow the frame. Detection is never
+    // rationed (§9.3 item 4), only the per-face embed.
+    let budget = tracker.schedule_embeds(
+        &assignments,
+        cfg.max_embeds_per_frame,
+        MIN_EMIT_FACE_PX,
+        cfg.reverify_frames,
+    );
+    // Tracks that wanted an embed but were passed over; separated from the
+    // ones that were skipped because their name is settled, because the
+    // two mean very different things to an operator reading the counters.
+    let mut over_budget = 0u64;
+    let mut settled = 0u64;
+    for (i, a) in assignments.iter().enumerate() {
+        if budget.contains(&i) {
+            continue;
+        }
+        let wanted = tracker
+            .get(a.track)
+            .and_then(|t| t.embed_priority(MIN_EMIT_FACE_PX, cfg.reverify_frames));
+        if wanted.is_some() {
+            over_budget += 1;
+        } else {
+            settled += 1;
+        }
+        // Skipped, not reset: the vote window bleeds one vote every
+        // `VOTE_DECAY_FRAMES` so a background track still converges.
+        if let Some(t) = tracker.get_mut(a.track) {
+            t.decay_vote(cfg.votes_to_confirm);
+        }
+    }
+    bump(&stats.embeds_over_budget, over_budget);
+    bump(&stats.embeds_settled, settled);
+    bump(&stats.embeds, budget.len() as u64);
+    for &i in &budget {
+        let a = &assignments[i];
         let det = &dets[a.detection];
         let crop = norm_crop(&frame.image, &det.landmarks, CROP_SIZE);
         let emb = match parts.embedder.embed(&crop) {
@@ -466,6 +517,7 @@ fn process_frame(
         if let Some(t) = tracker.get_mut(a.track) {
             t.push_embedding_scored(unit, quality);
             t.vote(matched, cfg.votes_to_confirm);
+            t.note_embedded();
         }
     }
 
@@ -476,6 +528,9 @@ fn process_frame(
     debug!(
         faces = dets.len(),
         tracks = tracker.len(),
+        embeds = budget.len(),
+        over_budget,
+        settled,
         ?elapsed,
         "frame"
     );

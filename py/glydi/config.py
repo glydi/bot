@@ -63,6 +63,7 @@ class Config:
 
     tts: str = "mac"          # mac | kokoro -- this build only does mac
     mac_voice: str = ""       # empty means whatever the system prefers
+    mic_device: str = ""      # index or name substring; empty means the default input
 
     @staticmethod
     def load(env_file: str | Path | None = None) -> "Config":
@@ -115,4 +116,5 @@ class Config:
             voice_margin=num("GLYDI_VOICE_MARGIN", 0.08),
             tts=tts,
             mac_voice=get("GLYDI_MAC_VOICE", ""),
+            mic_device=get("GLYDI_MIC_DEVICE", "").strip(),
         )

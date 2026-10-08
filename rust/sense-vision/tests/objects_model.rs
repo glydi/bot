@@ -47,6 +47,7 @@ fn setup() -> Option<Yolo> {
             &cfg.ort_lib,
             cfg.objects.score_threshold,
             cfg.objects.nms_threshold,
+            cfg.intra_threads,
         )
         .unwrap_or_else(|e| panic!("open yolo: {e}")),
     )

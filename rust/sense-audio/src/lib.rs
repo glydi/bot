@@ -137,6 +137,11 @@ pub struct VadConfig {
     pub hangover_frames: usize,
     /// Minimum speech frames worth transcribing.
     pub min_speech_frames: usize,
+    /// Silero only: speech probability that starts a turn (its default
+    /// 0.5). Higher is deafer to a television across the room and to
+    /// people talking to each other; a kiosk in a foyer wants 0.6-0.7.
+    /// The end threshold follows at 0.15 below it.
+    pub speech_threshold: f32,
 }
 
 impl Default for VadConfig {
@@ -147,6 +152,7 @@ impl Default for VadConfig {
             start_frames: v.start_frames,
             hangover_frames: v.hangover_frames,
             min_speech_frames: v.min_speech_frames,
+            speech_threshold: 0.5,
         }
     }
 }
@@ -371,6 +377,8 @@ fn open_vad(
             s.start_frames = config.vad.start_frames;
             s.hangover_frames = config.vad.hangover_frames;
             s.min_speech_frames = config.vad.min_speech_frames;
+            s.start_threshold = config.vad.speech_threshold.clamp(0.1, 0.95);
+            s.end_threshold = (s.start_threshold - 0.15).max(0.05);
             if config.warm_up {
                 s.warm_up()?;
             }

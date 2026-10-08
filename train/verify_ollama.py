@@ -30,8 +30,24 @@ except OSError:
     pass
 
 
+def wire_messages(messages):
+    """The dataset keeps tool-call arguments as objects; the OpenAI-style
+    endpoint (Ollama's included) wants them as a JSON string."""
+    out = []
+    for m in messages:
+        if m.get("tool_calls"):
+            m = dict(m)
+            m["tool_calls"] = [
+                {**c, "function": {**c["function"], "arguments": a if isinstance(a, str) else json.dumps(a)}}
+                for c in m["tool_calls"]
+                for a in [c["function"].get("arguments", {})]
+            ]
+        out.append(m)
+    return out
+
+
 def chat(model, messages, tools=None, max_tokens=96, temperature=0.7):
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens,
+    body = {"model": model, "messages": wire_messages(messages), "max_tokens": max_tokens,
             "temperature": temperature, "stream": True}
     if tools:
         body["tools"] = tools

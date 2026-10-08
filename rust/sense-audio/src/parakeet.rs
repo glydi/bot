@@ -197,6 +197,13 @@ pub struct Parakeet {
     blank: usize,
 }
 
+/// The variable that moves the encoder to the GPU: `GLYDI_STT_GPU=1`
+/// (`GLYDI_TRT=1` on top for `TensorRT`; see [`accel`]). The runtime must
+/// be a CUDA build with its provider library beside it (the same
+/// `models/onnxruntime-cuda` the voice uses; the binary loads the CUDA
+/// libraries before any session is built).
+pub const GPU_ENV: &str = "GLYDI_STT_GPU";
+
 impl Parakeet {
     /// Load the three graphs and the vocabulary from `dir`. `threads` is
     /// the encoder's intra-op pool; the front end and joint run on one.
@@ -223,8 +230,9 @@ impl Parakeet {
             &std::fs::read_to_string(&vocab_path)
                 .map_err(|e| Error::Model(format!("{}: {e}", vocab_path.display())))?,
         )?;
-        let session = |name: &str, threads: usize| -> Result<Session, Error> {
-            Ok(Session::builder()?
+        let gpu = accel::Accel::from_env(GPU_ENV);
+        let session = |name: &str, threads: usize, on_gpu: bool| -> Result<Session, Error> {
+            let mut builder = Session::builder()?
                 .with_intra_threads(threads.max(1))
                 .map_err(ort::Error::from)?
                 .with_inter_threads(1)
@@ -232,12 +240,25 @@ impl Parakeet {
                 // As voiceid: a spinning pool after the run starves the
                 // ECAPA embed running beside it.
                 .with_intra_op_spinning(false)
-                .map_err(ort::Error::from)?
-                .commit_from_file(file(name)?)?)
+                .map_err(ort::Error::from)?;
+            if on_gpu && gpu.is_gpu() {
+                // The encoder is the whole cost of an utterance; on CUDA
+                // it is a few tens of milliseconds. Registration that
+                // fails is logged by `ort` and the CPU provider stays.
+                // TensorRT keeps its engines in `trt_cache/` beside the
+                // model.
+                builder = builder
+                    .with_execution_providers(gpu.providers(&dir.join("trt_cache"), "parakeet"))
+                    .map_err(ort::Error::from)?;
+            }
+            Ok(builder.commit_from_file(file(name)?)?)
         };
-        let preprocessor = session(PREPROCESSOR_FILE, 1)?;
-        let encoder = session(ENCODER_FILE, threads)?;
-        let decoder_joint = session(DECODER_JOINT_FILE, 1)?;
+        let preprocessor = session(PREPROCESSOR_FILE, 1, false)?;
+        let encoder = session(ENCODER_FILE, threads, true)?;
+        let decoder_joint = session(DECODER_JOINT_FILE, 1, false)?;
+        if gpu.is_gpu() {
+            tracing::info!(accel = gpu.name(), "parakeet encoder asked for the GPU");
+        }
         tracing::info!(dir = %dir.display(), vocab = vocab.len(), "parakeet loaded");
         Ok(Self {
             preprocessor,

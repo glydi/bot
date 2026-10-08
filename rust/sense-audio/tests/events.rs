@@ -299,9 +299,13 @@ fn heuristic_cost_is_negligible() {
 
 fn yamnet() -> Option<Yamnet> {
     let model = repo_root().join(sense_audio::events::DEFAULT_MODEL_PATH);
-    let ort = AudioConfig::default().ort_lib;
+    let ort = common::ort_lib();
     if !model.is_file() || !ort.is_file() {
-        eprintln!("skipping: yamnet or onnxruntime not present");
+        eprintln!(
+            "skipping: yamnet ({}) or onnxruntime ({}) not present",
+            model.display(),
+            ort.display()
+        );
         return None;
     }
     Some(Yamnet::open(&model, &ort).unwrap_or_else(|e| panic!("{e}")))

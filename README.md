@@ -81,6 +81,9 @@ py/run.sh        # the bot
 `glydi check` reports every model, device, and server it will use.
 `glydi run --headless` skips the window; `--no-camera`, `--no-mic`,
 `--tts kokoro` (needs `--features kokoro`), `--record FILE`.
+`--text` reads lines typed on the console as utterances and prints replies
+as `glydi> ...`: `glydi run --headless --no-camera --no-mic --text` is how
+to talk to it on a machine with no webcam or microphone.
 
 `glydi replay FILE --speed 0` folds a recording through a fresh mind and
 prints the events, commands, and reflex latency. Deterministic.
