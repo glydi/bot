@@ -1,120 +1,93 @@
 //! The school ERP, wired to the conversation and the screen: a worker
-//! thread that keeps the local snapshot fresh and marks the greeted
-//! present, the [`SchoolLink`] the deliberator calls, and the view of
+//! thread that runs [`school::Engine`] (snapshot refresh, durable mark
+//! queue), the [`SchoolLink`] the deliberator calls, and the view of
 //! marks the panel shows.
 //!
 //! Configured by three variables, all required: `GLYDI_ERP_URL`
 //! (`https://erp.xulo.in`), `GLYDI_ERP_USER` and `GLYDI_ERP_PASSWORD`
 //! (the robot's own account; `scripts/erp-robot-account.py` makes one).
 //! Without them there is no school: greetings mark nobody and day
-//! questions go to the model.
+//! questions go to the model. Days are the school's (`GLYDI_UTC_OFFSET`,
+//! IST by default).
 //!
-//! The snapshot lives at `data/school.json` and is refreshed every
-//! [`REFRESH`]: the school's day for the days ahead, each section's day
-//! for today and tomorrow, today's and yesterday's absentees, and the
-//! teaching day of every staff member the bot has resolved. Answers read
-//! only the snapshot, so they are instant and survive an outage.
+//! # Who is marked
 //!
-//! # Marks that cannot be sent
-//!
-//! A sighting while the ERP is unreachable is not lost: it is queued in
-//! the snapshot (`pending`, on disk) with the time it happened and sent
-//! on the next tick that reaches the ERP, dated and timed as seen. A mark
-//! the ERP *refuses* (an unknown name, a student with no section, a
-//! closed month) is not retried: it is shown on the screen as failed so
-//! the operator looks.
+//! Only a greeted *known* face (never a stranger's track, never a name
+//! someone said), recognised at `GLYDI_MARK_MIN_CONFIDENCE` or better
+//! (default 0.5, the gallery cosine), whose gallery name is linked to an
+//! ERP record (`glydi school link`). Once per person per school day; the
+//! mark is dated and timed when seen, queued on disk before it is sent,
+//! and retried in order with backoff until the ERP takes it. A refusal
+//! is not retried: it shows on the screen and in `glydi school pending`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use act_ui::visitor::{MarkState, SchoolView};
 use common::EntityId;
 use crossbeam_channel::{Receiver, Sender};
 use deliberate::SchoolLink;
 use parking_lot::Mutex;
-use school::{Date, Erp, ErpConfig, ErpError, Marked, PendingMark, Person, Scope, Snapshot};
+use school::worker::{Engine, MarkView, Paths, Sighting, min_confidence_from_env};
+use school::{Erp, ErpConfig, SchoolTime, Snapshot};
 
-/// How often the snapshot is pulled again.
-pub const REFRESH: Duration = Duration::from_secs(15 * 60);
-/// How often queued marks are retried while the ERP is down.
-pub const RETRY: Duration = Duration::from_secs(60);
-/// How many days ahead the school's day is loaded.
-pub const DAYS_AHEAD: i64 = 10;
+/// How often the worker wakes to run the schedule (refresh every 15
+/// minutes and due retries are decided by the engine).
+pub const TICK: Duration = Duration::from_secs(30);
 /// A looked-up fact older than this is said with its age.
 pub const STALE_AFTER_SECS: i64 = 2 * 3600;
 
-/// What the screen is told.
-#[derive(Debug, Default)]
-struct Status {
-    online: bool,
-    marks: HashMap<String, MarkState>,
-}
+/// The recognition confidence of an entity right now, if it is in view.
+pub type ConfidenceOf = Box<dyn Fn(&EntityId) -> Option<f32> + Send + Sync>;
 
 /// The link the deliberator holds, and the panel reads.
 pub struct SchoolService {
     snap: Arc<Mutex<Snapshot>>,
-    status: Arc<Mutex<Status>>,
-    seen_tx: Sender<(String, String)>,
-    offset_secs: i64,
+    view: Arc<Mutex<SchoolView>>,
+    seen_tx: Sender<Sighting>,
+    time: SchoolTime,
+    confidence: ConfidenceOf,
     /// The last speaker and what they asked, for follow-ups.
     ctx: Mutex<(Option<String>, school::AskContext)>,
 }
 
 impl SchoolService {
     /// Start from the environment, or `None` when it is not configured.
-    pub fn from_env(root: &Path) -> Option<Arc<Self>> {
-        let var = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty())
-        };
-        let (Some(base_url), Some(identifier), Some(password)) = (
-            var("GLYDI_ERP_URL"),
-            var("GLYDI_ERP_USER"),
-            var("GLYDI_ERP_PASSWORD"),
-        ) else {
+    pub fn from_env(root: &Path, confidence: ConfidenceOf) -> Option<Arc<Self>> {
+        let Some(cfg) = ErpConfig::from_env() else {
             tracing::info!("no school ERP configured (GLYDI_ERP_URL/USER/PASSWORD)");
             return None;
         };
-        let cfg = ErpConfig {
-            base_url,
-            identifier,
-            password,
-            timeout: Duration::from_secs(30),
+        let erp = match Erp::new(cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "school client not built");
+                return None;
+            }
         };
-        let path = root.join("data").join("school.json");
-        let snap = Arc::new(Mutex::new(Snapshot::load(&path)));
-        let status = Arc::new(Mutex::new(Status::default()));
-        // Marks queued by an earlier run show as waiting from the start.
-        for p in &snap.lock().pending {
-            status.lock().marks.insert(
-                p.name.to_ascii_lowercase(),
-                MarkState::Pending(p.at.clone()),
-            );
-        }
-        let offset_secs = act_ui::visitor::offset_from_env();
-        let (seen_tx, seen_rx) = crossbeam_channel::bounded(64);
+        let time = SchoolTime::from_env();
+        let engine = Engine::open(
+            erp,
+            Paths::in_dir(&root.join("data")),
+            time,
+            min_confidence_from_env(),
+        );
+        let view = Arc::new(Mutex::new(SchoolView::default()));
+        update_view(&engine, &view);
+        let (seen_tx, seen_rx) = crossbeam_channel::bounded(256);
         let me = Arc::new(Self {
-            snap: Arc::clone(&snap),
-            status: Arc::clone(&status),
+            snap: engine.snapshot(),
+            view: Arc::clone(&view),
             seen_tx,
-            offset_secs,
+            time,
+            confidence,
             ctx: Mutex::new((None, school::AskContext::default())),
         });
-        let worker = Worker {
-            cfg,
-            snap,
-            status,
-            path,
-            offset_secs,
-            seen_rx,
-        };
         if let Err(e) = std::thread::Builder::new()
             .name("glydi-school".into())
-            .spawn(move || worker.run())
+            .spawn(move || run(&engine, &view, &seen_rx))
         {
             tracing::warn!(error = %e, "school worker not started");
             return None;
@@ -124,33 +97,70 @@ impl SchoolService {
 
     /// The panel's view: a cheap copy per frame.
     pub fn view(&self) -> SchoolView {
-        let s = self.status.lock();
-        SchoolView {
-            online: s.online,
-            marks: s.marks.clone(),
+        self.view.lock().clone()
+    }
+}
+
+fn update_view(engine: &Engine, view: &Mutex<SchoolView>) {
+    let today = engine.time().date(school::clock::utc_now());
+    let marks: HashMap<String, MarkState> = engine
+        .mark_views(today)
+        .into_iter()
+        .map(|(name, v)| {
+            let state = match v {
+                MarkView::Sent(at) => MarkState::Sent(at),
+                MarkView::Pending(at) => MarkState::Pending(at),
+                MarkView::Failed(why) => MarkState::Failed(why),
+            };
+            (name, state)
+        })
+        .collect();
+    let mut v = view.lock();
+    v.online = engine.status().online;
+    v.marks = marks;
+}
+
+/// The thread: check the account, then run the schedule and take
+/// sightings until the service is dropped.
+fn run(engine: &Engine, view: &Mutex<SchoolView>, seen_rx: &Receiver<Sighting>) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        tracing::warn!("school worker: no runtime");
+        return;
+    };
+    let _ = rt.block_on(engine.check_account(school::clock::utc_now()));
+    loop {
+        rt.block_on(engine.tick(school::clock::utc_now()));
+        update_view(engine, view);
+        match seen_rx.recv_timeout(TICK) {
+            Ok(s) => {
+                let _ = rt.block_on(engine.sighting(s));
+                // Drain whatever else arrived meanwhile.
+                while let Ok(s) = seen_rx.try_recv() {
+                    let _ = rt.block_on(engine.sighting(s));
+                }
+                update_view(engine, view);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
-    }
-
-    fn local_secs(&self) -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-            + self.offset_secs
-    }
-
-    fn today(&self) -> Date {
-        Date::from_local_secs(self.local_secs())
     }
 }
 
 impl SchoolLink for SchoolService {
     fn seen(&self, entity: &EntityId, name: &str) {
-        if self
-            .seen_tx
-            .try_send((entity.to_string(), name.to_owned()))
-            .is_err()
-        {
-            tracing::warn!(name, "school worker busy; mark dropped");
+        // Day, time and confidence are taken now, at the greeting, not
+        // when the worker gets to it.
+        let s = Sighting {
+            gallery_name: name.to_owned(),
+            known: !entity.is_track(),
+            confidence: (self.confidence)(entity),
+            utc: school::clock::utc_now(),
+        };
+        if self.seen_tx.try_send(s).is_err() {
+            tracing::warn!("school worker busy; a sighting was dropped");
         }
     }
 
@@ -159,13 +169,9 @@ impl SchoolLink for SchoolService {
         // lookups, spans, "when is X" forward searches and day questions.
         // The context it returns carries "what about tomorrow?" and
         // "where is she?" to the next turn; a new speaker starts afresh.
-        let today = self.today();
-        let secs = self.local_secs();
-        let now = format!(
-            "{:02}:{:02}",
-            secs.rem_euclid(86_400) / 3600,
-            (secs.rem_euclid(86_400) % 3600) / 60
-        );
+        let utc = school::clock::utc_now();
+        let today = self.time.date(utc);
+        let now = self.time.hhmm(utc);
         let snap = self.snap.lock();
         let mut ctx = self.ctx.lock();
         if ctx.0.as_deref() != speaker {
@@ -180,275 +186,10 @@ impl SchoolLink for SchoolService {
         let (fact, next) = school::respond(text, &env, &ctx.1)?;
         ctx.1 = next;
         tracing::info!(source = fact.source, "school answered");
-        Some(school::lookup::speak(
-            &fact,
-            secs - self.offset_secs,
-            STALE_AFTER_SECS,
-        ))
+        Some(school::lookup::speak(&fact, utc, STALE_AFTER_SECS))
     }
 
     fn forget(&self) {
         *self.ctx.lock() = (None, school::AskContext::default());
-    }
-}
-
-/// Whether an error means "try again later" (the ERP could not be
-/// reached or would not let us in) rather than "the ERP said no to this
-/// mark".
-fn retryable(e: &ErpError) -> bool {
-    match e {
-        ErpError::Transport { .. } | ErpError::Login(_) => true,
-        ErpError::Server { status, .. } => *status == 429 || *status >= 500,
-        ErpError::Shape { .. } => false,
-    }
-}
-
-/// The thread: sign in, refresh on a schedule, mark on request, retry
-/// what is queued.
-struct Worker {
-    cfg: ErpConfig,
-    snap: Arc<Mutex<Snapshot>>,
-    status: Arc<Mutex<Status>>,
-    path: std::path::PathBuf,
-    offset_secs: i64,
-    seen_rx: Receiver<(String, String)>,
-}
-
-impl Worker {
-    fn now_local(&self) -> (Date, String) {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-            + self.offset_secs;
-        let s = secs.rem_euclid(86_400);
-        (
-            Date::from_local_secs(secs),
-            format!("{:02}:{:02}", s / 3600, (s % 3600) / 60),
-        )
-    }
-
-    fn save(&self) {
-        if let Err(e) = self.snap.lock().save(&self.path) {
-            tracing::warn!(error = %e, "school snapshot not saved");
-        }
-    }
-
-    fn set_online(&self, online: bool) {
-        let mut s = self.status.lock();
-        if s.online != online {
-            tracing::info!(online, "school system");
-        }
-        s.online = online;
-    }
-
-    fn set_mark(&self, name: &str, state: MarkState) {
-        self.status
-            .lock()
-            .marks
-            .insert(name.to_ascii_lowercase(), state);
-    }
-
-    fn run(self) {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            tracing::warn!("school worker: no runtime");
-            return;
-        };
-        let erp = match Erp::new(self.cfg.clone()) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "school client not built");
-                return;
-            }
-        };
-        rt.block_on(async {
-            match erp.whoami().await {
-                Ok((name, missing)) if missing.is_empty() => {
-                    self.set_online(true);
-                    tracing::info!(school = %name, "erp ready");
-                }
-                Ok((name, missing)) => {
-                    self.set_online(true);
-                    tracing::warn!(school = %name, ?missing, "erp account lacks permissions");
-                }
-                Err(e) => {
-                    self.set_online(false);
-                    tracing::warn!(error = %e, "erp sign-in failed; will retry");
-                }
-            }
-        });
-        let mut next_refresh = std::time::Instant::now();
-        let mut next_retry = std::time::Instant::now();
-        loop {
-            let now = std::time::Instant::now();
-            if now >= next_refresh {
-                let (today, _) = self.now_local();
-                match rt.block_on(self.refresh(&erp, today)) {
-                    Ok(()) => {
-                        self.set_online(true);
-                        tracing::info!(
-                            days = self.snap.lock().days.len(),
-                            "school snapshot refreshed"
-                        );
-                    }
-                    Err(e) => {
-                        if retryable(&e) {
-                            self.set_online(false);
-                        }
-                        tracing::warn!(error = %e, "school refresh incomplete");
-                    }
-                }
-                self.save();
-                next_refresh = now + REFRESH;
-            }
-            if now >= next_retry && !self.snap.lock().pending.is_empty() {
-                rt.block_on(self.retry_pending(&erp));
-                self.save();
-                next_retry = now + RETRY;
-            }
-            let wait = next_refresh
-                .min(next_retry)
-                .saturating_duration_since(std::time::Instant::now())
-                .min(Duration::from_secs(30));
-            match self.seen_rx.recv_timeout(wait) {
-                Ok((entity, name)) => {
-                    let (today, at) = self.now_local();
-                    rt.block_on(self.mark(&erp, &entity, &name, today, &at));
-                    self.save();
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    }
-
-    async fn refresh(&self, erp: &Erp, today: Date) -> Result<(), ErpError> {
-        erp.refresh(&self.snap, today, DAYS_AHEAD).await?;
-        // The teaching day of every staff member we know, so "what do I
-        // have today" works for a teacher too.
-        let staff: Vec<String> = self
-            .snap
-            .lock()
-            .people
-            .values()
-            .filter(|p| p.kind == "staff")
-            .map(|p| p.id.clone())
-            .collect();
-        for id in staff {
-            for n in 0..=1 {
-                let date = today.plus(n);
-                let day = erp.day(date, &Scope::Teacher(id.clone())).await?;
-                self.snap.lock().put(date, &Scope::Teacher(id.clone()), day);
-            }
-        }
-        Ok(())
-    }
-
-    /// The person a gallery name is, from the links or by asking the ERP.
-    /// `Ok(None)` is a name the ERP cannot place; that is final.
-    async fn resolve(&self, erp: &Erp, name: &str) -> Result<Option<Person>, ErpError> {
-        let key = name.to_ascii_lowercase();
-        if let Some(p) = self.snap.lock().people.get(&key).cloned() {
-            return Ok(Some(p));
-        }
-        let sections = self.snap.lock().sections.clone().into_iter().collect();
-        let found = erp.find(name, &sections).await?;
-        if found.len() == 1 {
-            let p = found.into_iter().next().unwrap_or_else(|| unreachable!());
-            self.snap.lock().people.insert(key, p.clone());
-            return Ok(Some(p));
-        }
-        tracing::warn!(
-            name,
-            matches = found.len(),
-            "school: name is ambiguous or unknown"
-        );
-        Ok(None)
-    }
-
-    /// One mark, dated and timed as seen. Queues it when the ERP cannot
-    /// be reached; records a refusal for the screen.
-    async fn send(&self, erp: &Erp, name: &str, date: Date, at: &str) -> bool {
-        let outcome = match self.resolve(erp, name).await {
-            Ok(Some(person)) => erp
-                .mark(&self.snap, &person, date, at)
-                .await
-                .map(|m| (m, person)),
-            Ok(None) => {
-                self.set_mark(
-                    name,
-                    MarkState::Failed(format!("{name} is not linked to a school record")),
-                );
-                return true;
-            }
-            Err(e) => Err(e),
-        };
-        match outcome {
-            Ok((Marked::Written, person)) => {
-                self.set_online(true);
-                self.set_mark(name, MarkState::Sent(at.to_owned()));
-                tracing::info!(name = %person.name, kind = %person.kind, at, "marked present");
-                true
-            }
-            Ok((Marked::Already, person)) => {
-                let when = self
-                    .snap
-                    .lock()
-                    .marked
-                    .get(&format!("{}|{}", date.iso(), person.id))
-                    .cloned();
-                self.set_mark(name, MarkState::Sent(when.unwrap_or_else(|| at.to_owned())));
-                true
-            }
-            Err(e) if retryable(&e) => {
-                self.set_online(false);
-                self.set_mark(name, MarkState::Pending(at.to_owned()));
-                tracing::warn!(name, error = %e, "mark queued; school system unreachable");
-                false
-            }
-            Err(e) => {
-                self.set_mark(
-                    name,
-                    MarkState::Failed(e.to_string().chars().take(80).collect()),
-                );
-                tracing::warn!(name, error = %e, "mark refused");
-                true
-            }
-        }
-    }
-
-    async fn mark(&self, erp: &Erp, entity: &str, name: &str, today: Date, at: &str) {
-        let _ = entity;
-        if !self.send(erp, name, today, at).await {
-            self.snap.lock().pending.push(PendingMark {
-                name: name.to_owned(),
-                date: today.iso(),
-                at: at.to_owned(),
-            });
-        }
-    }
-
-    async fn retry_pending(&self, erp: &Erp) {
-        let pending = std::mem::take(&mut self.snap.lock().pending);
-        let mut still = Vec::new();
-        for p in pending {
-            let Some(date) = Date::parse_iso(&p.date) else {
-                continue;
-            };
-            if self.send(erp, &p.name, date, &p.at).await {
-                continue;
-            }
-            still.push(p);
-            // The ERP is still down: no point trying the rest this round.
-            break;
-        }
-        let mut s = self.snap.lock();
-        still.extend(std::mem::take(&mut s.pending));
-        s.pending = still;
-        if !s.pending.is_empty() {
-            tracing::info!(n = s.pending.len(), "marks still queued");
-        }
     }
 }

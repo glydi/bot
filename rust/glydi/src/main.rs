@@ -204,11 +204,12 @@ fn main() -> anyhow::Result<()> {
 
 #[derive(Subcommand)]
 enum SchoolCmd {
-    /// Sign in and report the school and any missing permission.
+    /// Sign in and report: the account, missing permissions, how old the
+    /// snapshot is, marks waiting and refused, the last errors.
     Check,
     /// Link a gallery name to the ERP person it is: searches the ERP,
-    /// and with one match (or `--to <id>`) records it in data/school.json
-    /// so the next greeting marks the right record.
+    /// and with one match (or `--to <id>`) records it in
+    /// data/school-links.json. Only linked people are ever marked.
     Link {
         /// The name as the gallery has it.
         name: String,
@@ -218,79 +219,247 @@ enum SchoolCmd {
     },
     /// Who is linked.
     Links,
-    /// Pull the days ahead now and show one: `today`, `tomorrow`,
+    /// Remove a gallery name's link (nobody is marked under it again).
+    Unlink {
+        /// The name as the gallery has it.
+        name: String,
+    },
+    /// Pull the day from the ERP and show it: `today`, `tomorrow`,
     /// `friday`, `2026-10-12`.
     Day {
         /// The day, as it would be said.
         #[arg(default_value = "today")]
         when: String,
     },
+    /// List the marks waiting to be sent and those the ERP refused;
+    /// `--clear` drops the waiting ones (with `--yes`; without it, only
+    /// says what it would drop).
+    Pending {
+        /// Drop the waiting marks.
+        #[arg(long)]
+        clear: bool,
+        /// With `--clear`: the refused ones too.
+        #[arg(long)]
+        failed: bool,
+        /// Really drop them.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `glydi school links`: every gallery name tied to someone in the ERP.
-fn print_links(s: &school::Snapshot) {
-    if s.people.is_empty() {
+/// Ids and kinds only: names and classes stay in the ERP.
+fn print_links(links: &school::Links) {
+    if links.people.is_empty() {
         println!("no links yet; `glydi school link <name>`");
     }
-    for (gallery, p) in &s.people {
+    for (gallery, p) in &links.people {
+        let note = if p.kind == "student" && p.section_id.is_none() {
+            "  (no section: cannot be marked)"
+        } else {
+            ""
+        };
+        println!("{gallery:<20} -> {:<8} {}{note}", p.kind, p.id);
+    }
+}
+
+/// "42 s", "7 min", "3 h", "2 days".
+fn age(secs: i64) -> String {
+    match secs {
+        s if s < 120 => format!("{s} s"),
+        s if s < 7200 => format!("{} min", s / 60),
+        s if s < 172_800 => format!("{} h", s / 3600),
+        s => format!("{} days", s / 86_400),
+    }
+}
+
+/// `glydi school pending`.
+fn school_pending(
+    paths: &school::Paths,
+    clear: bool,
+    failed: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    let mut ledger = school::Ledger::load(&paths.ledger);
+    let time = school::SchoolTime::from_env();
+    println!(
+        "{} waiting, {} refused, {} done (last 30 days)",
+        ledger.queue.len(),
+        ledger.failed.len(),
+        ledger.done.len()
+    );
+    for q in &ledger.queue {
+        let next = if q.next_try_utc == 0 {
+            "now".to_owned()
+        } else {
+            format!(
+                "{} {}",
+                time.date(q.next_try_utc).iso(),
+                time.hhmm(q.next_try_utc)
+            )
+        };
         println!(
-            "{gallery:<20} -> {:<8} {} {}",
-            p.kind,
-            p.name,
-            p.group.as_deref().unwrap_or("")
+            "  waiting  {:<48} seen {} {}  tries {}  next {next}  {}",
+            q.key, q.date, q.at, q.attempts, q.last_error
         );
     }
+    for f in &ledger.failed {
+        println!("  refused  {:<48} seen {}  {}", f.key, f.at, f.error);
+    }
+    if !clear {
+        return Ok(());
+    }
+    let n = ledger.queue.len() + if failed { ledger.failed.len() } else { 0 };
+    if !yes {
+        println!(
+            "would drop {n} mark(s); add --yes to do it (stop the robot first: it holds the queue)"
+        );
+        return Ok(());
+    }
+    let audit = school::store::AuditLog::new(paths.audit.clone());
+    let now = school::clock::utc_now();
+    let mut dropped: Vec<String> = ledger.queue.drain(..).map(|q| q.key).collect();
+    if failed {
+        dropped.extend(ledger.failed.drain(..).map(|f| f.key));
+    }
+    for key in &dropped {
+        audit.record(&school::store::AuditEntry {
+            ts: now,
+            key: key.clone(),
+            event: "cleared".into(),
+            detail: "operator".into(),
+        });
+    }
+    ledger.save(&paths.ledger)?;
+    println!("dropped {} mark(s)", dropped.len());
+    Ok(())
+}
+
+/// `glydi school check` against a signed-in client.
+async fn school_check(
+    erp: &school::Erp,
+    paths: &school::Paths,
+    links: &school::Links,
+) -> anyhow::Result<()> {
+    let time = school::SchoolTime::from_env();
+    let now = school::clock::utc_now();
+    let mut ok = true;
+    match erp.whoami().await {
+        Ok(w) => {
+            println!("login        ok: signed in at {}", w.school);
+            if let Some(tz) = &w.timezone {
+                #[allow(clippy::cast_precision_loss)]
+                let hours = time.offset_secs as f64 / 3600.0;
+                println!(
+                    "time zone    the ERP's is {tz}; the robot's days are UTC{hours:+} h (GLYDI_UTC_OFFSET)"
+                );
+            }
+            if w.missing.is_empty() {
+                println!(
+                    "permissions  ok: all {} the robot needs",
+                    school::PERMISSIONS_NEEDED.len()
+                );
+            } else {
+                ok = false;
+                println!("permissions  MISSING: {}", w.missing.join(", "));
+            }
+        }
+        Err(e) => {
+            ok = false;
+            println!("login        FAILED: {e}");
+        }
+    }
+    let s = school::Snapshot::load(&paths.snapshot);
+    match s.age_secs(now) {
+        Some(a) => println!(
+            "snapshot     {} old: {} days, {} sections",
+            age(a),
+            s.days.len(),
+            s.sections.len()
+        ),
+        None => println!("snapshot     never refreshed"),
+    }
+    if !s.last_error.is_empty() {
+        println!(
+            "last refresh FAILED {} ago: {}",
+            age(now - s.attempted_at),
+            s.last_error
+        );
+    }
+    if !s.drift.is_empty() {
+        println!(
+            "schema drift fields the ERP left out: {}",
+            s.drift.join(", ")
+        );
+    }
+    let ledger = school::Ledger::load(&paths.ledger);
+    println!(
+        "marks        {} waiting, {} refused, {} done (30 days); `glydi school pending`",
+        ledger.queue.len(),
+        ledger.failed.len(),
+        ledger.done.len()
+    );
+    if let Some(q) = ledger.queue.first() {
+        println!(
+            "             oldest waiting since {} {}: {}",
+            q.date, q.at, q.last_error
+        );
+    }
+    let st = school::Status::load(&paths.status);
+    if !st.last_mark_error.is_empty() {
+        println!("last mark    error: {}", st.last_mark_error);
+    }
+    if !st.auth_problem.is_empty() {
+        println!("robot        sign-in held back: {}", st.auth_problem);
+    }
+    println!("links        {} gallery names linked", links.people.len());
+    if !ok {
+        anyhow::bail!("school check failed");
+    }
+    Ok(())
 }
 
 /// `glydi school ...`: the operator's side of the ERP link.
 fn school(config: &Config, what: SchoolCmd) -> anyhow::Result<()> {
-    use school::{Date, Erp, ErpConfig, Scope, Snapshot};
+    use school::{Date, Erp, ErpConfig, Links, Scope, Snapshot};
 
-    let path = config.root.join("data").join("school.json");
-    let snap = parking_lot::Mutex::new(Snapshot::load(&path));
-    if let SchoolCmd::Links = what {
-        print_links(&snap.lock());
-        return Ok(());
+    let paths = school::Paths::in_dir(&config.root.join("data"));
+    let mut links = Links::load(&paths.links);
+    if links.people.is_empty() {
+        // An older build kept the links inside the snapshot.
+        let old = Snapshot::load(&paths.snapshot);
+        links.people = old.people;
     }
-    let var = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    let (Some(base_url), Some(identifier), Some(password)) = (
-        var("GLYDI_ERP_URL"),
-        var("GLYDI_ERP_USER"),
-        var("GLYDI_ERP_PASSWORD"),
-    ) else {
+    match what {
+        SchoolCmd::Links => {
+            print_links(&links);
+            return Ok(());
+        }
+        SchoolCmd::Unlink { name } => {
+            if links.people.remove(&name.trim().to_lowercase()).is_some() {
+                links.save(&paths.links)?;
+                println!("{name} unlinked");
+            } else {
+                println!("{name} was not linked");
+            }
+            return Ok(());
+        }
+        SchoolCmd::Pending { clear, failed, yes } => {
+            return school_pending(&paths, clear, failed, yes);
+        }
+        SchoolCmd::Check | SchoolCmd::Link { .. } | SchoolCmd::Day { .. } => {}
+    }
+    let Some(cfg) = ErpConfig::from_env() else {
         anyhow::bail!("set GLYDI_ERP_URL, GLYDI_ERP_USER and GLYDI_ERP_PASSWORD in .env first");
     };
-    let erp = Erp::new(ErpConfig {
-        base_url,
-        identifier,
-        password,
-        timeout: Duration::from_secs(30),
-    })?;
-    let offset = act_ui::visitor::offset_from_env();
-    let now_local = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        + offset;
-    let today = Date::from_local_secs(now_local);
+    let erp = Erp::new(cfg)?;
+    let today = school::SchoolTime::from_env().date(school::clock::utc_now());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
         match what {
-            SchoolCmd::Check => {
-                let (name, missing) = erp.whoami().await?;
-                println!("signed in at {name}");
-                if missing.is_empty() {
-                    println!("every permission the bot needs is there");
-                } else {
-                    println!("missing permissions: {}", missing.join(", "));
-                }
-            }
+            SchoolCmd::Check => school_check(&erp, &paths, &links).await?,
             SchoolCmd::Link { name, to } => {
                 let sections = erp.sections().await?;
                 let found = erp.find(&name, &sections).await?;
@@ -299,26 +468,44 @@ fn school(config: &Config, what: SchoolCmd) -> anyhow::Result<()> {
                     (None, 1) => found.into_iter().next(),
                     (None, 0) => None,
                     (None, _) => {
-                        println!("{} people match {name:?}; pick one with --to <id>:", found.len());
+                        println!(
+                            "{} people match {name:?}; pick one with --to <id>:",
+                            found.len()
+                        );
                         for p in &found {
-                            println!("  {:<38} {:<8} {}  {}", p.id, p.kind, p.name, p.group.as_deref().unwrap_or(""));
+                            println!(
+                                "  {:<38} {:<8} {}  {}",
+                                p.id,
+                                p.kind,
+                                p.name,
+                                p.group.as_deref().unwrap_or("")
+                            );
                         }
                         return Ok(());
                     }
                 };
                 match chosen {
                     Some(p) => {
-                        println!("{name} -> {} {} ({}{})", p.kind, p.name, p.id, p.group.as_deref().map_or(String::new(), |g| format!(", {g}")));
+                        println!(
+                            "{name} -> {} {} ({}{})",
+                            p.kind,
+                            p.name,
+                            p.id,
+                            p.group
+                                .as_deref()
+                                .map_or(String::new(), |g| format!(", {g}"))
+                        );
                         if p.kind == "student" && p.section_id.is_none() {
-                            println!("warning: no section found for them; attendance cannot be marked until they are enrolled in a section");
+                            println!(
+                                "warning: no section found for them; attendance cannot be marked until they are enrolled in a section"
+                            );
                         }
-                        snap.lock().people.insert(name.to_ascii_lowercase(), p);
-                        snap.lock().save(&path)?;
+                        links.people.insert(name.trim().to_lowercase(), p);
+                        links.save(&paths.links)?;
                     }
                     None => println!("nobody in the ERP matches {name:?}"),
                 }
             }
-            SchoolCmd::Links => {}
             SchoolCmd::Day { when } => {
                 let date = school::parse_day(&when, today)
                     .or_else(|| Date::parse_iso(&when))
@@ -331,9 +518,8 @@ fn school(config: &Config, what: SchoolCmd) -> anyhow::Result<()> {
                     }
                 }
                 println!("{}", serde_json::to_string_pretty(&day)?);
-                snap.lock().put(date, &Scope::School, day);
-                snap.lock().save(&path)?;
             }
+            SchoolCmd::Links | SchoolCmd::Unlink { .. } | SchoolCmd::Pending { .. } => {}
         }
         anyhow::Ok(())
     })

@@ -17,16 +17,25 @@
 
 pub mod ask;
 pub mod client;
+pub mod clock;
 pub mod converse;
 pub mod dates;
 pub mod day;
+pub mod ledger;
 pub mod lookup;
 pub mod snapshot;
+pub mod store;
+pub mod worker;
 
 pub use ask::{Question, answer, classify};
-pub use client::{Erp, ErpConfig, ErpError, Marked, PERMISSIONS_NEEDED};
+pub use client::{
+    AuthFailure, Erp, ErpConfig, ErpError, Fetched, Marked, PERMISSIONS_NEEDED, Whoami,
+};
+pub use clock::SchoolTime;
 pub use converse::{AskContext, Asked, Env, respond};
 pub use dates::{Date, parse_day};
 pub use day::{Day, Exam, Period, Person, Presence};
+pub use ledger::{Enqueued, Ledger};
 pub use lookup::{Fact, Query};
-pub use snapshot::{PendingMark, Scope, Snapshot};
+pub use snapshot::{Links, PendingMark, Scope, Snapshot};
+pub use worker::{Engine, MarkView, Paths, Sighting, Skip, Status};

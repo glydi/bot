@@ -336,7 +336,17 @@ impl App {
 
         // -- school -----------------------------------------------------
         // Before the mind and the window: both read it.
-        let school = crate::school::SchoolService::from_env(&config.root);
+        // The gallery confidence of whoever is greeted gates the mark.
+        let school = crate::school::SchoolService::from_env(&config.root, {
+            let view = reflex.view();
+            Box::new(move |id: &common::EntityId| {
+                view.load()
+                    .people
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map(|p| p.confidence)
+            })
+        });
 
         // -- deliberate -------------------------------------------------
         let deliberator = match chat {
@@ -1348,7 +1358,7 @@ fn apply_name_fixer(cfg: &mut AudioConfig, people: Arc<Store>) {
         tracing::info!("name fixing off (GLYDI_NAME_FIX=0)");
         return;
     }
-    cfg.name_fixer = Some(sense_audio::names::NameFixer::new(Arc::new(move || {
+    let fixer = sense_audio::names::NameFixer::new(Arc::new(move || {
         let focus = common::focus::focus_person(Duration::from_secs(30));
         people
             .people()
@@ -1360,7 +1370,10 @@ fn apply_name_fixer(cfg: &mut AudioConfig, people: Arc<Store>) {
                 name: p.name,
             })
             .collect()
-    })));
+    }));
+    // The conversation tells the fixer when it waits for a name.
+    let _ = NAME_EXPECTED.set(fixer.expect_name());
+    cfg.name_fixer = Some(fixer);
 }
 
 /// `GLYDI_SAVE_UTTERANCES=1` keeps every utterance (WAV + transcript) in
@@ -2000,7 +2013,63 @@ fn people_first(config: &Config) -> Option<deliberate::People> {
         )),
         handoff: deliberate::handoff::from_env(),
         think_ack: std::env::var("GLYDI_THINK_ACK").is_ok_and(|v| v.trim() == "1"),
+        deep: deep_backend(config),
+        expecting_name: Some(Arc::new(|on| {
+            if let Some(flag) = NAME_EXPECTED.get() {
+                flag.store(on, std::sync::atomic::Ordering::Relaxed);
+            }
+        })),
     })
+}
+
+/// The name fixer's "a name is expected" flag, once the audio side built it.
+static NAME_EXPECTED: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// The stronger model for the people path's slow lane (questions that need
+/// thinking): Claude when `GLYDI_DEEP_CLOUD=1` and there is a key, else
+/// `GLYDI_DEEP_MODEL` (default `qwen2.5:7b-instruct`) on the local Ollama,
+/// warmed in the background so the first slow question does not pay the
+/// load. `GLYDI_DEEP_MODEL=off` keeps the slow lane on the chat model.
+fn deep_backend(config: &Config) -> Option<Arc<dyn ChatBackend>> {
+    let timeout = Duration::from_secs(8);
+    if std::env::var("GLYDI_DEEP_CLOUD").is_ok_and(|v| v.trim() == "1") {
+        match deliberate::ClaudeBackend::from_env(deliberate::claude::DEFAULT_MODEL, timeout) {
+            Some(Ok(b)) => {
+                tracing::info!(model = b.model(), "slow path: cloud model");
+                return Some(Arc::new(b));
+            }
+            Some(Err(e)) => tracing::warn!(error = %e, "slow path: cloud client not built"),
+            None => tracing::info!("slow path: GLYDI_DEEP_CLOUD=1 but no key; local model"),
+        }
+    }
+    let model = std::env::var("GLYDI_DEEP_MODEL")
+        .ok()
+        .map(|m| m.trim().to_owned())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "qwen2.5:7b-instruct".to_owned());
+    if model == "off" {
+        return None;
+    }
+    match OpenAiBackend::new(&config.local_llm_url, &model, None, timeout) {
+        Ok(b) => {
+            tracing::info!(model, "slow path: local model");
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let w = b.clone();
+                rt.spawn(async move {
+                    match w.warm("", Vec::new()).await {
+                        Ok(d) => tracing::info!(ms = d.as_millis(), "slow path model warm"),
+                        Err(e) => tracing::info!(error = %e, "slow path model not warmed"),
+                    }
+                });
+            }
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "slow path model not built");
+            None
+        }
+    }
 }
 
 /// The board the camera and the microphone share for the lip gate
