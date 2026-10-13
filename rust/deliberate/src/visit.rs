@@ -54,6 +54,9 @@ pub struct Visit {
     pub awaiting: Option<Awaiting>,
     /// The people moment (greeting from the graph) was said.
     pub greeted: bool,
+    /// People they told about before giving their own name ("this is my
+    /// sister Priya" from a stranger): stored once the name comes.
+    pub pending_people: Vec<crate::understand::Mention>,
 }
 
 /// An answer the bot is waiting for.

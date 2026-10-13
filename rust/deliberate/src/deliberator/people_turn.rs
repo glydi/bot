@@ -39,12 +39,23 @@ pub struct People {
     /// (`GLYDI_THINK_ACK=1`). Off by default: in `simulate.py` the
     /// acknowledgement became the whole first line and hid the reply.
     pub think_ack: bool,
+    /// The stronger model for the slow path (questions that need
+    /// thinking); `None` uses the session's own backend.
+    pub deep: Option<Arc<dyn crate::backend::ChatBackend>>,
+    /// Told after every turn whether the bot now waits for a name (its
+    /// own, a relation's or a companion's), so the hearing side may read a
+    /// bare one- or two-word reply as a name (`NameFixer::expect_name`).
+    pub expecting_name: Option<ExpectName>,
 }
+
+/// See [`People::expecting_name`].
+pub type ExpectName = Arc<dyn Fn(bool) + Send + Sync>;
 
 impl std::fmt::Debug for People {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("People")
             .field("understander", &self.understander.is_some())
+            .field("deep", &self.deep.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +66,8 @@ impl Default for People {
             understander: None,
             handoff: Arc::new(crate::handoff::DefaultHandoff),
             think_ack: false,
+            deep: None,
+            expecting_name: None,
         }
     }
 }
@@ -184,6 +197,7 @@ impl Session {
             self.visit.awaiting = Some(Awaiting::Companion);
         }
         self.visit.greeted = true;
+        self.sync_expect_name();
         line
     }
 
@@ -338,9 +352,66 @@ impl Session {
                 intent = "tell_fact";
             }
         }
-        if !u.heard_ok || u.confidence < understand::MIN_CONFIDENCE {
+        // The model's out_of_zone and everyday are checked against the
+        // words: a statement ("the printer broke again", "we just moved to
+        // Kondapur") is never handed off or answered with the date.
+        if understood.by != "rules" {
+            let joined = understand::words(text).join(" ");
+            let statement = || {
+                if u.facts.is_empty() {
+                    "chit_chat"
+                } else {
+                    "tell_fact"
+                }
+            };
+            if intent == "out_of_zone" && !understand::asks(text) {
+                intent = statement();
+            } else if intent == "everyday" && !understand::everyday(&joined) {
+                intent = if understand::asks(text) {
+                    "out_of_zone"
+                } else {
+                    statement()
+                };
+            }
+        }
+        // Two speeds: a question that needs thinking (advice, planning,
+        // reasoning over what they told before) goes to the slow path; an
+        // open question the understander is unsure of goes there too,
+        // rather than a guess or "say that again".
+        let unsure_question = understood.by == "model"
+            && u.heard_ok
+            && matches!(intent, "chit_chat" | "unclear" | "feeling")
+            && u.confidence < DEEP_BELOW
+            && understand::open_question(text);
+        let rule_deep = matches!(intent, "chit_chat" | "unclear" | "feeling" | "tell_fact")
+            && understand::deep_question(text);
+        let labelled = intent == "deep";
+        if unsure_question || rule_deep {
+            intent = "deep";
+        }
+        // The fallback (no model answer) is small talk on purpose: a
+        // friendly line, not "say that again" to every sentence.
+        if intent != "deep"
+            && understood.by != "fallback"
+            && (!u.heard_ok || u.confidence < understand::MIN_CONFIDENCE)
+        {
             intent = "unclear";
         }
+        tracing::info!(
+            route = if intent == "deep" { "slow" } else { "fast" },
+            why = if intent != "deep" {
+                "intent"
+            } else if labelled {
+                "labelled deep"
+            } else if rule_deep {
+                "question shape"
+            } else {
+                "unsure question"
+            },
+            intent,
+            confidence = u.confidence,
+            "router"
+        );
         let salt = self.visit.exchanges.len() + text.len();
         let last = self.said.all().last().copied();
         let now = unix_now();
@@ -376,7 +447,12 @@ impl Session {
                     .iter()
                     .find(|p| p.relation_to_speaker.is_none() && !p.name.is_empty())
                     .map(|p| p.name.clone())
-                    .or_else(|| understand::first_name_in(text));
+                    .or_else(|| understand::first_name_in(text))
+                    .or_else(|| {
+                        (intent == "correct_name")
+                            .then(|| said_name(text, my_name.as_deref()))
+                            .flatten()
+                    });
                 match name {
                     Some(n) => {
                         let known_before = self.facts.resolve_name(&n).is_some()
@@ -389,7 +465,18 @@ impl Session {
                         my_name = Some(n.clone());
                         self.visit.name = Some(n.clone());
                         self.visit.key.clone_from(&me);
-                        let rel = self.store_relations(me.as_ref(), &u, text);
+                        let mut rel = self.store_relations(me.as_ref(), &u, text);
+                        let pending = std::mem::take(&mut self.visit.pending_people);
+                        if !pending.is_empty() {
+                            let mut pu = Understanding::of("tell_relation");
+                            pu.people = pending;
+                            rel = rel.or_else(|| self.store_relations(me.as_ref(), &pu, text));
+                        }
+                        if let Some(id) = &me {
+                            for f in &u.facts {
+                                converse::write_fact(self.facts.as_ref(), id, f, false);
+                            }
+                        }
                         let mut l = if known_before && let Some(id) = me.clone() {
                             // Back again: the people moment, from the graph.
                             self.people_greeting(&id, &n)
@@ -422,17 +509,40 @@ impl Session {
                 } else if me.is_none() {
                     self.visit.awaiting = Some(Awaiting::Name);
                     self.visit_asked_name = true;
-                    Some("Nice! And what's your name?".to_owned())
+                    let named: Vec<Mention> = u
+                        .people
+                        .iter()
+                        .filter(|p| !p.name.is_empty() && p.relation_to_speaker.is_some())
+                        .cloned()
+                        .collect();
+                    let line = match named.first() {
+                        Some(m) => match m.reference.as_deref() {
+                            Some(r) if r.contains("'s ") => {
+                                format!("Lovely, {r}! And what's your name?")
+                            }
+                            _ => format!("Hi {}! And what's your name?", m.name),
+                        },
+                        None => "Nice! And what's your name?".to_owned(),
+                    };
+                    self.visit.pending_people.extend(named);
+                    Some(line)
                 } else {
                     let companion = self.room_people(speaker).1;
                     let first = u.people.first().map(|p| p.name.clone()).unwrap_or_default();
+                    let beside = companion.is_some();
                     if let (Some(track), false) = (companion, first.is_empty()) {
                         self.name_companion(&track, &first);
                     }
                     let r = self.store_relations(me.as_ref(), &u, text);
+                    if let Some(id) = &me {
+                        for f in &u.facts {
+                            converse::write_fact(self.facts.as_ref(), id, f, false);
+                        }
+                    }
                     Some(match (r, first.is_empty()) {
-                        (_, false) => format!("Hi {first}! Nice to meet you."),
-                        (Some(r), true) => r,
+                        (_, false) if beside => format!("Hi {first}! Nice to meet you."),
+                        (Some(r), _) => r,
+                        (None, false) => format!("Hi {first}! Nice to meet you."),
                         (None, true) => "Nice!".to_owned(),
                     })
                 }
@@ -442,8 +552,15 @@ impl Session {
                 self.store_relations(me.as_ref(), &u, text);
                 let mut ops = Vec::new();
                 if let Some(id) = &me {
+                    let replaces = converse::replaces(text);
                     for f in &u.facts {
-                        ops.push(converse::write_fact(self.facts.as_ref(), id, f, retract));
+                        ops.push(converse::write_fact_replacing(
+                            self.facts.as_ref(),
+                            id,
+                            f,
+                            retract,
+                            replaces,
+                        ));
                     }
                 }
                 Some(if ops.iter().any(|o| matches!(o, FactOp::Delete(_))) {
@@ -533,7 +650,7 @@ impl Session {
                         .facts
                         .recall(id)
                         .into_iter()
-                        .filter(|f| !f.starts_with(crate::visit::LAST_VISIT))
+                        .filter(|f| converse::shown(f))
                         .collect();
                     let best = facts
                         .iter()
@@ -571,7 +688,7 @@ impl Session {
                         .facts
                         .recall(id)
                         .into_iter()
-                        .filter(|f| !f.starts_with(crate::visit::LAST_VISIT))
+                        .filter(|f| converse::shown(f))
                         .collect();
                     if let Some(f) = facts.last() {
                         let said = second_person(f);
@@ -599,6 +716,16 @@ impl Session {
                 Some("Okay, I've forgotten you. Bye for now!".to_owned())
             }
             "everyday" => Some(everyday_answer(text)),
+            "deep" => match self
+                .deep_line(text, me.as_ref(), my_name.as_deref(), obs, cancel)
+                .await
+            {
+                Ok(l) => Some(l),
+                Err(()) => {
+                    self.ui("idle");
+                    return Ok(TurnEnd::Cancelled);
+                }
+            },
             "out_of_zone" => {
                 let h = self
                     .people
@@ -678,6 +805,7 @@ impl Session {
                 said_before,
                 None,
             );
+            self.sync_expect_name();
             self.ui("idle");
             return Ok(TurnEnd::Done);
         }
@@ -701,8 +829,19 @@ impl Session {
             said_before,
             None,
         );
+        self.sync_expect_name();
         self.ui("idle");
         Ok(TurnEnd::Done)
+    }
+
+    /// Tell the hearing side whether a name is expected now.
+    fn sync_expect_name(&self) {
+        if let Some(hook) = self.people.as_ref().and_then(|p| p.expecting_name.as_ref()) {
+            hook(matches!(
+                self.visit.awaiting,
+                Some(Awaiting::Name | Awaiting::Companion | Awaiting::RelationName(_))
+            ));
+        }
     }
 
     /// Store every relation the utterance gave; the confirmation line for
@@ -726,6 +865,15 @@ impl Session {
             let mine = r.inverse();
             self.facts
                 .relate_people(me, &mine, &m.name, text, u.confidence.max(0.5));
+            // The word itself ("son", not just "child"), on them.
+            if let (Some(other), Some(my)) =
+                (self.facts.resolve_name(&m.name), self.facts.name_of(me))
+            {
+                let f = format!("{}{my}", converse::relation_word_fact(word));
+                if !self.facts.recall(&other).contains(&f) {
+                    self.facts.remember(&other, &f);
+                }
+            }
             if confirm.is_none() {
                 confirm = Some(match m.reference.as_deref() {
                     Some(r) if r.contains("'s ") => format!("I'll remember you're {r}."),
@@ -799,6 +947,7 @@ impl Session {
             let low = s.to_lowercase();
             need.iter().all(|w| low.contains(w.as_str()))
                 && (!content.trim_end().ends_with('?') || s.contains('?'))
+                && (content.contains('?') || !s.contains('?'))
         };
         let (raw, first) = self
             .stream_say_first(stream, deadline, obs, cancel, &carries)
@@ -818,7 +967,9 @@ impl Session {
         // Every name and number the content carried must survive.
         // Every name and number kept, and a question still asked.
         let kept = need.iter().all(|w| low.contains(w.as_str()))
-            && (!content.trim_end().ends_with('?') || l.contains('?'));
+            && (!content.trim_end().ends_with('?') || l.contains('?'))
+            // No question of its own: no unprompted small talk.
+            && (content.contains('?') || !l.contains('?'));
         let words = l.split_whitespace().count();
         if !kept
             || words == 0
@@ -1011,11 +1162,157 @@ impl Session {
     }
 }
 
+/// An understander confidence below which an open question goes to the
+/// slow path.
+const DEEP_BELOW: f32 = 0.7;
+/// The slow path's whole budget, holding line to answer.
+const DEEP_CAP: Duration = Duration::from_secs(6);
+/// Word ceiling of a slow-path answer.
+const DEEP_WORDS: usize = 50;
+/// Said at once when a question needs thinking, taken in turn.
+pub const HOLDS: &[&str] = &[
+    "Hmm, let me think about that.",
+    "Good question. Let me think.",
+    "Ooh, give me a second to think.",
+    "Let me think about that for a moment.",
+    "Hmm, let me put that together.",
+];
+static HOLD_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// When the slow path runs out of time or the model fails.
+pub const DEEP_GIVE_UP: &str =
+    "Sorry, I couldn't think that one through just now. Could you ask me again?";
+/// The slow path's instructions.
+const DEEP_RULES: &str = "Now a question that needs real thought. First think briefly inside <think></think>, never spoken, in at most three short lines: what exactly they ask; which facts above (their people, what they told you, this visit, the times and details) decide it; the answer a kind, sensible friend would give. Then, after </think>, the spoken answer: one to three short sentences, at most 45 words, warm and specific, using what they told you. Never invent people, facts or events you were not told. If the answer is not in what you know, say so simply and suggest who could help (their family, a teacher, the front desk). No emoji, no lists.";
+
+impl Session {
+    /// The slow path: a holding line at once, then the stronger model with
+    /// the whole layered context and a silent reasoning step, within
+    /// [`DEEP_CAP`]. `Err` = cancelled (barge-in).
+    async fn deep_line(
+        &mut self,
+        text: &str,
+        me: Option<&EntityId>,
+        name: Option<&str>,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: &CancellationToken,
+    ) -> Result<String, ()> {
+        use futures_util::StreamExt as _;
+        let t0 = tokio::time::Instant::now();
+        let n = HOLD_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hold = HOLDS[n % HOLDS.len()];
+        tracing::info!(hold, "slow path: holding line");
+        self.say(hold.to_owned());
+        self.said.push(hold);
+        // Layers: who they are (profile, relations, facts), their people's
+        // own facts, the visit notebook, then the last turns as real turns.
+        let mut ctx = converse::layered(self.facts.as_ref(), me, name, &self.visit);
+        if let Some(id) = me {
+            for e in self.facts.edges(id).iter().take(6) {
+                let known: Vec<String> = self
+                    .facts
+                    .recall(&e.other)
+                    .into_iter()
+                    .filter(|f| converse::shown(f))
+                    .take(4)
+                    .collect();
+                if !known.is_empty() {
+                    ctx.push_str(&format!("\n[about {}] {}", e.other_name, known.join("; ")));
+                }
+            }
+        }
+        let mut m = vec![Message::system(format!(
+            "{PERSONA}\n{}\n{ctx}\n{DEEP_RULES}",
+            now_line()
+        ))];
+        for e in self.visit.recent() {
+            m.push(Message::user(e.heard.clone()));
+            m.push(Message::assistant(e.said.clone()));
+        }
+        let who = name.map(|n| format!(" ({n})")).unwrap_or_default();
+        m.push(Message::user(format!("[they ask]{who} {text}")));
+        let req = ChatRequest {
+            messages: m,
+            tools: Vec::new(),
+            max_tokens: 220,
+            temperature: 0.4,
+            json_object: false,
+        };
+        let backend = self
+            .people
+            .as_ref()
+            .and_then(|p| p.deep.clone())
+            .unwrap_or_else(|| Arc::clone(&self.backend));
+        let mut stream = backend.chat(req);
+        let deadline = t0 + DEEP_CAP;
+        let mut raw = String::new();
+        let done = loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(()),
+                () = tokio::time::sleep_until(deadline) => break false,
+                o = obs.recv() => {
+                    if let Some(o) = o
+                        && barge_in(&o)
+                    {
+                        return Err(());
+                    }
+                }
+                ev = stream.next() => match ev {
+                    None => break true,
+                    Some(Err(e)) => {
+                        tracing::info!(error = %e, "slow path: model failed");
+                        break false;
+                    }
+                    Some(Ok(ChatEvent::Text(t))) => raw.push_str(&t),
+                    Some(Ok(ChatEvent::Call(_))) => {}
+                }
+            }
+        };
+        let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (mut answer, reasoning) = crate::voice::strip_reasoning(&raw);
+        // Out of time mid-answer: the complete sentences so far are said.
+        let partial = !done && raw.contains("</think>");
+        if partial {
+            let cut = answer.rfind(['.', '!', '?']).map_or(0, |i| i + 1);
+            answer.truncate(cut);
+        }
+        let line = if done || partial {
+            // The guards, with everything the prompt carried counted as
+            // real: names from the graph are not invented ones.
+            let real = format!("{} {}", self.real_context(), ctx.to_lowercase());
+            deep_answer(&answer).filter(|l| {
+                !crate::voice::leaks_example(l, &real) && !l.contains('[') && !self.said.repeats(l)
+            })
+        } else {
+            None
+        };
+        tracing::info!(
+            ms,
+            done,
+            reasoning = reasoning.as_str(),
+            answer = line.as_deref().unwrap_or(""),
+            "slow path answered"
+        );
+        Ok(line.unwrap_or_else(|| DEEP_GIVE_UP.to_owned()))
+    }
+}
+
+/// The spoken part of a slow-path reply (the reasoning dropped, at most
+/// two sentences and [`DEEP_WORDS`] words), or `None` when nothing sayable
+/// is left.
+fn deep_answer(answer: &str) -> Option<String> {
+    crate::voice::speakable(answer, DEEP_WORDS)
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty() && !crate::voice::leaks_instructions(l))
+}
+
 /// Lines whose exact words matter and are never reworded: privacy, the
 /// hand-off, forgetting someone.
 fn fixed_line(intent: &str, line: &str) -> bool {
     intent == "forget_me"
         || intent == "out_of_zone"
+        || line == ASK_NAME
+        || line.starts_with("I don't know")
         || line.starts_with("I only talk")
         || line == crate::handoff::DEFAULT_LINE
 }
@@ -1058,6 +1355,42 @@ fn sentence_end(text: &str) -> Option<usize> {
 /// The words a rephrase must keep from `content`: names and numbers,
 /// lower-cased.
 fn required_words(content: &str) -> Vec<String> {
+    // What "You told me ..." reports must survive too: "hospital".
+    let told: Vec<String> = content
+        .split("told me")
+        .skip(1)
+        .flat_map(|t| t.split(|c: char| !c.is_alphanumeric()))
+        .filter(|w| {
+            w.len() >= 4
+                && !matches!(
+                    *w,
+                    "your"
+                        | "that"
+                        | "with"
+                        | "have"
+                        | "work"
+                        | "works"
+                        | "like"
+                        | "likes"
+                        | "favourite"
+                )
+        })
+        .map(str::to_lowercase)
+        .collect();
+    let mut need = named_words(content);
+    need.extend(told);
+    // The relation said must survive: "Sunita is your wife".
+    for w in content.split(|c: char| !c.is_alphanumeric()) {
+        let lw = w.to_lowercase();
+        if crate::people::Relation::from_word(&lw).is_some() && lw.len() > 3 && !need.contains(&lw)
+        {
+            need.push(lw);
+        }
+    }
+    need
+}
+
+fn named_words(content: &str) -> Vec<String> {
     content
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| {
@@ -1206,6 +1539,23 @@ fn everyday_answer(text: &str) -> String {
     }
 }
 
+/// The name a correction gives when no rule found it: the last
+/// capitalised word that is not the name held now ("sorry, I'm Neela, the
+/// line was noisy", "not Meena, Mina").
+fn said_name(text: &str, held: Option<&str>) -> Option<String> {
+    text.split(|c: char| !c.is_alphabetic())
+        .filter(|w| w.len() >= 2 && w.chars().next().is_some_and(char::is_uppercase))
+        .filter(|w| {
+            !matches!(
+                *w,
+                "I" | "No" | "Not" | "Sorry" | "It" | "My" | "That" | "Its" | "Glydi"
+            )
+        })
+        .filter(|w| held.is_none_or(|h| !h.eq_ignore_ascii_case(w)))
+        .find(|w| crate::voice::plausible_name(w))
+        .map(str::to_owned)
+}
+
 /// "What's my name?", "who am I?", "do you know me?".
 fn asks_name_only(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
@@ -1268,6 +1618,10 @@ mod tests {
     }
 
     fn rig(chat: Vec<Script>) -> Rig {
+        rig_with(chat, Arc::new(|_| {}))
+    }
+
+    fn rig_with(chat: Vec<Script>, expect_hook: ExpectName) -> Rig {
         let room: Arc<Mutex<Vec<ViewEntity>>> = Arc::default();
         let r2 = Arc::clone(&room);
         let snapshot: Snapshot = Box::new(move || {
@@ -1287,6 +1641,8 @@ mod tests {
                 understander: Some(model.clone()),
                 handoff: Arc::new(crate::handoff::DefaultHandoff),
                 think_ack: true,
+                deep: None,
+                expecting_name: Some(expect_hook),
             }),
             ..Config::default()
         };
@@ -1539,6 +1895,63 @@ mod tests {
         r.model.push("{");
         let line = r.say("blorp the flimble", Some(&a)).await;
         assert!(CLARIFY.contains(&line.as_str()), "{line}");
+    }
+
+    /// The hearing side is told when a bare reply may be a name.
+    #[tokio::test]
+    async fn name_expected_while_the_bot_waits_for_one() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = Arc::clone(&flag);
+        let mut r = rig_with(
+            vec![],
+            Arc::new(move |on| f2.store(on, std::sync::atomic::Ordering::Relaxed)),
+        );
+        let on = || flag.load(std::sync::atomic::Ordering::Relaxed);
+        r.say("hello", None).await;
+        assert!(on(), "asked for a name");
+        r.say("Meera", None).await;
+        assert!(!on(), "name given");
+        let meera = r.facts.resolve_name("Meera").unwrap();
+        r.say("this is my sister", Some(&meera)).await;
+        assert!(on(), "asked for the sister's name");
+        r.say("Priya", Some(&meera)).await;
+        assert!(!on());
+    }
+
+    #[tokio::test]
+    async fn router_sends_thinking_questions_to_the_slow_path() {
+        let mut r = rig(vec![Script::text(&[
+            "<think>Priya loves painting; a gift for painting.</think>",
+            "Priya loves painting, so a set of brushes would be lovely.",
+        ])]);
+        let kavya = r.facts.add_person("Kavya");
+        r.facts
+            .relate_people(&kavya, &Relation::SiblingOf, "Priya", "x", 0.9);
+        let line = r
+            .say(
+                "what should I get my sister for her birthday?",
+                Some(&kavya),
+            )
+            .await;
+        assert!(HOLDS.iter().any(|h| line.starts_with(h)), "{line}");
+        assert!(
+            line.ends_with("a set of brushes would be lovely."),
+            "{line}"
+        );
+        assert!(!line.contains("think>"), "{line}");
+        // A plain question stays fast.
+        let line = r.say("what's my name?", Some(&kavya)).await;
+        assert!(line.starts_with("You're Kavya"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn slow_path_gives_a_graceful_line_when_the_model_is_late() {
+        let mut late = Script::text(&["<think>hmm</think> Too late."]);
+        late.delay = Duration::from_secs(7);
+        let mut r = rig(vec![late]);
+        let a = r.facts.add_person("Om");
+        let line = r.say("who should I ask about my cough?", Some(&a)).await;
+        assert!(line.ends_with(DEEP_GIVE_UP), "{line}");
     }
 
     #[tokio::test]

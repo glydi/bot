@@ -51,6 +51,11 @@ MAX_WORDS = 35
 P = {"lane": "people"}
 CHAT = {"lane": "people", "words": 22, "budget": 1500, "not": ["teacher!"]}
 HANDOFF = {"lane": "people", "has": "front desk", "same_ok": True}
+# The slow path: a holding line at once (within the usual budget), then the
+# stronger model's answer within DEEP_CAP_MS of the question.
+DEEP_CAP_MS = 6000
+HOLD_WORDS = ["let me think", "let me put that together", "second to think"]
+DEEP = {"lane": "people", "deep": True, "words": 70}
 
 SCENARIOS: dict[str, list[tuple[str, dict]]] = {
     "parent_and_son": [
@@ -67,7 +72,9 @@ SCENARIOS: dict[str, list[tuple[str, dict]]] = {
         ("I'm Suresh, Rohan's father", {**P, "has": "Suresh"}),
         ("Rohan has a cricket match on Sunday", {**P, "not": "teacher"}),
         ("bye", {**P, "has": "Suresh"}),
-        ("hello, I'm Suresh", {**P, "has": "How did Rohan's match go"}),
+        # No volunteered facts: the remembering greeting ("How did Rohan's
+        # match go?") is behind GLYDI_GREET_FACTS=1; by default a plain hello.
+        ("hello, I'm Suresh", {**P, "has": "Suresh"}),
         ("he won!", {"lane": "people", "budget": 1500}),
         ("bye bye", {**P, "has": "Suresh"}),
     ],
@@ -77,12 +84,15 @@ SCENARIOS: dict[str, list[tuple[str, dict]]] = {
         ("who is Priya?", {**P, "has": ["sibling", "sister"]}),
         ("how is she?", {**P, "has": "Priya"}),
         ("bye", {**P, "has": "Sony"}),
-        ("hi, I'm Priya", {**P, "has": ["Sony"]}),
+        # Known again, greeted by name; Sony is not volunteered.
+        ("hi, I'm Priya", {**P, "has": "Priya"}),
+        ("who is Sony?", {**P, "has": ["sister", "sibling"]}),
         ("what's my name?", {**P, "has": "Priya"}),
     ],
     "stranger_gives_name": [
         ("hello", {**P, "has": "name"}),
-        ("Meera", {**P, "has": "Nice to meet you, Meera"}),
+        # The model words it: "Nice/Great/Lovely to meet you" are all fine.
+        ("Meera", {**P, "has": "Meera", "all": ["meet"]}),
         ("what's my name?", {**P, "has": "Meera"}),
         ("do you know me?", {**P, "has": "Meera", "same_ok": True}),
         ("see you later", {**P, "has": "Meera"}),
@@ -229,6 +239,55 @@ SCENARIOS: dict[str, list[tuple[str, dict]]] = {
         ("who am I?", {**P, "has": "Fatima"}),
         ("bye", {**P, "has": "Fatima"}),
     ],
+    # --- The slow path: questions that need thinking over what was told.
+    "deep_gift": [
+        ("I'm Kavya", {**P, "has": "Kavya"}),
+        ("my sister Priya loves painting", {**P, "has": "Priya"}),
+        ("what should I get my sister for her birthday?", {**DEEP, "has": ["paint", "brush", "art", "colour", "color", "canvas", "sketch"]}),
+        ("what's my name?", {**P, "has": "Kavya"}),
+    ],
+    "deep_recall": [
+        ("I'm Arjun", {**P, "has": "Arjun"}),
+        ("my daughter Meera has a dance show on Friday", {**P, "has": "Meera"}),
+        ("she is very nervous about it", {"lane": "people", "budget": 1500}),
+        ("what did I tell you about Meera?", {**DEEP, "has": ["dance", "show", "Friday", "nervous"]}),
+    ],
+    "deep_who_to_ask": [
+        ("I'm Sana", {**P, "has": "Sana"}),
+        ("my husband Imran is a doctor", {**P, "has": "Imran"}),
+        ("I have had a bad cough all week", {"lane": "people", "budget": 1500}),
+        ("who should I ask about my cough?", {**DEEP, "has": ["Imran", "doctor"]}),
+    ],
+    "deep_calm_son": [
+        ("I'm Ravi", {**P, "has": "Ravi"}),
+        ("my son Kabir has a maths test tomorrow", {**P, "has": "Kabir"}),
+        ("he always gets nervous before tests", {"lane": "people", "budget": 1500}),
+        ("how can I help my son feel calm before his test?", {**DEEP, "has": ["Kabir", "breath", "calm", "practi", "relax", "sleep", "remind"]}),
+        ("thanks, bye", {**P, "has": "Ravi"}),
+    ],
+    "deep_friend_advice": [
+        ("hi, I'm Tara", {**P, "has": "Tara"}),
+        ("my friend Zoya is not talking to me today", {"lane": "people", "budget": 1500, "has": ["Zoya", "sorry", "oh"]}),
+        ("what should I do?", {**DEEP, "has": ["Zoya", "talk", "ask", "kind", "teacher"]}),
+    ],
+    "deep_pickup": [
+        ("I'm Fatima", {**P, "has": "Fatima"}),
+        ("my son Imran has football practice until five", {**P, "has": "Imran"}),
+        ("my daughter Aisha finishes school at three", {**P, "has": "Aisha"}),
+        ("which one should I pick up first?", {**DEEP, "has": ["Aisha"]}),
+    ],
+    "deep_compare": [
+        ("I'm Neha", {**P, "has": "Neha"}),
+        ("my brother Dev loves cricket", {**P, "has": "Dev"}),
+        ("my sister Priya loves music", {**P, "has": "Priya"}),
+        ("do you think Dev or Priya would enjoy a concert more?", {**DEEP, "has": ["Priya"]}),
+    ],
+    "deep_open": [
+        ("I'm Meena", {**P, "has": "Meena"}),
+        ("I work at the hospital", {**P, "not": "teacher"}),
+        ("should I switch to night shifts, what do you think?", {**DEEP, "has": ["sleep", "rest", "night", "shift", "family", "depend", "hospital", "you"]}),
+        ("what do you know about me?", {**P, "has": "hospital"}),
+    ],
     # The safety net: one calm fixed line, always.
     "emergency": [
         ("I'm hurt", {"lane": "any", "has": ["teacher", "office", "adult"]}),
@@ -364,6 +423,8 @@ def run_scenario(name: str, steps: list[tuple[str, dict]], wait: float) -> list[
         # a reply and a grace period. The timing comes from that line, never
         # from this loop's own polling and settling waits.
         reply_lines: list[str] = []
+        deep_ms = None
+        route = None
         lane = None
         legs = None
         first_reply_at = None
@@ -375,12 +436,25 @@ def run_scenario(name: str, steps: list[tuple[str, dict]], wait: float) -> list[
                 # Stamped as it is seen, before any waiting below.
                 first_reply_at = time.time()
             for l in new:
+                if "slow path answered" in l:
+                    m = re.search(r"\bms=(\d+)", l)
+                    deep_ms = int(m.group(1)) if m else -1
+                if "router" in l and "route=" in l:
+                    m = re.search(r"route=\"?(\w+)", l)
+                    route = m.group(1) if m else route
                 for mark, lane_name in LANE_MARKS.items():
                     if mark in l:
                         lane = lane_name
                 got = turn_legs(l)
                 if got and got["id"] == turn_id:
                     legs = got
+            slow = route == "slow"
+            if slow and deep_ms is None:
+                # The slow path: wait for its answer, past the holding line.
+                if time.time() - t0 > DEEP_CAP_MS / 1000 + 4:
+                    break
+                time.sleep(0.1)
+                continue
             if legs is not None:
                 time.sleep(0.3)
                 break
@@ -396,6 +470,7 @@ def run_scenario(name: str, steps: list[tuple[str, dict]], wait: float) -> list[
         results.append({
             "said": said, "reply": " ".join(reply_lines), "lane": lane or "none",
             "turn_ms": legs["total"] if legs else None, "legs": legs, "elapsed_ms": elapsed_ms, "expect": expect,
+            "route": route, "deep_ms": deep_ms,
         })
     try:
         proc.stdin.close()
@@ -428,6 +503,20 @@ def judge(name: str, results: list[dict]) -> list[str]:
             want = lane
         if want != "any" and lane != want:
             gaps.append(f"{tag}: lane {lane}, wanted {want} -> {reply!r}")
+        if r["expect"].get("deep"):
+            if r.get("route") != "slow":
+                gaps.append(f"{tag}: not on the slow path (route {r.get('route')}) -> {reply!r}")
+            elif not any(h in reply.lower() for h in HOLD_WORDS):
+                gaps.append(f"{tag}: no holding line -> {reply!r}")
+            if r.get("deep_ms") is None or r["deep_ms"] < 0 or r["deep_ms"] > DEEP_CAP_MS:
+                gaps.append(f"{tag}: slow answer took {r.get('deep_ms')} ms, cap {DEEP_CAP_MS}")
+            if "couldn't think that one through" in reply:
+                gaps.append(f"{tag}: slow path gave up -> {reply!r}")
+        elif r.get("route") == "slow":
+            gaps.append(f"{tag}: took the slow path, wanted fast -> {reply!r}")
+        for a in r["expect"].get("all") or []:
+            if a.lower() not in reply.lower():
+                gaps.append(f"{tag}: missing {a!r} -> {reply!r}")
         has = r["expect"].get("has")
         if isinstance(has, str):
             has = [has]
@@ -493,13 +582,18 @@ def main() -> None:
                 timing = f"{legs['total']:>5} ms  think {leg('think'):>4} tts {leg('tts'):>4}"
             else:
                 timing = f"{r['elapsed_ms']:>5} ms~ (no turn line)"
+            if r.get("deep_ms") is not None:
+                timing += f"  slow {r['deep_ms']} ms"
             print(f"  {r['said']:<52} [{r['lane']:<8} {timing}]  {r['reply']}")
         for r in results:
             if r["reply"]:
                 by_lane.setdefault(r["lane"], []).append(r["turn_ms"] if r["turn_ms"] is not None else r["elapsed_ms"])
+        for r in results:
+            if r.get("deep_ms") is not None and r["deep_ms"] >= 0:
+                by_lane.setdefault("slow", []).append(r["deep_ms"])
         gaps = judge(name, results)
         all_gaps.extend(gaps)
-    print("\n== latency per lane, ms to first audio: n  min  median  p90  max")
+    print("\n== latency per lane, ms to first audio (slow = question to answer): n  min  median  p90  max")
     for ln, v in sorted(by_lane.items()):
         v.sort()
         print(f"  {ln:<9} {len(v):>3} {v[0]:>6} {v[len(v) // 2]:>6} {v[min(len(v) - 1, int(len(v) * 0.9))]:>6} {v[-1]:>6}")

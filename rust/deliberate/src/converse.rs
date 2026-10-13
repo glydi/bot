@@ -80,7 +80,7 @@ pub fn profile(facts: &dyn FactSource, speaker: Option<&EntityId>, name: Option<
         s.push_str(&rel.join("; "));
     }
     let all = facts.recall(id);
-    let plain: Vec<&String> = all.iter().filter(|f| !f.starts_with(LAST_VISIT)).collect();
+    let plain: Vec<&String> = all.iter().filter(|f| shown(f)).collect();
     if !plain.is_empty() {
         s.push_str(". Known: ");
         s.push_str(
@@ -111,6 +111,20 @@ pub fn layered(
     format!("{}\n{}", profile(facts, speaker, name), visit.notebook())
 }
 
+/// The fact kept on a person told as "my son" (`"son of "`), so "my son"
+/// and "my daughter" find the right one of two children.
+pub fn relation_word_fact(word: &str) -> String {
+    format!("{REL_TAG}{} of ", word.trim().to_lowercase())
+}
+
+/// Marks the relation-word facts; never said as a fact.
+pub const REL_TAG: &str = "told as ";
+
+/// A fact to show or say: not the last-visit line, not a relation tag.
+pub fn shown(f: &str) -> bool {
+    !f.starts_with(LAST_VISIT) && !f.starts_with(REL_TAG)
+}
+
 /// Who a mention points at: a name, "my son", or a pronoun from the
 /// notebook.
 pub fn resolve(
@@ -130,7 +144,20 @@ pub fn resolve(
         if let Some(r) = Relation::from_word(word) {
             let want = r.inverse();
             let edges = facts.edges(sp);
-            if let Some(e) = edges.iter().find(|e| e.relation == want) {
+            // "my son" when there are a son and a daughter: the one told
+            // as a son (see [`relation_word_fact`]).
+            let told = relation_word_fact(word);
+            let hit = edges
+                .iter()
+                .filter(|e| e.relation == want)
+                .find(|e| {
+                    facts
+                        .recall(&e.other)
+                        .iter()
+                        .any(|f| f.to_lowercase().starts_with(&told))
+                })
+                .or_else(|| edges.iter().find(|e| e.relation == want));
+            if let Some(e) = hit {
                 return Some((e.other.clone(), e.other_name.clone()));
             }
         }
@@ -160,10 +187,17 @@ pub fn about_person(
     if !may_discuss(speaker, id, &edges) {
         return "I only talk about people I know through you. The office can help.".to_owned();
     }
-    let rel = edges
-        .iter()
-        .find(|e| &e.other == id)
-        .map(|e| relation_noun(&e.relation.inverse()).to_owned());
+    let rel = edges.iter().find(|e| &e.other == id).map(|e| {
+        // The word they used ("wife", "sister") beats the edge's noun.
+        let told = speaker.and_then(|sp| facts.name_of(sp)).and_then(|me| {
+            facts.recall(id).iter().find_map(|f| {
+                f.strip_prefix(REL_TAG)
+                    .and_then(|r| r.strip_suffix(&format!(" of {me}")))
+                    .map(str::to_owned)
+            })
+        });
+        told.unwrap_or_else(|| relation_noun(&e.relation.inverse()).to_owned())
+    });
     if who_question {
         return match rel {
             Some(r) => format!("That's {name}, your {r}."),
@@ -179,12 +213,7 @@ pub fn about_person(
     } else {
         format!("I haven't seen {name} today.")
     };
-    if let Some(f) = facts
-        .recall(id)
-        .iter()
-        .rev()
-        .find(|f| !f.starts_with(LAST_VISIT))
-    {
+    if let Some(f) = facts.recall(id).iter().rev().find(|f| shown(f)) {
         line.push_str(&format!(
             " Last I heard, {name} {}.",
             f.trim_end_matches('.')
@@ -211,6 +240,40 @@ pub fn write_fact(facts: &dyn FactSource, id: &EntityId, fact: &str, retract: bo
     }
     tracing::info!(%id, fact, ?op, "fact write");
     op
+}
+
+/// [`write_fact`], and when `replaces` (they said "now" or "actually")
+/// a new fact that would be added beside one of the same subject replaces
+/// it instead: "now I like football" after "likes cricket".
+pub fn write_fact_replacing(
+    facts: &dyn FactSource,
+    id: &EntityId,
+    fact: &str,
+    retract: bool,
+    replaces: bool,
+) -> FactOp {
+    if replaces && !retract {
+        let held = facts.recall(id);
+        let key = crate::people::subject_key(fact);
+        if crate::people::fact_op(&held, fact, false) == FactOp::Add
+            && !key.is_empty()
+            && let Some(old) = held.iter().find(|h| crate::people::subject_key(h) == key)
+        {
+            facts.forget_fact(id, old);
+            facts.remember(id, fact);
+            tracing::info!(%id, fact, old, "fact write: replaced");
+            return FactOp::Update(old.clone());
+        }
+    }
+    write_fact(facts, id, fact, retract)
+}
+
+/// The utterance changes something said before: "now", "actually",
+/// "not any more but".
+pub fn replaces(text: &str) -> bool {
+    let w = crate::understand::words(text);
+    w.iter()
+        .any(|x| matches!(x.as_str(), "now" | "actually" | "instead" | "anymore"))
 }
 
 /// Whether the utterance takes a fact back.

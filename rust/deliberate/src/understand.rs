@@ -42,6 +42,7 @@ pub const INTENTS: &[&str] = &[
     "chit_chat",
     "feeling",
     "out_of_zone",
+    "deep",
     "unclear",
 ];
 
@@ -161,16 +162,19 @@ pub fn schema() -> Value {
 /// The understander's instructions (layer (i) for this call).
 pub const SYSTEM: &str = r#"Label ONE utterance said to a school-door robot. Reply with JSON only. Label only the utterance; the context is only for resolving he/she.
 Intents:
-- greet: hello. bye: goodbye.
+- greet: hello, namaste, good morning. bye: goodbye.
+- how_are_you: asks how the robot is ("how are you?", "how's it going").
+- ask_about_bot: asks about the robot itself ("what's your name?", "what can you do?").
 - tell_name: the speaker says their own name. correct_name: says the robot has their name wrong.
 - tell_relation: says who someone is to them ("this is my sister Priya", "I'm Meera's mother", "Mrs Rao is my teacher").
 - tell_fact: a statement about themselves or their family (likes, has, works, lives, events).
 - ask_about_person: a question about someone else ("how is Rohan?", "is my son here?", "who is she?").
 - ask_about_me: asks what the robot knows about them or their name.
 - forget_me: asks the robot to forget or delete them.
-- feeling: says how they feel. chit_chat: small talk with the robot.
-- everyday: the time, the date or day, simple sums, spelling a word.
-- out_of_zone: history, geography, famous people, news, weather, scores, translation, school dates, fees, homework, holidays.
+- feeling: says how they feel. chit_chat: small talk with the robot, jokes, compliments or rude remarks about the robot ("you are stupid", "shut up").
+- everyday: ONLY the time, today's date or day, a simple sum, spelling a word.
+- out_of_zone: a question about the world or the school's business: history, geography, science facts, famous people, news, weather, scores, translation, school dates, fees, homework, holidays ("capital of France", "how far is the moon", "will it rain").
+- deep: a question that needs thinking about the speaker's own life, people or earlier words: advice, planning, "what should I...", "who should I ask...", "what did I tell you about...".
 - unclear: words that make no sense.
 people: every other person named or pointed at in the utterance: name exactly as said ("" for a bare pronoun), relation_to_speaker (son, sister, friend, teacher...), ref (the words: "she", "my son"). Never take names from the context.
 facts: short facts about the speaker, e.g. "likes cricket". refers_to: the pronoun used, else null.
@@ -178,6 +182,10 @@ Examples:
 "my name is Kavya" -> {"intent":"tell_name","people":[{"name":"Kavya"}],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.95}
 "meet my friend Kabir" -> {"intent":"tell_relation","people":[{"name":"Kabir","relation_to_speaker":"friend","ref":"my friend"}],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}
 "I have a dog called Bruno" -> {"intent":"tell_fact","people":[],"facts":["has a dog called Bruno"],"refers_to":null,"heard_ok":true,"confidence":0.9}
+"my son is Aarav" -> {"intent":"tell_relation","people":[{"name":"Aarav","relation_to_speaker":"son","ref":"my son"}],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}
+"we just moved to Kondapur" -> {"intent":"tell_fact","people":[],"facts":["lives in Kondapur"],"refers_to":null,"heard_ok":true,"confidence":0.9}
+"when are the fees due?" -> {"intent":"out_of_zone","people":[],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}
+"what should I get my sister for her birthday?" -> {"intent":"deep","people":[{"name":"","relation_to_speaker":"sister","ref":"my sister"}],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}
 "is he here yet?" -> {"intent":"ask_about_person","people":[{"name":"","ref":"he"}],"facts":[],"refers_to":"he","heard_ok":true,"confidence":0.9}
 "I'm bored" -> {"intent":"feeling","people":[],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}
 "blue the went sandwich" -> {"intent":"unclear","people":[],"facts":[],"refers_to":null,"heard_ok":false,"confidence":0.2}"#;
@@ -520,6 +528,116 @@ pub fn first_name_in(text: &str) -> Option<String> {
     name_word(first).then(|| cap(first))
 }
 
+/// Whether `name` appears capitalised in `text` as said (a transcriber
+/// capitalises names): "I'm Anil Kapoor, here for..." yes, "I'm starving
+/// today" no.
+fn capitalised_in(text: &str, name: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|t| t.eq_ignore_ascii_case(name) && t.chars().next().is_some_and(char::is_uppercase))
+}
+
+/// Whether `text` asks something: a question mark, or a question word or
+/// auxiliary first.
+pub fn asks(text: &str) -> bool {
+    if text.trim_end().ends_with('?') {
+        return true;
+    }
+    let w = words(text);
+    let first = w.iter().map(String::as_str).find(|x| {
+        !matches!(
+            *x,
+            "and" | "so" | "but" | "hey" | "glydi" | "robot" | "ok" | "okay" | "tell" | "me"
+        )
+    });
+    matches!(
+        first,
+        Some(
+            "what"
+                | "what's"
+                | "whats"
+                | "when"
+                | "where"
+                | "who"
+                | "who's"
+                | "whom"
+                | "whose"
+                | "why"
+                | "how"
+                | "which"
+                | "is"
+                | "are"
+                | "do"
+                | "does"
+                | "did"
+                | "can"
+                | "could"
+                | "will"
+                | "would"
+                | "should"
+                | "shall"
+                | "was"
+                | "were"
+                | "has"
+                | "have"
+        )
+    )
+}
+
+/// "my son is Aarav", "my son Imran also studies here", "Ananya is my
+/// daughter", "Mrs Rao is my teacher": a relation told, with the name.
+fn relation_statement(s: &[&str]) -> Option<Understanding> {
+    let tell = |name: String, rel: &str| {
+        let mut u = Understanding::of("tell_relation");
+        u.people.push(Mention {
+            name,
+            relation_to_speaker: Some(rel.to_owned()),
+            reference: Some(format!("my {rel}")),
+        });
+        u
+    };
+    let s: Vec<&str> = s
+        .iter()
+        .copied()
+        .skip_while(|w| matches!(*w, "and" | "also" | "so" | "oh" | "well"))
+        .collect();
+    match s.as_slice() {
+        ["my", rel, "is", name, ..] | ["my", rel, name, ..]
+            if crate::people::Relation::from_word(rel).is_some()
+                && name_word(name)
+                && !matches!(
+                    *name,
+                    "is" | "was"
+                        | "will"
+                        | "has"
+                        | "had"
+                        | "can"
+                        | "studies"
+                        | "likes"
+                        | "loves"
+                        | "plays"
+                        | "goes"
+                        | "works"
+                        | "lives"
+                ) =>
+        {
+            Some(tell(cap(name), rel))
+        }
+        [title, name, "is", "my", rel, ..]
+            if matches!(*title, "mr" | "mrs" | "ms" | "miss" | "dr")
+                && name_word(name)
+                && crate::people::Relation::from_word(rel).is_some() =>
+        {
+            Some(tell(format!("{} {}", cap(title), cap(name)), rel))
+        }
+        [name, "is", "my", rel, ..]
+            if name_word(name) && crate::people::Relation::from_word(rel).is_some() =>
+        {
+            Some(tell(cap(name), rel))
+        }
+        _ => None,
+    }
+}
+
 /// "X's father" anywhere: (X, word).
 fn possessive_relation(s: &[&str]) -> Option<(String, String)> {
     s.windows(2).find_map(|p| {
@@ -540,7 +658,7 @@ pub fn inverse_word(word: &str) -> String {
 
 /// Deterministic understanding when unambiguous; `None` hands over to the
 /// model.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 pub fn rules(text: &str) -> Option<Understanding> {
     let w = words(text);
     let s: Vec<&str> = w.iter().map(String::as_str).collect();
@@ -558,6 +676,9 @@ pub fn rules(text: &str) -> Option<Understanding> {
         "how is it going",
         "hows it going",
         "how s it going",
+        "how's it going",
+        "how's your day",
+        "what's up",
         "whats up",
         "what s up",
         "how was your day",
@@ -588,6 +709,29 @@ pub fn rules(text: &str) -> Option<Understanding> {
         "hey glydi",
     ];
     if greet_words.contains(&joined.as_str()) {
+        return Some(Understanding::of("greet"));
+    }
+    const GREET_ANY: &[&str] = &[
+        "hi",
+        "hello",
+        "hey",
+        "hii",
+        "namaste",
+        "namaskar",
+        "morning",
+        "afternoon",
+        "evening",
+    ];
+    if s.len() <= 4
+        && s.iter().any(|w| GREET_ANY.contains(w))
+        && s.iter().all(|w| {
+            GREET_ANY.contains(w)
+                || matches!(
+                    *w,
+                    "good" | "glydi" | "robot" | "there" | "ji" | "everyone" | "friend" | "again"
+                )
+        })
+    {
         return Some(Understanding::of("greet"));
     }
     let bye_words = [
@@ -721,6 +865,35 @@ pub fn rules(text: &str) -> Option<Understanding> {
         }
         return Some(u);
     }
+    // Leading fillers off for the shapes below: "and this is my friend
+    // Zoya", "wait, actually, is my sister Priya here?".
+    let lead = s
+        .iter()
+        .take_while(|w| {
+            matches!(
+                **w,
+                "and"
+                    | "wait"
+                    | "actually"
+                    | "oh"
+                    | "um"
+                    | "uh"
+                    | "so"
+                    | "well"
+                    | "also"
+                    | "never"
+                    | "mind"
+                    | "ok"
+                    | "okay"
+                    | "hey"
+            )
+        })
+        .count();
+    let s: Vec<&str> = if lead > 0 && s.len() > lead + 1 {
+        s[lead..].to_vec()
+    } else {
+        s
+    };
     // "this is my sister Priya", "meet my friend Sony", "my son Rohan"
     for start in [
         &["this", "is", "my"][..],
@@ -748,6 +921,13 @@ pub fn rules(text: &str) -> Option<Understanding> {
             });
             return Some(u);
         }
+    }
+    if let Some(u) = relation_statement(&s).filter(|u| {
+        u.people
+            .iter()
+            .all(|m| m.name.split(' ').all(|n| capitalised_in(text, n)))
+    }) {
+        return Some(u);
     }
     // "I'm Suresh, Rohan's father" / "I am Rohan's mother" / "I'm Suresh"
     let own = first_name_in(text);
@@ -777,12 +957,21 @@ pub fn rules(text: &str) -> Option<Understanding> {
                 });
                 return Some(u);
             }
-            (Some(n), None) if s.len() <= 5 => {
+            (Some(n), None) if s.len() <= 5 || capitalised_in(text, n) => {
                 let mut u = Understanding::of("tell_name");
                 u.people.push(Mention {
                     name: n.clone(),
                     ..Mention::default()
                 });
+                // What the rest of the sentence says about them: "I'm
+                // Lakshmi, I work in the front office".
+                for clause in text.split([',', ';', '.']).skip(1) {
+                    let cw = words(clause);
+                    let cs: Vec<&str> = cw.iter().map(String::as_str).collect();
+                    if let Some(f) = own_fact(&cs) {
+                        u.facts.push(f);
+                    }
+                }
                 return Some(u);
             }
             _ => {}
@@ -809,8 +998,16 @@ pub fn rules(text: &str) -> Option<Understanding> {
         match who.as_slice() {
             ["my", rel] => {
                 crate::people::Relation::from_word(rel)?;
+                // "is my sister Priya here?": the name, when said.
+                let name = s
+                    .iter()
+                    .position(|w| w == rel)
+                    .and_then(|i| s.get(i + 1))
+                    .filter(|n| name_word(n) && capitalised_in(text, n))
+                    .map(|n| cap(n))
+                    .unwrap_or_default();
                 u.people.push(Mention {
-                    name: String::new(),
+                    name,
                     relation_to_speaker: Some((*rel).to_owned()),
                     reference: Some(format!("my {rel}")),
                 });
@@ -831,15 +1028,18 @@ pub fn rules(text: &str) -> Option<Understanding> {
         }
         return Some(u);
     }
+    if everyday(&joined) {
+        return Some(Understanding::of("everyday"));
+    }
+    if deep_question(text) {
+        return Some(Understanding::of("deep"));
+    }
     if let Some(f) = own_fact(&s) {
         let mut u = Understanding::of("tell_fact");
         u.facts.push(f);
         return Some(u);
     }
-    if everyday(&joined) {
-        return Some(Understanding::of("everyday"));
-    }
-    if out_of_zone(&joined) {
+    if out_of_zone(&joined) && asks(text) {
         return Some(Understanding::of("out_of_zone"));
     }
     if [
@@ -862,14 +1062,131 @@ pub fn rules(text: &str) -> Option<Understanding> {
     None
 }
 
+/// A question that needs thinking rather than a lookup: advice, planning,
+/// reasoning over what the speaker told before or about their people.
+/// Personal (it says I/my/me/we/our) and shaped as asking; world
+/// questions ("why is the sky blue") are not deep.
+#[allow(clippy::items_after_statements)]
+pub fn deep_question(text: &str) -> bool {
+    let w = words(text);
+    if w.len() < 4 {
+        return false;
+    }
+    let joined = format!(" {} ", w.join(" "));
+    let has = |p: &str| joined.contains(&format!(" {p} "));
+    const MEMORY: &[&str] = &[
+        "what did i tell you",
+        "what did i say",
+        "did i tell you",
+        "did i mention",
+        "remind me what",
+        "remind me who",
+        "remember what i",
+        "remember when i",
+        "what was i",
+    ];
+    const ASKING: &[&str] = &[
+        "should i",
+        "should we",
+        "shall i",
+        "shall we",
+        "what should",
+        "who should",
+        "where should",
+        "when should",
+        "how should",
+        "any advice",
+        "your advice",
+        "advise me",
+        "can you suggest",
+        "could you suggest",
+        "what do you suggest",
+        "do you recommend",
+        "would you recommend",
+        "what do you think",
+        "do you think",
+        "help me decide",
+        "help me plan",
+        "help me think",
+        "help me choose",
+        "how do i",
+        "how can i",
+        "how could i",
+        "what can i",
+        "what could i",
+        "which one",
+        "is it better",
+        "would it be better",
+        "what if",
+        "why do i",
+        "why does my",
+        "why is my",
+        "why did my",
+        "ideas for",
+        "any ideas",
+        "who could help",
+        "who can help",
+    ];
+    if MEMORY.iter().any(|p| has(p)) {
+        return true;
+    }
+    let personal = w
+        .iter()
+        .any(|x| matches!(x.as_str(), "i" | "my" | "me" | "we" | "our" | "us" | "mine"));
+    // "do you think Dev or Priya would enjoy a concert more?": an opinion
+    // asked about people by name.
+    let names_someone = text
+        .split(|c: char| !c.is_alphanumeric())
+        .skip(1)
+        .any(|t| t.len() > 1 && t.chars().next().is_some_and(char::is_uppercase) && t != "Glydi");
+    let opinion = ["do you think", "what do you think", "would you say"]
+        .iter()
+        .any(|p| has(p));
+    (personal && ASKING.iter().any(|p| has(p))) || (opinion && names_someone)
+}
+
+/// Whether `text` is shaped like a question that wants an answer (a
+/// question word first, or a question mark) and is long enough to be more
+/// than a quick exchange: the router sends such a turn to the slow path
+/// when the understander is unsure of it.
+pub fn open_question(text: &str) -> bool {
+    let w = words(text);
+    let wh = w.first().is_some_and(|f| {
+        matches!(
+            f.as_str(),
+            "what" | "why" | "how" | "who" | "which" | "should" | "would" | "could" | "can"
+        )
+    });
+    w.len() >= 5 && (wh || text.trim_end().ends_with('?'))
+}
+
 /// "my favourite colour is red", "I like cricket", "I have a dog called
 /// Bruno": the fact, third person ("favourite colour is red", "likes
 /// cricket", "has a dog called Bruno").
 pub fn own_fact(s: &[&str]) -> Option<String> {
+    // "actually I moved, I work at the hospital now": the last clause
+    // that says something is the fact.
+    let starts = (1..s.len())
+        .rev()
+        .filter(|&i| matches!(s[i], "i" | "we" | "i'm" | "im" | "my"));
+    for i in starts {
+        if let Some(f) = own_fact_here(&s[i..]) {
+            return Some(f);
+        }
+    }
+    own_fact_here(s)
+}
+
+fn own_fact_here(s: &[&str]) -> Option<String> {
     let s: Vec<&str> = s
         .iter()
         .copied()
-        .skip_while(|w| matches!(*w, "actually" | "and" | "also" | "well" | "so" | "oh"))
+        .skip_while(|w| {
+            matches!(
+                *w,
+                "actually" | "and" | "also" | "well" | "so" | "oh" | "now" | "sorry" | "but"
+            )
+        })
         .collect();
     let rest = |n: usize| {
         s[n..]
@@ -886,6 +1203,30 @@ pub fn own_fact(s: &[&str]) -> Option<String> {
         ["i", "like" | "love", _, ..] if s.len() <= 8 => Some(format!("likes {}", rest(2))),
         ["i", "have", "a" | "an" | "two" | "three", _, ..] if s.len() <= 9 => {
             Some(format!("has {}", rest(2)))
+        }
+        ["i", "work", "at" | "in" | "for" | "as", _, ..] if s.len() <= 10 => {
+            Some(format!("works {}", rest(2)))
+        }
+        ["i", "teach", _, ..] if s.len() <= 10 => Some(format!("teaches {}", rest(2))),
+        ["i" | "we", "live" | "stay", "in" | "at" | "near", _, ..] if s.len() <= 9 => {
+            Some(format!("lives {}", rest(2)))
+        }
+        ["i" | "we", "moved" | "shifted", "to", _, ..] if s.len() <= 9 => {
+            Some(format!("lives in {}", rest(3)))
+        }
+        [
+            "i" | "we",
+            "just" | "recently",
+            "moved" | "shifted",
+            "to",
+            _,
+            ..,
+        ] if s.len() <= 10 => Some(format!("lives in {}", rest(4))),
+        ["i'm" | "im", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 6 => {
+            Some(format!("is in class {}", rest(3)))
+        }
+        ["i", "am", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 7 => {
+            Some(format!("is in class {}", rest(4)))
         }
         _ => None,
     }
@@ -1023,6 +1364,64 @@ mod tests {
                 assert_eq!(r.u.intent, "chit_chat", "{what}");
             }
         }
+    }
+
+    #[test]
+    fn two_speeds_and_the_eval_misses() {
+        let i = |t: &str| rules(t).map(|u| u.intent);
+        assert_eq!(
+            i("what should I get my sister for her birthday?").as_deref(),
+            Some("deep")
+        );
+        assert_eq!(
+            i("what did I tell you about Meera?").as_deref(),
+            Some("deep")
+        );
+        assert_eq!(
+            i("who should I ask about my cough?").as_deref(),
+            Some("deep")
+        );
+        assert!(!deep_question("why is the sky blue"));
+        assert!(!deep_question("what's my name?"));
+        assert_eq!(i("morning glydi").as_deref(), Some("greet"));
+        assert_eq!(i("the fees are paid").as_deref(), None);
+        assert_eq!(i("when are the fees due?").as_deref(), Some("out_of_zone"));
+        let u = rules("I'm Anil Kapoor, here for a meeting with the principal").unwrap();
+        assert_eq!(
+            (u.intent.as_str(), u.people[0].name.as_str()),
+            ("tell_name", "Anil")
+        );
+        let u = rules("I'm Lakshmi, I work in the front office").unwrap();
+        assert_eq!(u.facts, vec!["works in the front office".to_owned()]);
+        for (t, name, rel) in [
+            ("my son is Aarav", "Aarav", "son"),
+            ("my son Imran also studies here", "Imran", "son"),
+            (
+                "Ananya is my daughter, she's in class two",
+                "Ananya",
+                "daughter",
+            ),
+            ("Mrs Rao is my teacher", "Mrs Rao", "teacher"),
+        ] {
+            let u = rules(t).unwrap();
+            assert_eq!(u.intent, "tell_relation", "{t}");
+            assert_eq!(u.people[0].name, name, "{t}");
+            assert_eq!(u.people[0].relation_to_speaker.as_deref(), Some(rel), "{t}");
+        }
+        assert!(rules("my brother is tall").is_none_or(|u| u.intent != "tell_relation"));
+        let f = |t: &str| rules(t).and_then(|u| u.facts.first().cloned());
+        assert_eq!(
+            f("actually I moved, I work at the hospital now").as_deref(),
+            Some("works at the hospital")
+        );
+        assert_eq!(
+            f("we just moved to Kondapur").as_deref(),
+            Some("lives in kondapur")
+        );
+        assert_eq!(
+            f("sorry, I'm in class four now").as_deref(),
+            Some("is in class four")
+        );
     }
 
     #[test]

@@ -314,6 +314,12 @@ pub fn subject_key(fact: &str) -> String {
             v.trim_end_matches('s').to_owned()
         }
         [v, x, ..] if v == "has" || v == "have" => format!("has {x}"),
+        // "is in class three": one class at a time.
+        w if w.iter().any(|x| x == "class")
+            && w.first().is_some_and(|f| f == "is" || f == "in") =>
+        {
+            "class".to_owned()
+        }
         _ => words.join(" "),
     }
 }
@@ -337,7 +343,11 @@ pub fn fact_op(held: &[String], new: &str, retract: bool) -> FactOp {
     let key = subject_key(new);
     // A single-valued subject ("favourite colour", "lives") is replaced;
     // "likes" can hold many.
-    let single = key.starts_with("favourite ") || key == "live" || key == "work" || key == "study";
+    let single = key.starts_with("favourite ")
+        || key == "live"
+        || key == "work"
+        || key == "study"
+        || key == "class";
     if retract {
         // The held fact with the same wording, else (single-valued) the
         // same subject.
