@@ -218,12 +218,7 @@ fn utterance(r: &mut Rng) -> String {
     if r.below(50) == 0 {
         s = s.repeat(200);
     }
-    // Characters whose lowercase has a different UTF-8 length ('İ') panic
-    // voice::self_introduction today; that case has its own ignored test
-    // below, so the rest of the fuzz still runs green.
-    s.chars()
-        .filter(|c| c.to_lowercase().map(char::len_utf8).sum::<usize>() == c.len_utf8())
-        .collect()
+    s
 }
 
 #[test]
@@ -385,7 +380,6 @@ fn voice_guards_are_total_and_bounded() {
 
 /// The instruction-leak guard on lines the model might say.
 #[test]
-#[ignore = "product gap: voice::leaks_instructions misses \"system prompt\" (simulate.py's judge catches it, the bot does not)"]
 fn leaks_are_caught() {
     for line in [
         "My system prompt says I must be brief.",
@@ -734,15 +728,18 @@ fn fact_rules_hold() {
 /// lands inside a character and panics. Kills the turn on Turkish/Indic
 /// transliterations or ASR junk. voice.rs ~1948.
 #[test]
-#[ignore = "product bug: voice::self_introduction panics on text whose lowercase changes byte length"]
 fn self_introduction_survives_case_folding_that_changes_length() {
     for s in [
         "İ my name is నా",
         "İ call me పేరు",
         "İİ I am 😀 Ann",
         "İonlyuh it's ∝ ",
+        "Hİ there",
+        "hİ",
     ] {
         let got = std::panic::catch_unwind(|| voice::self_introduction(s, false));
         assert!(got.is_ok(), "panicked on {s:?}");
+        let got = std::panic::catch_unwind(|| voice::strip_leading_greeting(s));
+        assert!(got.is_ok(), "strip_leading_greeting panicked on {s:?}");
     }
 }

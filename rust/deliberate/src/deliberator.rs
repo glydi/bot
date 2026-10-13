@@ -1405,12 +1405,51 @@ impl Session {
         // People mode speaks unprompted only to greet someone arriving or
         // to ask a stranger's name; no small talk, check-ins or remarks to
         // fill a silence.
-        if self.people.is_some()
-            && !matches!(intent.goal.as_deref(), Some("greet" | "ask_name"))
-            && !matches!(intent.decision.as_str(), "ask_name" | "recall" | "crowd")
-        {
-            tracing::info!(decision = intent.decision, "people mode: not said");
-            return None;
+        // The decision decides, not the goal: a `curious` or `invite`
+        // raised under a greet goal is still small talk.
+        if self.people.is_some() {
+            let greeting = match intent.decision.as_str() {
+                "greet" | "greet_pair" | "greet_group" => true,
+                "say" | "ask" | "recall" => intent.goal.as_deref() == Some("greet"),
+                _ => false,
+            };
+            let allowed = greeting
+                || matches!(
+                    intent.decision.as_str(),
+                    "ask_name" | "recall" | "crowd" | "ignore_utterance" | "reply_hint"
+                );
+            if !allowed {
+                tracing::info!(decision = intent.decision, "people mode: not said");
+                return None;
+            }
+            // Once per visit, whatever path the hello takes. Standing in
+            // view is still the same visit; coming back after a real
+            // absence (the mind's `returned_after_secs`) is a new one.
+            let returned = intent
+                .returned_after_secs
+                .is_some_and(|s| s >= VISIT_GAP.as_secs());
+            if greeting && let Some(id) = entity.as_ref().filter(|i| !i.is_track()) {
+                if returned {
+                    self.greeted_at.remove(id);
+                    if self.visit.key.as_ref() == Some(id) {
+                        self.new_visit();
+                    }
+                } else if self.greeted_this_visit(id) {
+                    tracing::info!(%id, "people mode: greeted this visit already");
+                    return None;
+                }
+            }
+            // `say`/`ask` under a greet goal carries the mind's own words;
+            // only a known face gets the graph's hello, nobody gets them.
+            if matches!(intent.decision.as_str(), "say" | "ask")
+                && entity.as_ref().is_none_or(EntityId::is_track)
+            {
+                tracing::info!(
+                    decision = intent.decision,
+                    "people mode: free line not said"
+                );
+                return None;
+            }
         }
         match intent.decision.as_str() {
             // The picture alone: nothing to say, kept for the next note.
@@ -1474,7 +1513,15 @@ impl Session {
                     return None;
                 }
                 self.gate(Some(id.clone()), "greet")?;
-                let mut p = Proactive::new(Moment::Arrival, "Hi there.");
+                // People mode: the graph's hello, which also opens the visit.
+                let line = match (
+                    self.people.is_some() && !id.is_track(),
+                    self.name_of(Some(&id)),
+                ) {
+                    (true, Some(n)) => self.people_greeting(&id, &n),
+                    _ => "Hi there.".to_owned(),
+                };
+                let mut p = Proactive::new(Moment::Arrival, line);
                 p.name = self.name_of(Some(&id));
                 p.entity = Some(id);
                 p.mood = mood;
@@ -3455,8 +3502,11 @@ impl Session {
         let Some(turn) = turn_intent(&cmd) else {
             match self.plan_intent(&cmd) {
                 Some(Planned::Line(line)) => self.speak_line(line),
+                // People mode: the decided line as it is. The model's
+                // version of a hello added "Found ya!" and questions.
                 Some(Planned::Turn(p))
-                    if !self.proactive_via_model
+                    if self.people.is_some()
+                        || !self.proactive_via_model
                         || (self.instant_greetings && p.moment.kind() == "greet") =>
                 {
                     let line = p.canned.clone();
@@ -3474,6 +3524,13 @@ impl Session {
             }
             return;
         };
+        // People mode: no small talk, no check-in, no opener to a
+        // stranger (the name question is `ask_name`). Live: "So, what's
+        // been keeping you busy, Sony?" came from here.
+        if self.people.is_some() && !matches!(turn, TurnIntent::Answer { .. }) {
+            tracing::info!(kind = turn.kind(), "people mode: turn intent not said");
+            return;
+        }
         if self.holding() && !matches!(turn, TurnIntent::Answer { .. }) {
             // The lull is the one they asked for; an answer to our own
             // question is theirs to give.
@@ -3575,6 +3632,7 @@ fn strip_note(content: &str) -> String {
 /// Tomorrow's "Thursday 8 October", same zone as [`local_clock`].
 /// A simple sum in words or digits: "what is 7 times 8", "12 plus 5",
 /// "20 divided by 4". `None` when it isn't one.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn sum(text: &str) -> Option<String> {
     const SMALL: [&str; 21] = [
         "zero",
@@ -3599,41 +3657,139 @@ pub(crate) fn sum(text: &str) -> Option<String> {
         "nineteen",
         "twenty",
     ];
+    const TENS: [(&str, f64); 8] = [
+        ("thirty", 30.0),
+        ("forty", 40.0),
+        ("fifty", 50.0),
+        ("sixty", 60.0),
+        ("seventy", 70.0),
+        ("eighty", 80.0),
+        ("ninety", 90.0),
+        ("hundred", 100.0),
+    ];
     let num = |tok: &str| -> Option<f64> {
         tok.parse::<f64>()
             .ok()
+            .filter(|v| v.is_finite())
             .or_else(|| SMALL.iter().position(|s| *s == tok).map(|i| i as f64))
+            .or_else(|| TENS.iter().find(|(w, _)| *w == tok).map(|(_, v)| *v))
     };
     let lower = text
         .to_ascii_lowercase()
         .replace("multiplied by", "times")
         .replace("divided by", "divided")
+        .replace("square root of", "sqrt")
+        .replace("square root", "sqrt")
+        .replace("per cent", "percent")
+        .replace('%', " percent")
         .replace(['?', ',', '!'], " ");
     let toks: Vec<&str> = lower.split_whitespace().collect();
-    for i in 1..toks.len().saturating_sub(1) {
-        let op = toks[i];
-        let (Some(lhs), Some(rhs)) = (num(toks[i - 1]), num(toks[i + 1])) else {
-            continue;
-        };
-        let value = match op {
-            "plus" | "+" | "and" if op != "and" || toks.contains(&"add") => lhs + rhs,
-            "minus" | "-" => lhs - rhs,
-            "times" | "x" | "*" | "into" => lhs * rhs,
-            "divided" | "/" | "by" => {
-                if rhs == 0.0 {
-                    return None;
-                }
-                lhs / rhs
-            }
-            _ => continue,
-        };
-        return Some(if (value - value.round()).abs() < 1e-9 {
+    let fmt = |value: f64| {
+        if (value - value.round()).abs() < 1e-9 {
             format!("{}", value.round() as i64)
         } else {
             format!("{value:.2}")
-        });
+        }
+    };
+    // "square root of 144", "15 percent of 200".
+    for i in 0..toks.len() {
+        if toks[i] == "sqrt"
+            && let Some(v) = toks.get(i + 1).and_then(|t| num(t))
+            && v >= 0.0
+        {
+            return Some(fmt(v.sqrt()));
+        }
+        if toks[i] == "percent"
+            && i > 0
+            && toks.get(i + 1) == Some(&"of")
+            && let (Some(p), Some(of)) = (num(toks[i - 1]), toks.get(i + 2).and_then(|t| num(t)))
+        {
+            return Some(fmt(p * of / 100.0));
+        }
     }
-    None
+    // The longest chain "[minus] N (op [minus] N)*", evaluated with
+    // times/divide before plus/minus. "minus five plus three" is -2.
+    let op_of = |t: &str, add: bool| -> Option<char> {
+        Some(match t {
+            "plus" | "+" => '+',
+            "and" if add => '+',
+            "minus" | "-" => '-',
+            "times" | "x" | "*" | "into" => '*',
+            "divided" | "/" | "by" | "over" => '/',
+            _ => return None,
+        })
+    };
+    let add = toks.contains(&"add");
+    let mut best: Option<(Vec<f64>, Vec<char>)> = None;
+    let mut start = 0;
+    while start < toks.len() {
+        let mut i = start;
+        let mut sign = 1.0;
+        if matches!(toks[i], "minus" | "negative" | "-") {
+            sign = -1.0;
+            i += 1;
+        }
+        let Some(first) = toks.get(i).and_then(|t| num(t)) else {
+            start += 1;
+            continue;
+        };
+        let mut nums = vec![sign * first];
+        let mut ops = Vec::new();
+        i += 1;
+        while let Some(op) = toks.get(i).and_then(|t| op_of(t, add)) {
+            let mut j = i + 1;
+            let mut s = 1.0;
+            if matches!(toks.get(j), Some(&"minus" | &"negative")) {
+                s = -1.0;
+                j += 1;
+            }
+            let Some(n) = toks.get(j).and_then(|t| num(t)) else {
+                break;
+            };
+            nums.push(s * n);
+            ops.push(op);
+            i = j + 1;
+        }
+        if !ops.is_empty() && best.as_ref().is_none_or(|(_, o)| ops.len() > o.len()) {
+            best = Some((nums, ops));
+        }
+        start = i.max(start + 1);
+    }
+    let (nums, ops) = best?;
+    // times and divide first.
+    let mut terms = vec![nums[0]];
+    let mut signs = Vec::new();
+    for (op, n) in ops.iter().zip(&nums[1..]) {
+        match op {
+            '*' => *terms.last_mut()? *= n,
+            '/' => {
+                if *n == 0.0 {
+                    return Some(DIVIDE_BY_ZERO.to_owned());
+                }
+                *terms.last_mut()? /= n;
+            }
+            c => {
+                signs.push(*c);
+                terms.push(*n);
+            }
+        }
+    }
+    let mut value = terms[0];
+    for (c, t) in signs.iter().zip(&terms[1..]) {
+        if *c == '+' {
+            value += t;
+        } else {
+            value -= t;
+        }
+    }
+    Some(fmt(value))
+}
+
+/// What [`sum`] gives for a division by zero.
+pub(crate) const DIVIDE_BY_ZERO: &str = "nothing: you can't divide by zero";
+
+fn local_clock_yesterday() -> String {
+    clock_at(now_local_secs() - 86_400).1
 }
 
 fn local_clock_tomorrow() -> String {

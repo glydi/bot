@@ -70,7 +70,7 @@ impl SchoolService {
         let time = SchoolTime::from_env();
         let engine = Engine::open(
             erp,
-            Paths::in_dir(&root.join("data")),
+            Paths::in_dir(&data_dir(root)),
             time,
             min_confidence_from_env(),
         );
@@ -192,4 +192,13 @@ impl SchoolLink for SchoolService {
     fn forget(&self) {
         *self.ctx.lock() = (None, school::AskContext::default());
     }
+}
+
+/// Where the school files live: `GLYDI_SCHOOL_DATA` when set (the
+/// simulators point it at a throwaway directory so a test run never
+/// rewrites the robot's real `data/school.json`), else `<root>/data`.
+pub fn data_dir(root: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("GLYDI_SCHOOL_DATA")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| root.join("data"), std::path::PathBuf::from)
 }

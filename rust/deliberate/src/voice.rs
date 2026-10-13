@@ -418,7 +418,8 @@ pub fn first_sentence(text: &str) -> String {
 /// model enrolling the answer (see [`crate::deliberator::ASK_NAME_LINE`]).
 pub fn strip_leading_greeting(text: &str) -> String {
     let trimmed = text.trim();
-    let lower = trimmed.to_lowercase();
+    // ASCII folding: byte offsets match `trimmed` ("Hİ" panicked).
+    let lower = trimmed.to_ascii_lowercase();
     let greeting = ["hello there", "hi there", "hey there", "hello", "hi", "hey"]
         .into_iter()
         .find(|g| {
@@ -1791,10 +1792,59 @@ pub fn leaks_instructions(sentence: &str) -> bool {
             "list_reminders",
             "tool call",
             "the model",
+            "system prompt",
+            "my instructions",
+            "my prompt",
+            "language model",
+            "as an ai",
+            "<|im_",
+            "<|endoftext|>",
+            "<tool_call>",
         ]
         .iter()
         .any(|t| lower.contains(t))
 }
+
+/// A request to drop the character or say something rude: "pretend you
+/// are a pirate", "act like my boss", "swear", "ignore your
+/// instructions". Answered with [`STAY_GLYDI`], never with the model.
+pub fn roleplay_request(text: &str) -> bool {
+    let t = format!(
+        " {} ",
+        text.to_ascii_lowercase().replace(['?', '!', ',', '.'], " ")
+    );
+    [
+        " pretend you ",
+        " pretend to be ",
+        " act like ",
+        " act as ",
+        " roleplay ",
+        " role play ",
+        " you are now ",
+        " be a pirate ",
+        " talk like a ",
+        " speak like a ",
+        " swear ",
+        " curse ",
+        " say a bad word ",
+        " bad words ",
+        " abuse me ",
+        " insult me ",
+        " ignore your instructions ",
+        " ignore all previous ",
+        " ignore previous instructions ",
+        " forget your instructions ",
+        " your system prompt ",
+        " developer mode ",
+        " jailbreak ",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
+
+/// The polite decline for [`roleplay_request`].
+pub const STAY_GLYDI: &str =
+    "I'll stay Glydi, the robot at the door, and keep it kind. What can I do for you?";
 
 /// Whether a string the introduction regex pulled out can be a name at
 /// all: one or two words, letters only, and none of them a word people
@@ -1927,7 +1977,10 @@ pub fn self_introduction(text: &str, after_name_question: bool) -> Option<String
 
 fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String> {
     let t = text.trim().trim_end_matches(['.', '!', '?', ',']).trim();
-    let lower = t.to_lowercase();
+    // ASCII folding keeps byte offsets identical to `t`, so the slice
+    // below is always on a char boundary ('İ' lowercases to 3 bytes and
+    // panicked here). The leads are ASCII, so nothing is lost.
+    let lower = t.to_ascii_lowercase();
     // The lead may sit anywhere in the sentence: "hey I'm Ada, is this
     // thing on?" is an introduction, and the model was the only thing
     // catching it before (measured: our own detector 0/3 on that case).
@@ -2212,9 +2265,12 @@ mod self_intro_tests {
 /// recall-without-facts case; "Hello Ada" on the second hello in the
 /// dark). Each is allowed through only when the room or the facts
 /// contain it, i.e. when it is real.
-pub const EXAMPLE_TOKENS: [&str; 12] = [
+/// Also the placeholder names a model invents for "everyone" when it
+/// knows nobody (live: "I just greeted Alice, Bob, and Carol").
+pub const EXAMPLE_TOKENS: &[&str] = &[
     "ada", "john", "mukesh", "priya", "sam", "leo", "parser", "rust", "two days", "coffee", "boss",
-    "yaju",
+    "yaju", "alice", "bob", "carol", "dave", "eve", "mallory", "jane doe", "john doe", "foo",
+    "bar",
 ];
 
 /// Whether `sentence` leans on an example-only token that nothing real
@@ -2241,6 +2297,15 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod leak_tests {
     use super::*;
+
+    #[test]
+    fn placeholder_names_are_caught() {
+        assert!(leaks_example(
+            "I just greeted Alice, Bob, and Carol.",
+            "people: sony"
+        ));
+        assert!(!leaks_example("Hi Bob!", "people: bob"));
+    }
 
     #[test]
     fn example_details_are_dropped_unless_real() {

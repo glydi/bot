@@ -31,6 +31,7 @@ pub mod cache;
 pub mod claude;
 pub mod condense;
 pub mod converse;
+pub mod deep;
 pub mod deliberator;
 pub mod handoff;
 pub mod learn;

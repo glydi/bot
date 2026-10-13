@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import tempfile
 import os
 import re
 import subprocess
@@ -324,6 +325,12 @@ BAD_PATTERNS = [
 ]
 
 
+# The school files of a simulated run live in a throwaway directory
+# (GLYDI_SCHOOL_DATA), never in data/: seeding used to overwrite the
+# robot's real data/school.json while it ran.
+SIM_SCHOOL = Path(tempfile.gettempdir()) / f"glydi-sim-school-{os.getpid()}"
+
+
 def seed_snapshot() -> None:
     """A timetable that is live at the current minute, two sections, a holiday tomorrow."""
     now = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=5, minutes=30)
@@ -358,8 +365,8 @@ def seed_snapshot() -> None:
         "marked": {},
         "pending": [],
     }
-    (ROOT / "data").mkdir(exist_ok=True)
-    (ROOT / "data" / "school.json").write_text(json.dumps(snap, indent=1), encoding="utf-8")
+    SIM_SCHOOL.mkdir(parents=True, exist_ok=True)
+    (SIM_SCHOOL / "school.json").write_text(json.dumps(snap, indent=1), encoding="utf-8")
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -388,6 +395,7 @@ def run_scenario(name: str, steps: list[tuple[str, dict]], wait: float) -> list[
         "GLYDI_ERP_URL": "https://erp.xulo.in", "GLYDI_ERP_USER": "sim@example.invalid", "GLYDI_ERP_PASSWORD": "wrong",
         "GLYDI_UTC_OFFSET": "+05:30", "RUST_LOG": "info",
     })
+    env["GLYDI_SCHOOL_DATA"] = str(SIM_SCHOOL)
     # A fresh memory per scenario: a throwaway gallery and answer cache.
     env["GLYDI_DB"] = str(ROOT / "data" / f"sim-{name}.db")
     for path in [ROOT / "data" / f"sim-{name}.db{suffix}" for suffix in ("", "-wal", "-shm")] + [ROOT / "data" / f"sim-{name}.answers.json"]:

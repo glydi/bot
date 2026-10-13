@@ -146,6 +146,9 @@ pub struct OpenAiBackend {
     timeout: Duration,
     /// Whether the server answered the last attempt; shared by clones.
     up: std::sync::Arc<Up>,
+    /// Ollama `keep_alive` in seconds sent with every request
+    /// ([`KEEP_ALIVE_FOREVER`] unless [`Self::with_keep_alive`]).
+    keep_alive: i64,
 }
 
 /// Every bound on one request, and the retry policy. A local model server
@@ -446,7 +449,21 @@ impl OpenAiBackend {
             limits,
             timeout,
             up: std::sync::Arc::new(Up::default()),
+            keep_alive: KEEP_ALIVE_FOREVER,
         })
+    }
+
+    /// The same client asking Ollama to unload the model `secs` after its
+    /// last request (the on-demand deep model); `-1` = resident.
+    #[must_use]
+    pub fn with_keep_alive(mut self, secs: i64) -> Self {
+        self.keep_alive = secs;
+        self
+    }
+
+    /// The server's base URL (`.../v1` for Ollama's `OpenAI` endpoint).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// The same client with other bounds (tests, or a slower server).
@@ -609,7 +626,7 @@ impl OpenAiBackend {
                 .json_object
                 .then(|| serde_json::json!({"type": "json_object"})),
             reasoning_effort: self.reasoning_effort(),
-            keep_alive: KEEP_ALIVE_FOREVER,
+            keep_alive: self.keep_alive,
         };
         let mut r = self
             .http

@@ -129,6 +129,12 @@ pub fn emergency_line(text: &str) -> Option<&'static str> {
         Emergency::Fire => Some(
             "Leave the building with the nearest teacher and follow the fire drill. Go now, calmly.",
         ),
+        Emergency::Danger => {
+            Some("Please get an adult or security right now. Move away from the gate.")
+        }
+        Emergency::LostChild => Some(
+            "Please tell security or the front desk right now; they will help find your child. Stay where they can find you.",
+        ),
         Emergency::Hurt => Some(
             "Please tell the nearest teacher right now, or go to the office. If someone is badly hurt, stay with them and call out for an adult.",
         ),
@@ -182,8 +188,13 @@ fn asks_quiet(t: &str) -> bool {
 enum Emergency {
     Fire,
     Hurt,
+    /// A weapon, a fight, an intruder or a threat.
+    Danger,
+    /// A parent who cannot find their child.
+    LostChild,
 }
 
+#[allow(clippy::too_many_lines)]
 fn emergency_kind(t: &str) -> Option<Emergency> {
     let words: Vec<&str> = t.split_whitespace().collect();
     let word = |w: &str| words.contains(&w);
@@ -193,6 +204,58 @@ fn emergency_kind(t: &str) -> Option<Emergency> {
         && !has("fire brigade day")
     {
         return Some(Emergency::Fire);
+    }
+    // A weapon, a fight, someone who should not be here: get an adult.
+    // Live test: "there is a man with a knife at the gate" got chat.
+    let danger_words = [
+        "knife",
+        "knives",
+        "gun",
+        "guns",
+        "pistol",
+        "weapon",
+        "weapons",
+        "sword",
+        "bomb",
+        "intruder",
+        "intruders",
+        "fighting",
+        "kidnap",
+        "kidnapped",
+        "kidnapping",
+        "attacking",
+        "stabbed",
+        "shooting",
+        "threatening",
+    ];
+    let danger_phrases = [
+        "a fight",
+        "in a fight",
+        "beating up",
+        "hitting each other",
+        "strange man",
+        "strange woman",
+        "stranger at the gate",
+        "stranger is at the gate",
+        "someone is following",
+        "somebody is following",
+        "trying to take",
+        "threatened",
+    ];
+    if danger_words.iter().any(|w| word(w)) || danger_phrases.iter().any(|p| has(p)) {
+        return Some(Emergency::Danger);
+    }
+    let kid = ["child", "son", "daughter", "kid", "boy", "girl", "baby"];
+    if kid.iter().any(|k| {
+        ["can't find my", "cant find my", "cannot find my", "lost my"]
+            .iter()
+            .any(|p| has(&format!("{p} {k}")))
+            || has(&format!("my {k} is missing"))
+            || has(&format!("my {k} is lost"))
+    }) || has("missing child")
+        || has("lost child")
+    {
+        return Some(Emergency::LostChild);
     }
     let hurt_words = [
         "hurt",
@@ -352,6 +415,15 @@ pub fn respond(text: &str, cx: &Context) -> Option<Reply> {
                 "emergency",
                 "Please tell the nearest teacher right now, or go to the office. If someone is badly hurt, stay with them and call out for an adult.",
             ));
+        }
+        Some(k @ (Emergency::Danger | Emergency::LostChild)) => {
+            let line = emergency_line(&t).unwrap_or_default();
+            let kind = if k == Emergency::Danger {
+                "emergency_danger"
+            } else {
+                "emergency_lost_child"
+            };
+            return Some(Reply::say(kind, line));
         }
         None => {}
     }

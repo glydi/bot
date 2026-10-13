@@ -212,6 +212,17 @@ pub struct OllamaUnderstander {
     rest: std::sync::Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
+/// The error prefix of an understand call that ran out of time.
+const SLOW: &str = "slow: ";
+
+fn slow_or_down(e: &reqwest::Error) -> String {
+    if e.is_timeout() && !e.is_connect() {
+        format!("{SLOW}{e}")
+    } else {
+        e.to_string()
+    }
+}
+
 /// How long the understander leaves a failed model alone.
 pub const REST: Duration = Duration::from_secs(20);
 
@@ -223,6 +234,7 @@ impl OllamaUnderstander {
         Self {
             http: reqwest::Client::builder()
                 .timeout(timeout)
+                .connect_timeout(timeout.min(Duration::from_millis(300)))
                 .build()
                 .unwrap_or_default(),
             url: format!("{root}/api/chat"),
@@ -251,6 +263,15 @@ impl UnderstandModel for OllamaUnderstander {
                 Ok(_) if rest.is_some() => {
                     tracing::warn!(model = self.model, "understand model back");
                     *rest = None;
+                }
+                // Slow, not down (GPU contention): this turn falls back to
+                // the rules, the next one tries the model again.
+                Err(e) if e.starts_with(SLOW) => {
+                    tracing::info!(
+                        model = self.model,
+                        error = e,
+                        "understand model slow; rules this turn"
+                    );
                 }
                 Err(e) => {
                     if rest.is_none() {
@@ -289,10 +310,10 @@ impl OllamaUnderstander {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| slow_or_down(&e))?
                 .json()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| slow_or_down(&e))?;
             v["message"]["content"]
                 .as_str()
                 .map(str::to_owned)
@@ -517,8 +538,23 @@ pub fn first_name_in(text: &str) -> Option<String> {
         | ["hi", "i'm", rest @ ..]
         | ["hello", "i'm", rest @ ..]
         | ["hi", "my", "name", "is", rest @ ..]
-        | ["hello", "my", "name", "is", rest @ ..] => rest,
+        | ["hello", "my", "name", "is", rest @ ..]
+        | ["myself", rest @ ..] => rest,
+        // Hinglish: "mera naam Arjun hai" (never "mera naam kya hai").
+        ["mera", "naam", n, ..] if *n != "kya" => &s[2..3],
         _ => return None,
+    };
+    // A title stays with the surname: "I'm Mr Iyer" is Mr Iyer, not "Mr".
+    if let [t, n, ..] = after
+        && let Some(title) = title_word(t)
+        && name_word(n)
+    {
+        return Some(format!("{title} {}", cap(n)));
+    }
+    // An initial goes: "I'm K. Ramesh" is Ramesh.
+    let after = match after {
+        [i, n, ..] if i.len() == 1 && name_word(n) => &after[1..],
+        _ => after,
     };
     let first = after.first()?;
     // "I'm Rohan's father" is a relation, not a name.
@@ -526,6 +562,19 @@ pub fn first_name_in(text: &str) -> Option<String> {
         return None;
     }
     name_word(first).then(|| cap(first))
+}
+
+/// "mr" -> "Mr": the titles a name may carry.
+pub fn title_word(w: &str) -> Option<&'static str> {
+    Some(match w.trim_end_matches('.') {
+        "mr" => "Mr",
+        "mrs" => "Mrs",
+        "ms" => "Ms",
+        "miss" => "Miss",
+        "dr" | "doctor" => "Dr",
+        "prof" | "professor" => "Prof",
+        _ => return None,
+    })
 }
 
 /// Whether `name` appears capitalised in `text` as said (a transcriber
@@ -799,7 +848,23 @@ pub fn rules(text: &str) -> Option<Understanding> {
     {
         return Some(Understanding::of("ask_about_bot"));
     }
+    // "my name is spelled R A V I": the letters are the name.
+    if has("name")
+        || s.first()
+            .is_some_and(|w| matches!(*w, "it's" | "its" | "spelled" | "spelt"))
+    {
+        if let Some(n) = crate::voice::spelled_name(text, false) {
+            let mut u = Understanding::of("tell_name");
+            u.people.push(Mention {
+                name: n,
+                ..Mention::default()
+            });
+            return Some(u);
+        }
+    }
     if [
+        "mera naam kya hai",
+        "mera naam kya",
         "what's my name",
         "whats my name",
         "what is my name",
@@ -812,6 +877,21 @@ pub fn rules(text: &str) -> Option<Understanding> {
     ]
     .iter()
     .any(|p| joined == *p || joined.starts_with(&format!("{p} ")))
+    {
+        return Some(Understanding::of("ask_about_me"));
+    }
+    // "where do I live?", "what do I play?", "where do I work?": what
+    // they told us about themselves.
+    if matches!(
+        s.as_slice(),
+        ["where" | "what" | "which" | "when", "do", "i", _, ..]
+    ) && s.len() <= 7
+        && !has("tell")
+        && !has("say")
+        && !has("do i need")
+        && !has("do i have to")
+        && !has("do i go")
+        && !has("should")
     {
         return Some(Understanding::of("ask_about_me"));
     }
@@ -830,10 +910,26 @@ pub fn rules(text: &str) -> Option<Understanding> {
     }
     // A misheard name put right: "no, it's Nisha, not Neha", "it's
     // Nisha not Neha", "no it's Nisha".
+    let wrong = has("wrong") || has("not right");
     if let Some(i) = s.iter().position(|x| matches!(*x, "it's" | "its"))
         && let Some(n) = s.get(i + 1).filter(|n| name_word(n) && **n != "not")
-        && (s.get(i + 2) == Some(&"not") || (s.first() == Some(&"no") && s.len() <= 4))
-        && s.len() <= 7
+        && (s.get(i + 2) == Some(&"not")
+            || (s.first() == Some(&"no") && s.len() <= 4)
+            || (wrong && s.get(i + 2).is_none()))
+        && s.len() <= 9
+    {
+        let mut u = Understanding::of("correct_name");
+        u.people.push(Mention {
+            name: cap(n),
+            ..Mention::default()
+        });
+        return Some(u);
+    }
+    // "no no, Ravi" / "no, Ravi": a bare name after a no.
+    if s.first() == Some(&"no")
+        && s.len() <= 3
+        && let Some(n) = s.last().filter(|n| name_word(n) && **n != "no")
+        && s[..s.len() - 1].iter().all(|w| *w == "no")
     {
         let mut u = Understanding::of("correct_name");
         u.people.push(Mention {
@@ -957,7 +1053,7 @@ pub fn rules(text: &str) -> Option<Understanding> {
                 });
                 return Some(u);
             }
-            (Some(n), None) if s.len() <= 5 || capitalised_in(text, n) => {
+            (Some(n), None) if s.len() <= 5 || n.split(' ').all(|p| capitalised_in(text, p)) => {
                 let mut u = Understanding::of("tell_name");
                 u.people.push(Mention {
                     name: n.clone(),
@@ -1039,7 +1135,13 @@ pub fn rules(text: &str) -> Option<Understanding> {
         u.facts.push(f);
         return Some(u);
     }
-    if out_of_zone(&joined) && asks(text) {
+    // An order counts as asking: "translate hello to French". Admissions
+    // are the office's, however they are put.
+    let ordered = matches!(
+        s.first(),
+        Some(&("translate" | "tell" | "give" | "explain" | "define" | "show"))
+    );
+    if out_of_zone(&joined) && (asks(text) || ordered || has("admission") || has("admissions")) {
         return Some(Understanding::of("out_of_zone"));
     }
     if [
@@ -1208,6 +1310,14 @@ fn own_fact_here(s: &[&str]) -> Option<String> {
             Some(format!("works {}", rest(2)))
         }
         ["i", "teach", _, ..] if s.len() <= 10 => Some(format!("teaches {}", rest(2))),
+        // "I play the tabla", "I learn Kathak", "I study at Osmania".
+        [
+            "i",
+            verb @ ("play" | "learn" | "study" | "practise" | "practice" | "sing" | "speak"
+            | "drive" | "cook" | "paint" | "collect" | "coach" | "run"),
+            _,
+            ..,
+        ] if s.len() <= 9 => Some(format!("{verb}s {}", rest(2)).replace("practices", "practises")),
         ["i" | "we", "live" | "stay", "in" | "at" | "near", _, ..] if s.len() <= 9 => {
             Some(format!("lives {}", rest(2)))
         }
@@ -1286,6 +1396,7 @@ pub fn out_of_zone(t: &str) -> bool {
         "principal",
         "attendance",
         "admission",
+        "admissions",
         "uniform",
         "who won",
         "translate",
@@ -1357,7 +1468,14 @@ mod tests {
             assert_eq!(r.by, "fallback", "{what}");
             assert!(!r.valid, "{what}");
             // The second turn: a failed model rests, so no wait at all.
-            if what != "wrong" {
+            // A slow one does not rest (GPU contention passes): the next
+            // turn tries again, bounded by the same timeout.
+            if what == "slow" {
+                let t = Instant::now();
+                let r = understand(Some(&m), "", utter).await;
+                assert!(t.elapsed() < Duration::from_millis(1500), "slow again");
+                assert_eq!(r.by, "fallback");
+            } else if what != "wrong" {
                 let t = Instant::now();
                 let r = understand(Some(&m), "", utter).await;
                 assert!(t.elapsed() < Duration::from_millis(100), "{what} rest");

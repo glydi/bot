@@ -2007,8 +2007,15 @@ fn people_first(config: &Config) -> Option<deliberate::People> {
             deliberate::understand::OllamaUnderstander::new(
                 &config.local_llm_url,
                 &model,
-                // Bounded: a stuck Ollama costs one short wait, then rests.
-                Duration::from_secs(3),
+                // Bounded: a slow understand must not hold the turn; past
+                // GLYDI_UNDERSTAND_MS (default 1200) the rules and the
+                // clarify line answer. Live: 3 s waits under GPU contention.
+                Duration::from_millis(
+                    std::env::var("GLYDI_UNDERSTAND_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(1200),
+                ),
             ),
         )),
         handoff: deliberate::handoff::from_env(),
@@ -2028,9 +2035,14 @@ static NAME_EXPECTED: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
 
 /// The stronger model for the people path's slow lane (questions that need
 /// thinking): Claude when `GLYDI_DEEP_CLOUD=1` and there is a key, else
-/// `GLYDI_DEEP_MODEL` (default `qwen2.5:7b-instruct`) on the local Ollama,
-/// warmed in the background so the first slow question does not pay the
-/// load. `GLYDI_DEEP_MODEL=off` keeps the slow lane on the chat model.
+/// `GLYDI_DEEP_MODEL` on the local Ollama. Default `off`: the slow lane
+/// uses the chat model. On an 8 GB GPU a 7B beside the resident 3B pushed
+/// the 3B onto the CPU (fast path ~2 s), so an opted-in local deep model
+/// (`GLYDI_DEEP_MODEL=qwen2.5:7b-instruct`) is loaded on demand: never
+/// warmed at start, `keep_alive` `GLYDI_DEEP_KEEP_ALIVE` seconds (default
+/// 30), and used only when it is loaded already or free VRAM holds it plus
+/// `GLYDI_DEEP_HEADROOM_MB` (default 1024); otherwise the chat model
+/// answers. `GLYDI_DEEP_VRAM_GATE=0` drops the check (a big GPU).
 fn deep_backend(config: &Config) -> Option<Arc<dyn ChatBackend>> {
     let timeout = Duration::from_secs(8);
     if std::env::var("GLYDI_DEEP_CLOUD").is_ok_and(|v| v.trim() == "1") {
@@ -2047,23 +2059,46 @@ fn deep_backend(config: &Config) -> Option<Arc<dyn ChatBackend>> {
         .ok()
         .map(|m| m.trim().to_owned())
         .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "qwen2.5:7b-instruct".to_owned());
-    if model == "off" {
+        .unwrap_or_else(|| "off".to_owned());
+    if model == "off" || model == config.local_model {
+        tracing::info!("slow path: the chat model (GLYDI_DEEP_MODEL=off)");
         return None;
     }
-    match OpenAiBackend::new(&config.local_llm_url, &model, None, timeout) {
-        Ok(b) => {
-            tracing::info!(model, "slow path: local model");
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let w = b.clone();
-                rt.spawn(async move {
-                    match w.warm("", Vec::new()).await {
-                        Ok(d) => tracing::info!(ms = d.as_millis(), "slow path model warm"),
-                        Err(e) => tracing::info!(error = %e, "slow path model not warmed"),
-                    }
-                });
-            }
-            Some(Arc::new(b))
+    let num = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(d)
+    };
+    let keep = i64::try_from(num(
+        "GLYDI_DEEP_KEEP_ALIVE",
+        deliberate::deep::DEFAULT_KEEP_ALIVE.unsigned_abs(),
+    ))
+    .unwrap_or(deliberate::deep::DEFAULT_KEEP_ALIVE);
+    let headroom = num(
+        "GLYDI_DEEP_HEADROOM_MB",
+        deliberate::deep::DEFAULT_HEADROOM_MB,
+    );
+    let gate = !std::env::var("GLYDI_DEEP_VRAM_GATE").is_ok_and(|v| v.trim() == "0");
+    let built = OpenAiBackend::new(&config.local_llm_url, &model, None, timeout).and_then(|d| {
+        OpenAiBackend::new(&config.local_llm_url, &config.local_model, None, timeout)
+            .map(|f| (d.with_keep_alive(keep), f))
+    });
+    match built {
+        Ok((deep, fallback)) => {
+            tracing::info!(
+                model,
+                keep_alive = keep,
+                gate,
+                headroom,
+                "slow path: local model on demand"
+            );
+            Some(Arc::new(deliberate::deep::OnDemandDeep::new(
+                deep,
+                Arc::new(fallback),
+                gate,
+                headroom,
+            )))
         }
         Err(e) => {
             tracing::warn!(error = %e, "slow path model not built");

@@ -423,7 +423,7 @@ async fn school_check(
 fn school(config: &Config, what: SchoolCmd) -> anyhow::Result<()> {
     use school::{Date, Erp, ErpConfig, Links, Scope, Snapshot};
 
-    let paths = school::Paths::in_dir(&config.root.join("data"));
+    let paths = school::Paths::in_dir(&glydi::school::data_dir(&config.root));
     let mut links = Links::load(&paths.links);
     if links.people.is_empty() {
         // An older build kept the links inside the snapshot.
