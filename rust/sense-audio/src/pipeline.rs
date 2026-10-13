@@ -924,6 +924,8 @@ pub(crate) struct Worker {
     pub affect: Option<Calibrator>,
     /// Where to keep each utterance's WAV and transcript; `None` keeps none.
     pub save_dir: Option<std::path::PathBuf>,
+    /// Snaps misheard names to known people; `None` keeps the transcript.
+    pub names: Option<crate::names::NameFixer>,
     pub source_name: SmolStr,
     pub clock: Arc<dyn Clock>,
     pub tx: RingSender,
@@ -1190,6 +1192,16 @@ impl Worker {
             tracing::debug!(secs, speculated, "utterance held no speech");
             return;
         }
+        let text = match &self.names {
+            Some(f) => {
+                let fixed = f.fix(&text);
+                if fixed != text {
+                    tracing::info!(heard = %text, fixed = %fixed, "name snapped to a known person");
+                }
+                fixed
+            }
+            None => text,
+        };
         self.stats
             .speech_end_to_utterance_us
             .store(speech_end_ms.as_micros() as u64, Ordering::Relaxed);
@@ -1427,6 +1439,7 @@ mod tests {
             gallery: Arc::new(InMemoryGallery::default()),
             affect: None,
             save_dir: None,
+            names: None,
             source_name: "mic0".into(),
             clock: Arc::new(RealClock),
             tx,
@@ -1590,6 +1603,7 @@ mod tests {
             gallery: Arc::new(InMemoryGallery::default()),
             affect: None,
             save_dir: None,
+            names: None,
             source_name: "mic0".into(),
             clock: clock.clone(),
             tx: tx.clone(),

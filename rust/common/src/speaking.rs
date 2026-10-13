@@ -13,9 +13,15 @@
 //! change of focus starts a new one, so the audio side can keep a speech
 //! level baseline per visitor and drop far-away talkers.
 //!
-//! The switch is `GLYDI_LIP_GATE` ([`lip_gate_from`]): OFF by default
-//! (not yet tried on the robot); `GLYDI_LIP_GATE=1` turns it on when the
-//! camera runs. Without it the binary simply hands the audio sense no board.
+//! The switch is `GLYDI_LIP_GATE` ([`lip_gate_from`]): OFF by default;
+//! `GLYDI_LIP_GATE=1` turns it on when the camera runs. Measured
+//! 2026-10-13: `2d106det` on still frames of one face (crop jitter, noise,
+//! blur, as a tracked box gives) moves the opening by 0.012 std (0.023
+//! with a looser crop); on synthetic 0.6-4 s windows at 13 fps with that
+//! floor, [`MOVE_STD`] gives precision 0.89 / recall 0.93 (floor 0.023:
+//! 0.73 / 0.985). A 7 % chance of dropping the focused visitor's own turn
+//! is too many for a default, and no real talking-face video of the
+//! robot's camera has been measured yet. Without it the binary simply hands the audio sense no board.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

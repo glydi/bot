@@ -843,6 +843,12 @@ fn emit_focus(
     }
     crowd.focus_sent = Some((focus, now));
     let mut obs = Observation::new(cfg.source_name.clone(), MODALITY_FOCUS, now);
+    common::focus::set_focus_person(
+        focus
+            .and_then(|id| tracker.get(id))
+            .and_then(|t| t.person.as_ref())
+            .map(|p| p.0.as_str()),
+    );
     if let Some(t) = focus.and_then(|id| tracker.get(id)) {
         let hint = match &t.person {
             Some(id) => EntityHint::KnownOnTrack(id.clone(), t.id),

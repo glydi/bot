@@ -1,12 +1,15 @@
 //! Who gets heard in a crowd: the checks a finished turn passes before it
 //! is transcribed.
 //!
-//! 1. **Lip gate** (`GLYDI_LIP_GATE`, on when the camera runs): the
+//! Both are OFF by default (measurements in `common::speaking` and below).
+//!
+//! 1. **Lip gate** (`GLYDI_LIP_GATE=1`, with the camera): the
 //!    focused face's mouth must have moved while the speech was heard
 //!    ([`common::SpeakingBoard::verdict`]). A still mouth means the voice
 //!    was someone else's: dropped, logged "not the focused speaker". No
 //!    opinion (no focus, face lost) lets it through.
-//! 2. **Level gate** (`GLYDI_LEVEL_GATE_DB`, default 12, 0 = off): the
+//! 2. **Level gate** (`GLYDI_LEVEL_GATE_DB`, 0 = off, the default; 12 is
+//!    the suggested margin): the
 //!    speech level must be within that many dB of this visit's baseline,
 //!    the level the focused visitor has been talking at. A talker across
 //!    the room reaches the mic 15-25 dB under one at arm's length. The
@@ -14,6 +17,11 @@
 //!    [`BASELINE_STALE`] without an accepted turn.
 //!
 //! Both drops happen before the worker, so a dropped turn costs no STT.
+//!
+//! The level gate stays off because it cannot be measured offline: the
+//! one number that matters, how far one visitor's own level wanders
+//! between turns on the robot's USB mic (turning away, a quiet "yes"),
+//! needs recordings at the door (`GLYDI_SAVE_UTTERANCES`, with consent).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

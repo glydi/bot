@@ -6,8 +6,23 @@
 //! runs at 16 kHz in 32 ms frames, so each frame is upsampled x3 (linear;
 //! there is nothing above 8 kHz to lose), pushed through in 480-sample
 //! hops, and box-filtered back down. Cost and delay: ~0.3 ms of CPU per
-//! 32 ms frame and 10-20 ms of latency (one hop plus the remainder); see
-//! `examples/denoise_eval.rs` for the measured numbers and the WER table.
+//! 32 ms frame and 10-20 ms of latency (one hop plus the remainder).
+//!
+//! **Off by default, measured 2026-10-13** (`examples/crowd_eval.rs`;
+//! 20 school sentences, Parakeet TDT int8, mixed with 6-talker babble and
+//! DEMAND `PCAFETER` cafeteria noise; WER %, off -> rnnoise):
+//!
+//! | noise   | clean | 10 dB      | 5 dB        | 0 dB        |
+//! |---------|-------|------------|-------------|-------------|
+//! | babble  | 3.3 -> 3.3 | 3.9 -> 5.5 | 17.7 -> 11.6 | 38.1 -> 41.4 |
+//! | cafe    |       | 3.9 -> 2.2 | 3.9 -> 4.4  | 3.9 -> 6.1  |
+//!
+//! Mixed for the recogniser (better only at babble 5 dB), and worse for
+//! the VAD: on 90 s of pure cafeteria noise Silero heard 0 % speech
+//! without it and 93.5 % with it (2 false turns/min) -- the suppressor
+//! leaves voice-like residue that the VAD takes for speech. Babble is
+//! speech to Silero either way (99.6 %), which is the lip and level gates'
+//! job, not this one's. Cost 0.14 ms median per 32 ms frame.
 //!
 //! `deepfilter` (`DeepFilterNet3`) is recognised but not built: its ONNX
 //! export needs the ERB/complex-spectrum feature front end and the deep

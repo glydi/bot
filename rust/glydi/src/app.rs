@@ -1323,6 +1323,29 @@ fn apply_remote_stt(cfg: &mut AudioConfig, people: Arc<Store>) {
     }));
 }
 
+/// Name fixing after hearing (`sense_audio::names`): the gallery's names,
+/// the camera's focused person marked, snap near misses in transcripts.
+/// On by default; `GLYDI_NAME_FIX=0` turns it off.
+fn apply_name_fixer(cfg: &mut AudioConfig, people: Arc<Store>) {
+    if std::env::var("GLYDI_NAME_FIX").is_ok_and(|v| v.trim() == "0") {
+        tracing::info!("name fixing off (GLYDI_NAME_FIX=0)");
+        return;
+    }
+    cfg.name_fixer = Some(sense_audio::names::NameFixer::new(Arc::new(move || {
+        let focus = common::focus::focus_person(Duration::from_secs(30));
+        people
+            .people()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !p.name.trim().is_empty() && !common::is_placeholder(&p.name))
+            .map(|p| sense_audio::names::KnownName {
+                in_focus: focus.as_deref() == Some(p.id.0.as_str()),
+                name: p.name,
+            })
+            .collect()
+    })));
+}
+
 /// `GLYDI_SAVE_UTTERANCES=1` keeps every utterance (WAV + transcript) in
 /// `data/utterances` for `scripts/stt-ab.py`; any other value but `0` is
 /// the directory to use.
@@ -1409,6 +1432,7 @@ fn spawn_audio(
             cfg.stt = sense_audio::SttKind::Whisper;
         }
         cfg.parakeet_model = Some(parakeet_dir);
+        apply_name_fixer(&mut cfg, store.clone());
         apply_remote_stt(&mut cfg, store);
         tracing::info!(stt = ?cfg.stt, "transcriber");
         // None = detect per utterance (needs a multilingual whisper

@@ -26,6 +26,27 @@ pub fn single_focus_from(v: Option<&str>) -> bool {
     )
 }
 
+/// Who the camera's focused face was recognised as, and when: the camera
+/// writes it with each `focus` observation, the microphone side reads it
+/// to snap a misheard name to the person in front (`sense_audio::names`).
+static FOCUS_PERSON: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Record the focused face's person id (`None`: nobody, or a stranger).
+pub fn set_focus_person(id: Option<&str>) {
+    if let Ok(mut g) = FOCUS_PERSON.lock() {
+        *g = id.map(|i| (i.to_owned(), std::time::Instant::now()));
+    }
+}
+
+/// The focused person's id when it was written within `max_age`.
+pub fn focus_person(max_age: std::time::Duration) -> Option<String> {
+    let g = FOCUS_PERSON.lock().ok()?;
+    g.as_ref()
+        .filter(|(_, at)| at.elapsed() <= max_age)
+        .map(|(id, _)| id.clone())
+}
+
 /// Whether `word` (punctuation already stripped) is an internal id rather
 /// than a name: `unknown_2`, `unknown-2`, `unknown2`, `track:7`,
 /// `track_7`, `stranger_3`, or a 12-hex gallery id with a digit in it.

@@ -17,13 +17,19 @@
 2. Done: model failure/garbage mid-turn gives a short line; mic reconnect and camera reopen with backoff (tests).
    Still open: soak test on the robot (`scripts/soak.py`); stronger model comparison (qwen2.5:7b, qwen3:4b-instruct) within 1.5 s.
 3. Written, OFF by default: noise suppression `GLYDI_DENOISE=rnnoise`; lip gate `GLYDI_LIP_GATE=1`
-   (2d106det mouth movement of the focused face); distance/level gate `GLYDI_LEVEL_GATE_DB=12`. Try on the robot, then decide defaults.
+   (2d106det mouth movement of the focused face); distance/level gate `GLYDI_LEVEL_GATE_DB=12`.
+   Measured offline 2026-10-13 (`sense-audio/examples/crowd_eval.rs`), all stay OFF: RNNoise mixed for WER and makes Silero
+   hear cafeteria noise as speech (0 % -> 93.5 %); lip gate recall 0.93 on synthetic windows (drops 7 % of the visitor's turns);
+   level gate needs door recordings. Numbers in `denoise.rs`, `common/src/speaking.rs`, `gate.rs`.
 4. Written, OFF by default: dynamic end-of-turn `GLYDI_TURN_EARLY_MS=220` (smart-turn asked after a short pause).
+   Measured: p50 282 ms vs 753 ms, but cuts 2 of 6 paused sentences; stays OFF (`sense_audio::DEFAULT_TURN_EARLY_MS`).
 5. simulate.py on the baseline: 13 gaps (return-visit check-in question, sibling recall, "Nice to meet you" wording,
    forget_me, visitor_adult name/out-of-zone, staff_member name, fact update "bank"->"hospital", "is my son here").
 
 ## Next
-6. Name fixing after hearing (snap "Stork"/"Connie" to known names).
+6. Done: name fixing after hearing (`sense_audio::names`, `GLYDI_NAME_FIX=0` turns it off): near misses snap to gallery names
+   in name contexts; loose matches only for the camera's focused person. Open: the mind should set `NameFixer::expect_name()`
+   after asking a name (short replies then count).
 7. Collect real voice clips (GLYDI_SAVE_UTTERANCES=1, with consent) and rerun the Parakeet vs Whisper test.
 8. Retrain the understander on logged intents; fix "sister" stored as "sibling".
 9. ERP: create the robot account (`scripts/erp-robot-account.py --admin <email>`), set GLYDI_ERP_* in .env; decide what ERP data the robot uses (people, classes, relations).

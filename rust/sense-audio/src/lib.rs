@@ -37,7 +37,12 @@ pub mod aec;
 pub mod affect;
 pub mod denoise;
 
-/// Default for [`AudioConfig::turn_early_ms`] in the binary.
+/// Suggested value for [`AudioConfig::turn_early_ms`]; the binary keeps it
+/// at 0 (off). Measured 2026-10-13 (`examples/crowd_eval.rs turn`, 20
+/// complete sentences + 6 with a 450 ms mid-sentence pause): end of speech
+/// to turn end p50 282 ms vs 753 ms fixed, but 2 of 6 paused sentences cut
+/// in half at p >= 0.8 (1 of 6 at 0.9, with p50 703 ms, no gain). Cutting
+/// a visitor off costs more than half a second.
 pub const DEFAULT_TURN_EARLY_MS: u32 = 220;
 /// After a turn the judge deferred, the most silence (from the last
 /// voiced frame) before it is answered anyway.
@@ -51,6 +56,7 @@ pub mod gate;
 pub mod input;
 #[cfg(feature = "mock")]
 pub mod mock;
+pub mod names;
 pub mod onnx;
 pub mod parakeet;
 pub mod pipeline;
@@ -231,6 +237,9 @@ pub struct AudioConfig {
     /// Write each utterance's audio and transcript here
     /// (`GLYDI_SAVE_UTTERANCES`); `None` saves nothing.
     pub save_utterances: Option<PathBuf>,
+    /// Snaps misheard names in transcripts to known people (see
+    /// [`names`]); `None` leaves transcripts as heard.
+    pub name_fixer: Option<names::NameFixer>,
     /// ECAPA ONNX model; `None` disables speaker id.
     pub voiceid_model: Option<PathBuf>,
     /// Silero VAD ONNX model. When set and loadable, voice activity means
@@ -310,6 +319,7 @@ impl std::fmt::Debug for AudioConfig {
             .field("stt_url", &self.stt_url)
             .field("stt_hints", &self.stt_hints.as_ref().map(|_| "set"))
             .field("save_utterances", &self.save_utterances)
+            .field("name_fixer", &self.name_fixer.is_some())
             .field("voiceid_model", &self.voiceid_model)
             .field("vad_model", &self.vad_model)
             .field("ort_lib", &self.ort_lib)
@@ -357,6 +367,7 @@ impl AudioConfig {
             stt_url: remote::DEFAULT_URL.to_owned(),
             stt_hints: None,
             save_utterances: None,
+            name_fixer: None,
             voiceid_model: Some(dir.join("voiceid/ecapa.onnx")),
             vad_model: Some(dir.join(vad_model_relative())),
             ort_lib: PathBuf::from(onnx::DEFAULT_ORT_LIBRARY),
@@ -987,6 +998,7 @@ impl AudioSense {
             gallery,
             affect: config.affect.then(affect::Calibrator::new),
             save_dir: config.save_utterances,
+            names: config.name_fixer,
             source_name: config.source_name,
             clock,
             tx,
