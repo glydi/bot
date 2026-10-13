@@ -119,6 +119,14 @@ pub fn classify(text: &str) -> Option<Query> {
         }
     }
     if t.contains("what period")
+        || t.contains("current period")
+        || t.contains("kaunsa period")
+        || t.contains("konsa period")
+        || t.contains("kaun sa period")
+        || t.contains("kon sa period")
+        || t.contains("period chal raha")
+        || t.contains("class chal rahi")
+        || t.contains("abhi kya chal")
         || t.contains("which period")
         || t.contains("period is it")
         || t.contains("what lesson is")
@@ -135,6 +143,9 @@ pub fn classify(text: &str) -> Option<Query> {
         || t.contains("next lesson")
         || t.contains("next class")
         || t.contains("after this")
+        || t.contains("agla period")
+        || t.contains("agli class")
+        || t.contains("next kaunsa")
     {
         return Some(Query::Next(class));
     }
@@ -237,6 +248,20 @@ pub fn answer(query: &Query, snap: &Snapshot, today: Date, now: &str) -> Option<
         }
         Query::Now(class) => {
             let (label, day) = scoped_day(snap, today, class.as_deref())?;
+            if !day.open {
+                return Some(Fact {
+                    line: format!(
+                        "School is closed today: {}.",
+                        day.reason.as_deref().unwrap_or("a holiday")
+                    ),
+                    source: format!("calendar {label}"),
+                    as_of,
+                });
+            }
+            if day.periods.is_empty() {
+                // No timetable loaded: say so rather than invent a period.
+                return None;
+            }
             let Some(p) = day.periods.iter().find(|p| within(now, &p.starts, &p.ends)) else {
                 let next = day.periods.iter().find(|p| p.starts.as_str() > now);
                 return Some(Fact {
@@ -260,6 +285,9 @@ pub fn answer(query: &Query, snap: &Snapshot, today: Date, now: &str) -> Option<
         }
         Query::Next(class) => {
             let (label, day) = scoped_day(snap, today, class.as_deref())?;
+            if !day.open || day.periods.is_empty() {
+                return None;
+            }
             let next = day.lessons().find(|p| p.starts.as_str() > now);
             Some(Fact {
                 line: match next {
@@ -319,7 +347,7 @@ pub fn speak(fact: &Fact, now_secs: i64, stale_after: i64) -> String {
 
 // --- helpers ------------------------------------------------------------------
 
-fn tidy(text: &str) -> String {
+pub(crate) fn tidy(text: &str) -> String {
     text.to_ascii_lowercase()
         .replace(['’', '`'], "'")
         .split_whitespace()
@@ -327,8 +355,10 @@ fn tidy(text: &str) -> String {
         .join(" ")
 }
 
-/// "class 7 b", "7b", "class seven b", "grade 7" -> "7 b".
-fn class_in(t: &str) -> Option<String> {
+/// The class named in `t` (lower-case), spoken form: "class 7 b",
+/// "7b", "6 A", "class 6-A", "6th A", "class seven b", "grade 7" ->
+/// "7 B" / "6 A" / "7".
+pub fn class_in(t: &str) -> Option<String> {
     let words: Vec<&str> = t
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -362,6 +392,10 @@ fn class_in(t: &str) -> Option<String> {
             continue;
         }
         let tail: String = c.chars().skip_while(char::is_ascii_digit).collect();
+        let tail = match tail.as_str() {
+            "st" | "nd" | "rd" | "th" => String::new(),
+            _ => tail,
+        };
         let section = if tail.len() == 1 {
             Some(tail.to_uppercase())
         } else {
@@ -416,7 +450,7 @@ fn subject_in(t: &str) -> Option<String> {
         .map(|s| (*s).to_owned())
 }
 
-fn same_subject(have: &str, want: &str) -> bool {
+pub(crate) fn same_subject(have: &str, want: &str) -> bool {
     let h = have.to_ascii_lowercase();
     let w = want.to_ascii_lowercase();
     h.contains(&w)
@@ -425,7 +459,7 @@ fn same_subject(have: &str, want: &str) -> bool {
         || (h.contains("physical") && w == "pe")
 }
 
-fn same_person(have: &str, want: &str) -> bool {
+pub(crate) fn same_person(have: &str, want: &str) -> bool {
     let strip = |s: &str| {
         s.to_ascii_lowercase()
             .replace(['.', ','], " ")
@@ -470,7 +504,7 @@ fn period_number_in(t: &str) -> Option<usize> {
     None
 }
 
-fn within(now: &str, starts: &str, ends: &str) -> bool {
+pub(crate) fn within(now: &str, starts: &str, ends: &str) -> bool {
     starts <= now && now < ends
 }
 
@@ -494,7 +528,7 @@ fn list(items: &[String]) -> String {
 }
 
 /// The section whose label matches `class` ("7 B" against "Class 7 B").
-fn section_id(snap: &Snapshot, class: &str) -> Option<(String, String)> {
+pub(crate) fn section_id(snap: &Snapshot, class: &str) -> Option<(String, String)> {
     let want = norm_class(class);
     snap.sections
         .iter()
@@ -507,7 +541,7 @@ fn section_id(snap: &Snapshot, class: &str) -> Option<(String, String)> {
         .map(|(id, label)| (id.clone(), label.clone()))
 }
 
-fn norm_class(s: &str) -> String {
+pub(crate) fn norm_class(s: &str) -> String {
     s.to_ascii_lowercase()
         .replace("class", " ")
         .replace("grade", " ")
@@ -518,13 +552,17 @@ fn norm_class(s: &str) -> String {
         .join(" ")
 }
 
-fn section_day<'a>(snap: &'a Snapshot, today: Date, class: &str) -> Option<(String, &'a Day)> {
+pub(crate) fn section_day<'a>(
+    snap: &'a Snapshot,
+    today: Date,
+    class: &str,
+) -> Option<(String, &'a Day)> {
     let (id, label) = section_id(snap, class)?;
     snap.day(today, &Scope::Section(id)).map(|d| (label, d))
 }
 
 /// A class's day when asked for and known, else the school's.
-fn scoped_day<'a>(
+pub(crate) fn scoped_day<'a>(
     snap: &'a Snapshot,
     today: Date,
     class: Option<&str>,
@@ -769,6 +807,47 @@ mod tests {
             Some("School is over for today.")
         );
         assert_eq!(a("where is Mr Nobody", "09:00"), None);
+    }
+
+    #[test]
+    fn hinglish_and_class_forms() {
+        assert_eq!(
+            classify("abhi kaunsa period chal raha hai?"),
+            Some(Query::Now(None))
+        );
+        assert_eq!(classify("agla period kya hai"), Some(Query::Next(None)));
+        for t in [
+            "absent in 6a",
+            "absent in 6 a",
+            "absent in class 6-a",
+            "absent in 6th a",
+        ] {
+            assert_eq!(class_in(t).as_deref(), Some("6 A"), "{t}");
+        }
+    }
+
+    #[test]
+    fn no_timetable_is_never_invented() {
+        let (mut s, today) = snap();
+        s.put(today, &Scope::School, Day::closed(today, "Gandhi Jayanti"));
+        s.days.retain(|k, _| !k.contains("section"));
+        assert_eq!(
+            answer(&Query::Now(None), &s, today, "09:00")
+                .map(|f| f.line)
+                .as_deref(),
+            Some("School is closed today: Gandhi Jayanti.")
+        );
+        s.put(
+            today,
+            &Scope::School,
+            Day {
+                date: today.iso(),
+                open: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(answer(&Query::Now(None), &s, today, "09:00"), None);
+        assert_eq!(answer(&Query::Next(None), &s, today, "09:00"), None);
     }
 
     #[test]

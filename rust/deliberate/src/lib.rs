@@ -30,14 +30,21 @@ pub mod backend;
 pub mod cache;
 pub mod claude;
 pub mod condense;
+pub mod converse;
 pub mod deliberator;
+pub mod handoff;
+pub mod learn;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
+pub mod people;
 pub mod prompt;
 pub mod school_link;
+pub mod scope;
 pub mod sentence;
 pub mod templates;
 pub mod tools;
+pub mod understand;
+pub mod visit;
 pub mod voice;
 
 pub use backend::{ChatBackend, ChatEvent, ChatRequest, EventStream, LlmError, OpenAiBackend};
@@ -45,7 +52,7 @@ pub use cache::{AnswerCache, Verdict};
 pub use claude::{ClaudeBackend, Effort, Fallback};
 pub use deliberator::{
     Config, Deliberator, DeliberatorHandle, INTENT_KIND, INTENT_SAY_GAP, INTENT_TARGET,
-    MAX_TOOL_ROUNDS, SET_NAME_KIND, SET_NAME_TARGET, Session, Snapshot, TurnEnd,
+    MAX_TOOL_ROUNDS, People, SET_NAME_KIND, SET_NAME_TARGET, Session, Snapshot, TurnEnd,
 };
 pub use prompt::{
     Conversation, EARLIER, EXAMPLES, LOCAL_SYSTEM_PROMPT, MARKER, MAX_HISTORY, Message, Role,

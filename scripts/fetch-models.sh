@@ -40,6 +40,7 @@ kokoro|$kokoro/voices-v1.0.bin|https://github.com/thewh1teagle/kokoro-onnx/relea
 yamnet|$models/yamnet/yamnet.onnx|$HF/zeropointnine/yamnet-onnx/resolve/main/yamnet.onnx
 yamnet|$models/yamnet/yamnet_class_map.csv|$HF/zeropointnine/yamnet-onnx/resolve/main/yamnet_class_map.csv
 vision|$models/vision/yolov5n.onnx|https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx
+vision|$models/vision/yolov8n-pose.onnx|$HF/Xenova/yolov8n-pose/resolve/main/onnx/model.onnx
 LIST
 }
 

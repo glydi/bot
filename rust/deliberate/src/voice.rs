@@ -300,6 +300,104 @@ pub fn clean_reply(text: &str) -> String {
         .to_owned()
 }
 
+/// A model line made safe to say out loud, or `None` when nothing
+/// sayable is left: reasoning, `[tags]` and `<|special|>` tokens dropped,
+/// markdown (bold, headings, bullets, code, links) and emoji removed,
+/// whitespace collapsed, cut to the first two sentences and `max_words`
+/// words. A line that is mostly not Latin script (the model drifted into
+/// another language) is `None`, so the caller says its own line.
+pub fn speakable(raw: &str, max_words: usize) -> Option<String> {
+    let (t, _) = strip_reasoning(raw);
+    let mut out = String::with_capacity(t.len());
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `[anything]` and `<|anything|>` / `<tag>` are prompt text.
+            '[' | '<' => {
+                let close = if c == '[' { ']' } else { '>' };
+                let mut inner = String::new();
+                let mut closed = false;
+                for n in chars.by_ref() {
+                    if n == close {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(n);
+                }
+                if !closed {
+                    // An unclosed bracket ends the sayable part.
+                    break;
+                }
+                // A markdown link `[words](url)`: keep the words.
+                if c == '[' && chars.peek() == Some(&'(') {
+                    out.push_str(&inner);
+                    for n in chars.by_ref() {
+                        if n == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            '*' | '_' | '#' | '`' | '~' | '|' | '>' | '\n' | '\r' | '\t' => out.push(' '),
+            c if is_emoji(c) => {}
+            c => out.push(c),
+        }
+    }
+    // Bullets left at the starts of lines: "- ", "1. ".
+    let words: Vec<&str> = out
+        .split_whitespace()
+        .filter(|w| {
+            let numbered = w.len() > 1
+                && w.ends_with('.')
+                && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit());
+            !matches!(*w, "-" | "\u{2022}") && !numbered
+        })
+        .collect();
+    let mut line = clean_reply(&words.join(" "));
+    for label in ["Glydi says:", "Robot:", "You:", "Answer:"] {
+        if let Some(rest) = line.strip_prefix(label).map(|r| r.trim().to_owned()) {
+            line = rest;
+        }
+    }
+    let letters: Vec<char> = line.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() {
+        return None;
+    }
+    let latin = letters.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    if latin * 10 < letters.len() * 7 {
+        return None;
+    }
+    let mut kept = split_sentences(&line)
+        .into_iter()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if kept.trim().is_empty() {
+        kept = line;
+    }
+    let ws: Vec<&str> = kept.split_whitespace().collect();
+    if ws.len() > max_words {
+        let first = first_sentence(&kept);
+        kept = if first.split_whitespace().count() <= max_words {
+            first
+        } else {
+            let mut cut = ws[..max_words].join(" ");
+            cut = cut.trim_end_matches([',', ';', ':', '-']).to_owned();
+            cut.push('.');
+            cut
+        };
+    }
+    let kept = kept.trim().to_owned();
+    (!kept.is_empty()).then_some(kept)
+}
+
+/// Pictographs, dingbats, flags, variation selectors and joiners: things
+/// a voice cannot say.
+fn is_emoji(c: char) -> bool {
+    matches!(c as u32,
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE00..=0xFE0F | 0x200D | 0x20E3 | 0xE0000..=0xE007F)
+}
+
 /// The first sentence of `text`, cleaned (see [`clean_reply`]).
 /// Proactive lines are one sentence by brief; the model sometimes adds
 /// a second, and the first is the one that was asked for.
@@ -787,7 +885,7 @@ pub fn fallback_opener(name: Option<&str>, facts: &[String]) -> String {
             "{n}, last I heard {}. Still the case?",
             f.trim().trim_end_matches('.')
         ),
-        (Some(n), None) => format!("{n}, what are you working on these days?"),
+        (Some(n), None) => format!("{n}, ask me anything about school today."),
         (None, _) => "I don't have your name yet. What is it?".to_owned(),
     }
 }
@@ -1124,7 +1222,7 @@ mod tests {
         );
         assert_eq!(
             fallback_opener(Some("John"), &[]),
-            "John, what are you working on these days?"
+            "John, ask me anything about school today."
         );
         assert!(!is_generic(&fallback_opener(None, &[])));
     }
@@ -1256,8 +1354,8 @@ const LEADS: [&str; 8] = [
 ];
 
 /// Words that end the name and carry the sentence on.
-const CLAUSE: [&str; 12] = [
-    "and", "but", "so", "because", "is", "was", "from", "the", "a", "an", "at", "in",
+const CLAUSE: &[&str] = &[
+    "and", "but", "so", "because", "is", "was", "from", "the", "a", "an", "at", "in", "not",
 ];
 
 /// Words that are never a name, however they arrive. "I'm fine", "it's
@@ -1265,7 +1363,40 @@ const CLAUSE: [&str; 12] = [
 /// "I'm alone" that were enrolled as people: six of the owner's own face
 /// samples ended up filed under a person called "No", which split his
 /// face across two identities and made him unrecognisable.
-const NOT_NAMES: [&str; 64] = [
+const NOT_NAMES: &[&str] = &[
+    // Feelings and school subjects: "I'm nervous about my exam",
+    // "it's maths".
+    "nervous",
+    "scared",
+    "worried",
+    "excited",
+    "anxious",
+    "afraid",
+    "stressed",
+    "upset",
+    "about",
+    "maths",
+    "math",
+    "science",
+    "english",
+    "hindi",
+    "history",
+    "geography",
+    "exam",
+    "exams",
+    "homework",
+    "hurt",
+    "injured",
+    "bleeding",
+    "sick",
+    "ill",
+    "help",
+    "lost",
+    "spelt",
+    "spelled",
+    "spell",
+    "spelling",
+    "forget",
     "fine",
     "good",
     "ok",
@@ -1402,23 +1533,42 @@ pub fn is_plain_question(text: &str) -> bool {
         return false;
     }
     // "Who is Bob?" is about a person the bot may know: the full lane,
-    // with its memory tools, owns every "who is".
-    if t.starts_with("who is ") || t.starts_with("who's ") || t.starts_with("who was ") {
+    // with its memory tools, owns every "who is" but "who is the ...".
+    let titled = t.starts_with("who is the ") || t.starts_with("who's the ");
+    if !titled && (t.starts_with("who is ") || t.starts_with("who's ") || t.starts_with("who was "))
+    {
         return false;
     }
-    // Anything about us or them is the full lane's business.
+    // "Do you know Bob?", "is Ada coming?": a person lookup.
+    if t.starts_with("do you know ") && !t.starts_with("do you know what")
+        || t.starts_with("have you met")
+        || t.starts_with("have you seen")
+        || t.starts_with("did you see")
+    {
+        return false;
+    }
+    let names_someone = text.split_whitespace().skip(1).any(|w| {
+        w.chars().next().is_some_and(char::is_uppercase) && !w.starts_with("I'") && w != "I"
+    });
+    if names_someone
+        && (["is", "was", "does", "did", "has", "can", "where"].contains(&words[0])
+            || t.contains(" about "))
+    {
+        return false;
+    }
+    // Memory and the person's own record are the full lane's business:
+    // it has the tools. Everything else -- the world, the bot itself,
+    // what the person told us (their facts ride along) -- is the fast lane's.
+    // The school's own words stay there too: the school lane answers
+    // them, and what it cannot is said plainly by the full lane. So do
+    // the senses: "what can you see" needs the room note.
     let personal = [
-        " my ",
-        " me ",
-        " me?",
-        " i ",
-        " i'm ",
-        " you ",
-        " your ",
-        " we ",
-        " our ",
         "remember",
+        "forget",
+        "remind",
         "glydi",
+        "my name",
+        "who am i",
         "school",
         "class",
         "period",
@@ -1429,14 +1579,200 @@ pub fn is_plain_question(text: &str) -> bool {
         "today",
         "tomorrow",
         "yesterday",
-        "name",
+        " see",
+        "hear",
+        "camera",
+        "wearing",
+        "holding",
+        "look like",
     ];
-    let padded = format!(" {t} ");
-    !personal.iter().any(|p| padded.contains(p))
+    !personal.iter().any(|p| t.contains(p))
 }
 
-/// The fast lane's whole prompt.
-pub const PLAIN_PROMPT: &str = "You are Glydi, a robot at a school door, talking out loud. Answer the question directly and correctly in one or two short sentences, in plain words a child follows. If you do not know, say so in one sentence. No greeting, no question back, no list.";
+/// Whether `text` goes to the fast lane: a plain question or a creative
+/// ask (story, joke, riddle).
+pub fn is_fast_lane(text: &str) -> bool {
+    is_plain_question(text) || is_creative_ask(text)
+}
+
+pub use crate::scope::{
+    Act, REASONING_RULE, ReasonStripper, act_of, class_number, is_trivia, ordinal, strip_reasoning,
+    trivia_thread,
+};
+
+/// The fast lane's whole prompt. General knowledge never gets here (the
+/// template lane redirects it, see [`is_trivia`]); the model reasons in a
+/// `<think>` line first ([`REASONING_RULE`]), which is never spoken.
+pub const PLAIN_PROMPT: &str = concat!("You are Glydi, a warm, playful robot at the door of a school in India, talking out loud with children and parents. Your job is the door: greeting people, knowing who they are, the school day, keeping everyone safe and a friendly word. You are not an encyclopedia: a fact about the world (history, geography, science, famous people, news) is one for their teacher or the library. Do yourself: simple sums, jokes, riddles, short stories, feelings and chit-chat, and what you like (pick something fun and robot-ish). Answer in plain words a child follows, one or two short sentences. A story is the one longer thing: 3 or 4 sentences, under 60 words, child-safe. This school's own facts that the conversation does not give you (its dates, fees, staff, bus, lunch menu, a student) get \"I don't have that; the office can help.\" Never invent anything. At most one question back, never ask their name, never repeat your last reply, no lists, no emoji.
+", "Before every reply, think in one short line inside <think></think> that is never spoken: who= the speaker (name, or stranger); said= what they literally said; means= what they most likely mean, given the last turns and what you know about them (the transcript may be misheard); heard=ok or heard=garbled; do= answer, clarify, acknowledge, redirect or quiet. Then the spoken reply, under 20 words. If do=clarify, ask one short question. If do=quiet, write nothing after </think>.
+Examples:
+Q: what is 12 times 3? A: <think>who=stranger; said=12 times 3; means=a sum; heard=ok; do=answer</think>12 times 3 is 36.
+Q: tell me a joke A: <think>who=stranger; said=joke please; means=wants a laugh; heard=ok; do=answer</think>Why did the maths book look sad? It had too many problems!
+Q: what's your favourite colour? A: <think>who=stranger; said=my favourite colour; means=chit-chat about me; heard=ok; do=answer</think>Electric blue, like my wires! What's yours?
+Q: I'm feeling sad A: <think>who=stranger; said=feeling sad; means=needs kindness; heard=ok; do=acknowledge</think>I'm sorry. A slow breath helps, and a teacher is always there to talk to.
+Q: we didn't motor any angles A: <think>who=stranger; said=motor any angles; means=unclear, misheard; heard=garbled; do=clarify</think>Sorry, I missed that. Could you say it again?
+Q: no I meant the other one A: <think>who=stranger; said=correction; means=they want the earlier thing, not my answer; heard=ok; do=clarify</think>Oops! Which one did you mean?
+Q: tell me a scary story A: <think>who=stranger; said=scary story; means=a short story; heard=ok; do=answer</think>One night the school lights flickered. Something tapped on the window: tap, tap, tap. Riya peeked out, heart pounding. It was only a little owl, asking to come in from the rain.
+Q: when are the fees due? A: <think>who=stranger; said=fees due date; means=school fact I lack; heard=ok; do=redirect</think>I don't have that; the office can help.");
+
+/// Whether `text` asks for something made up on the spot -- a story, a
+/// joke, a riddle, a poem. No tools, no room note: the fast lane, with
+/// room for a story ([`PLAIN_STORY_TOKENS`]).
+pub fn is_creative_ask(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "story", "joke", "riddle", "poem", "rhyme", "fun fact", "kahani", "chutkula",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
+        && !t.contains("remember")
+        && t.split_whitespace().count() <= 12
+}
+
+/// Whether `text` asks for a story: the one reply allowed to run long.
+pub fn is_story(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("story") || t.contains("kahani") || t.contains("poem")
+}
+
+/// The fast lane's token ceiling for a story (about 60 words).
+pub const PLAIN_STORY_TOKENS: u32 = 150;
+
+/// Whether `text` is plainly for the bot whoever says it: its name
+/// (and what the recogniser makes of it), or a greeting to open with.
+pub fn calls_me(text: &str) -> bool {
+    let w = shingle_words(text);
+    let joined = w.join(" ");
+    let name = [
+        "glydi", "glidy", "gliddy", "glady", "glide e", "glydie", "glidey",
+    ]
+    .iter()
+    .any(|n| joined.contains(n));
+    let greet = [
+        "hi",
+        "hello",
+        "hey",
+        "namaste",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    ]
+    .iter()
+    .any(|g| joined == *g || joined.starts_with(&format!("{g} ")));
+    name || greet
+}
+
+/// The instruction part of a prompt text, for [`echoes_prompt`]: the
+/// example exchanges and every quoted line ("I don't have that; the
+/// office can help." is a line the bot is *meant* to say) taken out.
+pub fn instruction_part(text: &str) -> String {
+    let body = text.split("Examples:").next().unwrap_or(text);
+    let mut out = String::new();
+    for line in body.lines() {
+        let l = line.trim_start();
+        if ["Person", "Glydi:", "Q:", "A:"]
+            .iter()
+            .any(|p| l.starts_with(p))
+        {
+            continue;
+        }
+        let mut quoted = false;
+        for c in l.chars() {
+            if c == '"' {
+                quoted = !quoted;
+                out.push(' ');
+            } else if !quoted {
+                out.push(c);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn shingle_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `sentence` reads our own instructions back: any run of six
+/// words (or the whole sentence, from four words up) found in
+/// `instructions` (see [`instruction_part`]). Generated from the prompt
+/// actually sent, so a new note can never leak unnoticed.
+pub fn echoes_prompt(sentence: &str, instructions: &str) -> bool {
+    let s = shingle_words(sentence);
+    if s.len() < 4 {
+        return false;
+    }
+    let hay = format!(" {} ", shingle_words(instructions).join(" "));
+    let n = s.len().min(6);
+    s.windows(n)
+        .any(|w| hay.contains(&format!(" {} ", w.join(" "))))
+}
+
+/// A line that is no line: "says:", "Say one short thing to draw them
+/// in:" -- anything ending in a colon, or a lone speaker label.
+pub fn is_fragment_line(sentence: &str) -> bool {
+    let t = sentence.trim();
+    t.ends_with(':') || t.split_whitespace().count() <= 1 && t.to_lowercase().starts_with("says")
+}
+
+/// A reply built by echoing the person's words with "what?" stuck on
+/// ("Most meetings what?", "Yeah what?", "I don't know what we'll.").
+pub fn parrots(sentence: &str, heard: &str) -> bool {
+    let s = shingle_words(sentence);
+    let h = shingle_words(heard);
+    if h.is_empty() || s.is_empty() {
+        return false;
+    }
+    let filler = ["what", "i", "don't", "know", "then", "so", "the"];
+    let echoed = s.iter().filter(|w| h.contains(w)).count();
+    let other = s
+        .iter()
+        .filter(|w| !h.contains(w) && !filler.contains(&w.as_str()))
+        .count();
+    s.contains(&"what".to_owned()) && echoed >= 1 && other == 0
+}
+
+/// A transcript too thin to answer: a bit of a sentence the recogniser
+/// caught ("Most meetings.", "We'll", "Yeah. Yeah.", "Then you can").
+/// Not a question, and either at most three words with no feeling or
+/// greeting in them, or ending on a word a sentence cannot end on.
+pub fn is_fragment(text: &str) -> bool {
+    let t = text.trim();
+    if t.ends_with('?') || is_question_shaped(t) {
+        return false;
+    }
+    let w = shingle_words(t);
+    if w.is_empty() {
+        return true;
+    }
+    let dangling = [
+        "can", "will", "we'll", "you'll", "i'll", "to", "the", "a", "an", "and", "but", "or", "of",
+        "on", "in", "at", "for", "with", "then", "is", "are", "was", "my", "your", "if", "so",
+        "because", "that", "just",
+    ];
+    if w.last().is_some_and(|l| dangling.contains(&l.as_str())) {
+        return true;
+    }
+    let keeps = [
+        "sad", "happy", "bored", "hungry", "tired", "scared", "angry", "sick", "hurt", "love",
+        "like", "hate", "good", "great", "cool", "nice", "wow", "sorry", "please", "help",
+    ];
+    w.len() <= 3 && !w.iter().any(|x| keeps.contains(&x.as_str()))
+}
+
+fn is_question_shaped(t: &str) -> bool {
+    let first = t.split_whitespace().next().unwrap_or("").to_lowercase();
+    [
+        "what", "what's", "who", "when", "where", "why", "how", "which", "can", "could", "do",
+        "does", "is", "are", "tell",
+    ]
+    .contains(&first.as_str())
+}
 
 /// Whether a sentence is the prompt talking rather than the bot: a
 /// `[note]` hint read back, or a tool named as text ("Call `recall_person`
@@ -1467,6 +1803,13 @@ pub fn leaks_instructions(sentence: &str) -> bool {
 /// enrolled a "Hang Hungry").
 pub fn plausible_name(name: &str) -> bool {
     const NOT_NAMES: &[&str] = &[
+        "hurt",
+        "injured",
+        "bleeding",
+        "help",
+        "spelt",
+        "spelled",
+        "spell",
         "feeling",
         "hungry",
         "tired",
@@ -1590,10 +1933,17 @@ fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String
     // catching it before (measured: our own detector 0/3 on that case).
     // Only what follows the lead up to the next comma or clause end is
     // the name, which is what the two-word cap below enforces.
-    let rest = LEADS
-        .iter()
-        .filter_map(|l| lower.find(l).map(|i| (i, l.len())))
-        .min_by_key(|(i, _)| *i)
+    // "My name is Aditya but call me Adi": what they want to be called
+    // wins over the name on the register.
+    let rest = lower
+        .find("call me ")
+        .map(|i| (i, "call me ".len()))
+        .or_else(|| {
+            LEADS
+                .iter()
+                .filter_map(|l| lower.find(l).map(|i| (i, l.len())))
+                .min_by_key(|(i, _)| *i)
+        })
         .map(|(i, len)| {
             let after = &t[i + len..];
             after.split([',', ';']).next().unwrap_or(after).trim()
@@ -1650,6 +2000,134 @@ fn self_introduction_one(text: &str, after_name_question: bool) -> Option<String
         }
     }
     Some(out)
+}
+
+/// A name spelt out letter by letter: "it's spelt A D I", "A-D-I",
+/// "a d i t y a". Spelling words ("spelt", "spelled", "spelling") make
+/// any run of two or more single letters a name; with `expecting` (the
+/// bot asked for a name or is confirming one) a bare run of three or
+/// more letters is one too. Returns the name capitalised: "Adi".
+pub fn spelled_name(text: &str, expecting: bool) -> Option<String> {
+    let lower = text.to_lowercase();
+    let cue = ["spelt", "spelled", "spelling", "spell it"]
+        .iter()
+        .any(|c| lower.contains(c));
+    if !cue && !expecting {
+        return None;
+    }
+    let tokens: Vec<String> = lower
+        .split(|c: char| c.is_whitespace() || c == '-' || c == ',' || c == '.')
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // The longest run of single letters.
+    let mut best: Vec<char> = Vec::new();
+    let mut run: Vec<char> = Vec::new();
+    for w in &tokens {
+        let mut cs = w.chars();
+        match (cs.next(), cs.next()) {
+            (Some(c), None) if c.is_alphabetic() => run.push(c),
+            _ => {
+                if run.len() > best.len() {
+                    best = std::mem::take(&mut run);
+                }
+                run.clear();
+            }
+        }
+    }
+    if run.len() > best.len() {
+        best = run;
+    }
+    let needed = if cue { 2 } else { 3 };
+    if best.len() < needed {
+        return None;
+    }
+    // Without a cue the letters must be the whole utterance, or "I am a
+    // b c student" style noise would become a name.
+    if !cue && best.len() != tokens.len() {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, c) in best.iter().enumerate() {
+        if i == 0 {
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(*c);
+        }
+    }
+    Some(out)
+}
+
+/// Whether `text` is transcriber noise rather than speech: a bracket tag
+/// ("[Music]", "(laughs)"), a lone one- or two-character token that is not
+/// a word people say alone, one word repeated ("the the the"), only
+/// fillers ("uh", "um", "hmm"), or one of Whisper's known hallucinations
+/// on silence ("Thank you for watching!", "Subtitles by ..."). The
+/// deliberator drops these silently before anything else.
+pub fn is_noise(text: &str) -> bool {
+    // Strip bracketed tags and music marks.
+    let mut bare = String::new();
+    let mut depth = 0i32;
+    for c in text.chars() {
+        match c {
+            '[' | '(' | '{' | '<' => depth += 1,
+            ']' | ')' | '}' | '>' => depth = (depth - 1).max(0),
+            '♪' | '♫' | '*' => {}
+            _ if depth == 0 => bare.push(c),
+            _ => {}
+        }
+    }
+    let lower = bare.to_lowercase().replace('’', "'");
+    let words: Vec<String> = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if words.is_empty() {
+        return true;
+    }
+    let hallucinations = [
+        "thank you for watching",
+        "thanks for watching",
+        "thank you for listening",
+        "subtitles by",
+        "subtitled by",
+        "transcribed by",
+        "translated by",
+        "captions by",
+        "amara org",
+        "please subscribe",
+        "like and subscribe",
+        "don't forget to subscribe",
+        "see you in the next video",
+        "copyright",
+    ];
+    let joined = words.join(" ");
+    if hallucinations.iter().any(|h| joined.contains(h)) {
+        return true;
+    }
+    let short_words: &[&str] = &[
+        "hi", "ok", "no", "ya", "ha", "oh", "yo", "go", "me", "i", "a", "so", "ji",
+    ];
+    if words.len() == 1
+        && words[0].chars().count() <= 2
+        && !short_words.contains(&words[0].as_str())
+    {
+        return true;
+    }
+    if words.len() == 1 && words[0] == "you" {
+        return true;
+    }
+    let fillers: &[&str] = &[
+        "uh", "uhh", "um", "umm", "hmm", "hmmm", "hm", "mm", "mmm", "er", "erm", "ah", "ahh", "eh",
+    ];
+    if words.iter().all(|w| fillers.contains(&w.as_str())) {
+        return true;
+    }
+    let meant: &[&str] = &[
+        "no", "yes", "bye", "help", "hello", "hi", "ok", "okay", "stop",
+    ];
+    words.len() >= 3 && words.iter().all(|w| *w == words[0]) && !meant.contains(&words[0].as_str())
 }
 
 /// Whether one of GLYDI's own lines asked for a name, so the next short
@@ -1801,5 +2279,179 @@ mod tail_tests {
         assert!(is_finished_sentence("He said \"later.\""));
         assert!(!is_finished_sentence("I was about to say that the"));
         assert!(!is_finished_sentence("Kalyan, how is the"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod noise_and_spelling_tests {
+    use super::*;
+
+    #[test]
+    fn transcriber_noise_is_recognised() {
+        for n in [
+            "[Music]",
+            "(laughs)",
+            "♪ ♪",
+            "k",
+            "xy",
+            "the the the",
+            "uh",
+            "um, hmm",
+            "Thank you for watching!",
+            "Subtitles by the Amara.org community",
+            "you",
+            "",
+        ] {
+            assert!(is_noise(n), "{n:?} should be noise");
+        }
+        for s in [
+            "hi",
+            "ok",
+            "no",
+            "no no no",
+            "thank you",
+            "bye bye",
+            "what time is it",
+            "I'm Adi",
+        ] {
+            assert!(!is_noise(s), "{s:?} is speech");
+        }
+    }
+
+    #[test]
+    fn letter_by_letter_names_are_assembled() {
+        assert_eq!(spelled_name("it's spelt A D I", false).unwrap(), "Adi");
+        assert_eq!(
+            spelled_name("spelled A-D-I-T-Y-A", false).unwrap(),
+            "Aditya"
+        );
+        assert_eq!(spelled_name("p r i y a", true).unwrap(), "Priya");
+        assert_eq!(spelled_name("p r i y a", false), None);
+        assert_eq!(spelled_name("I am a student", true), None);
+    }
+
+    #[test]
+    fn corrections_and_nicknames_pick_the_right_name() {
+        assert_eq!(
+            self_introduction("no, it's Priyanka not Priya", false).unwrap(),
+            "Priyanka"
+        );
+        assert_eq!(
+            self_introduction("my name is Aditya but call me Adi", false).unwrap(),
+            "Adi"
+        );
+        assert_eq!(self_introduction("I'm hurt", false), None);
+        assert_eq!(self_introduction("I am bleeding", false), None);
+        assert_eq!(self_introduction("it's spelt A D I", false), None);
+        assert!(!plausible_name("hurt"));
+    }
+
+    #[test]
+    fn fast_lane_takes_the_world_and_chit_chat_not_people() {
+        for yes in [
+            "who is the prime minister of India?",
+            "what is the capital of India?",
+            "what's your favourite colour?",
+            "tell me a scary story",
+            "tell me a joke",
+            "what is my dog's name?",
+        ] {
+            assert!(is_fast_lane(yes), "{yes}");
+        }
+        for no in [
+            "who is Bob?",
+            "do you know Ada?",
+            "is Ada coming?",
+            "do you remember me?",
+        ] {
+            assert!(!is_fast_lane(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn the_live_prompt_leak_is_caught() {
+        let note = "[note] Someone you do not know is standing here and has said nothing for a while. You already asked their name and got no answer, so do NOT ask their name again. Say one short thing to draw them in: ask what brings them here, or which class they are in, or what that chair is they have with them. One sentence, no hello.";
+        let ins = instruction_part(note);
+        for leak in [
+            "You already asked their name and got no answer, so do NOT ask their name again.",
+            "Say one short thing to draw them in:",
+            "ask what brings them here, or which class they are in, or what that chair is they have with them.",
+            "One sentence, no hello.",
+        ] {
+            assert!(
+                echoes_prompt(leak, &ins) || is_fragment_line(leak),
+                "{leak}"
+            );
+        }
+        assert!(is_fragment_line("says:"));
+        assert!(!echoes_prompt("What brings you here today?", &ins));
+        let plain = instruction_part(PLAIN_PROMPT);
+        assert!(!echoes_prompt(
+            "I don't have that; the office can help.",
+            &plain
+        ));
+        assert!(!echoes_prompt(
+            "Narendra Modi is the Prime Minister of India.",
+            &plain
+        ));
+    }
+
+    #[test]
+    fn asr_fragments_are_not_parroted() {
+        for f in ["Most meetings.", "We'll", "Yeah. Yeah.", "Then you can"] {
+            assert!(is_fragment(f), "{f}");
+        }
+        for ok in ["I'm sad", "what is 2+2", "I like cricket", "tell me a joke"] {
+            assert!(!is_fragment(ok), "{ok}");
+        }
+        assert!(parrots("Most meetings what?", "Most meetings."));
+        assert!(parrots("Yeah what?", "Yeah. Yeah."));
+        assert!(parrots("I don't know what we'll.", "We'll"));
+        assert!(parrots("I don't know what you can then.", "Then you can"));
+        assert!(!parrots(
+            "Paris is the capital of France.",
+            "what is the capital of France"
+        ));
+    }
+}
+#[cfg(test)]
+mod speakable_tests {
+    use super::speakable;
+
+    #[test]
+    fn cleans_markdown_emoji_tags_and_tokens() {
+        assert_eq!(
+            speakable("**Hi Asha!** \u{1F60A} [note] secret <|im_end|>", 24).as_deref(),
+            Some("Hi Asha! secret")
+        );
+        assert_eq!(
+            speakable("- Glad you came!\n- See you", 24).as_deref(),
+            Some("Glad you came! See you")
+        );
+        assert_eq!(
+            speakable("# Nice to [meet](http://x) you", 24).as_deref(),
+            Some("Nice to meet you")
+        );
+    }
+
+    #[test]
+    fn empty_foreign_and_long_lines() {
+        assert_eq!(speakable("", 24), None);
+        assert_eq!(speakable("   \u{1F60A}\u{1F389} ", 24), None);
+        assert_eq!(speakable("<think>hmm</think>", 24), None);
+        assert_eq!(
+            speakable("\u{4F60}\u{597D}\u{FF0C}\u{5F88}\u{9AD8}\u{5174}", 24),
+            None
+        );
+        let long = "One two three four five six seven eight nine ten eleven twelve \
+                    thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty \
+                    twentyone twentytwo twentythree twentyfour twentyfive twentysix";
+        let s = speakable(long, 24).unwrap_or_default();
+        assert!(s.split_whitespace().count() <= 25, "{s}");
+        assert_eq!(
+            speakable("That's lovely. Tell me more. What else? And more.", 24).as_deref(),
+            Some("That's lovely. Tell me more.")
+        );
     }
 }

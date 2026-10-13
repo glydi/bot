@@ -1,0 +1,32 @@
+# GLYDI: where we stopped
+
+2026-10-13: everything is committed on `jetson-ready` as a green baseline
+(fmt, clippy -D warnings, tests). Never `git stash` in this checkout.
+
+## Live and working
+- Camera on Windows; single-person focus; face recognition (Kalyan, Sony enrolled); enrol from photo: `glydi people --enrol NAME --image a.jpg`.
+- People-first conversation: model understands (qwen2.5:3b JSON), code decides; people graph with relations; facts add/update/delete.
+- Replies worded by the model (not canned); answer cache off; no volunteered facts; no unprompted small talk.
+- Greets only someone who looks at it for 1.5 s; time-of-day greeting and "haven't seen you for N days".
+- Everyday answers (time, date, sums, spelling); big-knowledge questions go to the hand-off line.
+- Parakeet speech on GPU; mic gain 4; speech threshold 0.5; end-of-turn 700 ms; voice af_heart at 0.85.
+
+## Baseline 2026-10-13: done, and switched off until tried on the robot
+1. Done: think-while-speaking (first sentence said while the model streams; test passes).
+   Off: the "Mm," acknowledgement when the model is slow, `GLYDI_THINK_ACK=1` (in simulate.py it became the whole first line).
+2. Done: model failure/garbage mid-turn gives a short line; mic reconnect and camera reopen with backoff (tests).
+   Still open: soak test on the robot (`scripts/soak.py`); stronger model comparison (qwen2.5:7b, qwen3:4b-instruct) within 1.5 s.
+3. Written, OFF by default: noise suppression `GLYDI_DENOISE=rnnoise`; lip gate `GLYDI_LIP_GATE=1`
+   (2d106det mouth movement of the focused face); distance/level gate `GLYDI_LEVEL_GATE_DB=12`. Try on the robot, then decide defaults.
+4. Written, OFF by default: dynamic end-of-turn `GLYDI_TURN_EARLY_MS=220` (smart-turn asked after a short pause).
+5. simulate.py on the baseline: 13 gaps (return-visit check-in question, sibling recall, "Nice to meet you" wording,
+   forget_me, visitor_adult name/out-of-zone, staff_member name, fact update "bank"->"hospital", "is my son here").
+
+## Next
+6. Name fixing after hearing (snap "Stork"/"Connie" to known names).
+7. Collect real voice clips (GLYDI_SAVE_UTTERANCES=1, with consent) and rerun the Parakeet vs Whisper test.
+8. Retrain the understander on logged intents; fix "sister" stored as "sibling".
+9. ERP: create the robot account (`scripts/erp-robot-account.py --admin <email>`), set GLYDI_ERP_* in .env; decide what ERP data the robot uses (people, classes, relations).
+10. erp.xulo.in straight-to-login: built on branch `erp-root-login` (worktree C:\Users\user\erp-root-login); not shipped. erp.xulo.in is Pages project `school-erp-d1`.
+11. xulo.in website: remove xulo.in/www from Cloudflare Pages project `xulo-site`, add the GitHub Pages DNS records, then enforce HTTPS. New screenshots still pending.
+13. Jetson: build the CUDA/TensorRT onnxruntime on the board; `deploy/jetson/install.sh`.

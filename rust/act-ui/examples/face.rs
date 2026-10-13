@@ -318,6 +318,8 @@ fn synthetic_preview(t: f32) -> common::Preview {
             score: 0.87,
             track: 3,
             engaged: true,
+            focused: false,
+            waving: false,
         },
         common::PreviewFace {
             x: 0.62,
@@ -328,6 +330,8 @@ fn synthetic_preview(t: f32) -> common::Preview {
             score: 0.71,
             track: 4,
             engaged: false,
+            focused: false,
+            waving: false,
         },
     ];
     for face in &faces {

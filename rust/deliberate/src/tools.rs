@@ -96,6 +96,52 @@ pub trait FactSource: Send + Sync {
         Vec::new()
     }
 
+    /// The people graph (see [`crate::people`]): record that `a` is
+    /// `relation` of the person called `b_name`, creating them by name if
+    /// nobody is. Returns `b`'s id. A conflicting current edge between the
+    /// pair is closed, not overwritten. The default keeps no graph.
+    fn relate_people(
+        &self,
+        a: &EntityId,
+        relation: &crate::people::Relation,
+        b_name: &str,
+        source: &str,
+        confidence: f32,
+    ) -> Option<EntityId> {
+        let _ = (a, relation, b_name, source, confidence);
+        None
+    }
+
+    /// Current edges of `entity`, from its side, inverses derived.
+    fn edges(&self, entity: &EntityId) -> Vec<crate::people::Edge> {
+        let _ = entity;
+        Vec::new()
+    }
+
+    /// The display name of `entity`.
+    fn name_of(&self, entity: &EntityId) -> Option<String> {
+        let _ = entity;
+        None
+    }
+
+    /// When `entity` was last seen, unix seconds.
+    fn last_seen(&self, entity: &EntityId) -> Option<f64> {
+        let _ = entity;
+        None
+    }
+
+    /// When `entity` was seen on the visit before this one, unix seconds.
+    fn previous_visit(&self, entity: &EntityId) -> Option<f64> {
+        let _ = entity;
+        None
+    }
+
+    /// Delete one held fact (exact text). `false` if it was not held.
+    fn forget_fact(&self, entity: &EntityId, fact: &str) -> bool {
+        let _ = (entity, fact);
+        false
+    }
+
     /// Keep a reminder for `entity`, due at `due_at` (unix seconds).
     /// Returns its id. The default has nowhere to keep it.
     fn remind(&self, entity: &EntityId, text: &str, due_at: f64) -> Result<i64, String> {
@@ -148,6 +194,9 @@ pub struct Reminder {
 pub struct InMemoryFacts {
     facts: Mutex<HashMap<EntityId, Vec<String>>>,
     reminders: Mutex<Vec<Reminder>>,
+    names: Mutex<HashMap<EntityId, String>>,
+    seen: Mutex<HashMap<EntityId, f64>>,
+    graph: Mutex<crate::people::Graph>,
 }
 
 impl InMemoryFacts {
@@ -155,9 +204,103 @@ impl InMemoryFacts {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A person known by name (tests): their id is `person:<lower name>`.
+    pub fn add_person(&self, name: &str) -> EntityId {
+        let id = EntityId::new(format!("person:{}", name.trim().to_lowercase()));
+        self.names.lock().insert(id.clone(), name.trim().to_owned());
+        id
+    }
+
+    /// Mark `entity` seen at `at` (unix seconds; tests).
+    pub fn saw(&self, entity: &EntityId, at: f64) {
+        self.seen.lock().insert(entity.clone(), at);
+    }
 }
 
 impl FactSource for InMemoryFacts {
+    fn resolve_name(&self, name: &str) -> Option<EntityId> {
+        self.names
+            .lock()
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+            .map(|(id, _)| id.clone())
+    }
+
+    fn everyone(&self) -> Vec<(EntityId, String)> {
+        let mut v: Vec<(EntityId, String)> = self
+            .names
+            .lock()
+            .iter()
+            .map(|(i, n)| (i.clone(), n.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    fn remember_name(&self, speaker: Option<&EntityId>, name: &str) -> Result<EntityId, String> {
+        if let Some(id) = self.resolve_name(name) {
+            return Ok(id);
+        }
+        // A known speaker renamed keeps their id.
+        if let Some(s) = speaker.filter(|s| !s.is_track())
+            && self.names.lock().contains_key(s)
+        {
+            self.names.lock().insert(s.clone(), name.trim().to_owned());
+            return Ok(s.clone());
+        }
+        Ok(self.add_person(name))
+    }
+
+    fn forget(&self, entity: &EntityId) -> bool {
+        let had = self.names.lock().remove(entity).is_some();
+        self.facts.lock().remove(entity);
+        self.graph.lock().forget(entity);
+        had
+    }
+
+    fn relate_people(
+        &self,
+        a: &EntityId,
+        relation: &crate::people::Relation,
+        b_name: &str,
+        source: &str,
+        confidence: f32,
+    ) -> Option<EntityId> {
+        let b = self
+            .resolve_name(b_name)
+            .unwrap_or_else(|| self.add_person(b_name));
+        self.graph
+            .lock()
+            .relate(a, relation.clone(), &b, source, confidence, unix_now());
+        Some(b)
+    }
+
+    fn edges(&self, entity: &EntityId) -> Vec<crate::people::Edge> {
+        let names = self.names.lock().clone();
+        self.graph.lock().current(entity, |id| {
+            names.get(id).cloned().unwrap_or_else(|| id.to_string())
+        })
+    }
+
+    fn name_of(&self, entity: &EntityId) -> Option<String> {
+        self.names.lock().get(entity).cloned()
+    }
+
+    fn last_seen(&self, entity: &EntityId) -> Option<f64> {
+        self.seen.lock().get(entity).copied()
+    }
+
+    fn forget_fact(&self, entity: &EntityId, fact: &str) -> bool {
+        let mut all = self.facts.lock();
+        let Some(v) = all.get_mut(entity) else {
+            return false;
+        };
+        let n = v.len();
+        v.retain(|f| f != fact);
+        v.len() != n
+    }
+
     fn recall(&self, entity: &EntityId) -> Vec<String> {
         self.facts.lock().get(entity).cloned().unwrap_or_default()
     }
@@ -1442,8 +1585,9 @@ mod tests {
     fn hook_tools_fail_softly_without_a_gallery() {
         let tools = Tools::new(Arc::new(InMemoryFacts::new()));
         let view = room(vec![person("john", true)]);
+        // The in-memory source keeps names now (the people graph needs them).
         let r = tools.invoke(REMEMBER_NAME, &json!({"name": "Ada"}), &view);
-        assert_eq!(r["status"], "failed");
+        assert_ne!(r["status"], "failed");
         let r = tools.invoke(FORGET_PERSON, &json!({"name": "john"}), &view);
         assert_eq!(r["status"], "failed");
         // remember_fact is the reference name for remember.

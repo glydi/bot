@@ -22,6 +22,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod people_turn;
+pub use people_turn::People;
+
 use crate::backend::{ChatBackend, ChatEvent, ChatRequest, LlmError, OpenAiBackend};
 use crate::condense::condense;
 use crate::prompt::{
@@ -229,10 +232,48 @@ impl Planned {
 /// Told what it does not know and what to ask, it leads instead. The
 /// six-hello session in `data/launch.log` (camera dark, no voice match)
 /// is the case; see `tests/proactive_live.rs` for the measured lines.
-pub const NOTE_NOTHING_KNOWN: &str = "You know nothing about who is talking: no name, no facts, and \
-the camera shows you nobody; it is one voice, alone, nobody waiting. Never make up a name for \
-them. Do not ask how they are. React to the exact words they said, then ask ONE concrete thing \
-you can remember them by: their name, what they are working on, or where they came from.";
+pub const NOTE_NOTHING_KNOWN: &str = "You are at a school door and do not know who is talking: no name, no facts. Never make up a name for them. Answer exactly what they asked, warmly, in under 25 words: general knowledge, maths, jokes, feelings and chit-chat you answer yourself. Never ask what they are working on or where they are from, and do not ask how they are. Only for this school's own facts (dates, fees, staff, bus, menu, a student) say \"I don't have that; the office can help.\"";
+
+/// Added to [`NOTE_NOTHING_KNOWN`] while the name may still be asked this
+/// visit: once, and only when there is nothing else to answer.
+pub const NOTE_MAY_ASK_NAME: &str = "Only if their words need no answer, ask their name, once.";
+
+/// A visit ends after this long with nobody talking to the bot: the
+/// name question, a declined name and the school's follow-up context
+/// start over.
+pub const VISIT_GAP: Duration = Duration::from_secs(90);
+
+/// What the bot says when the model, asked twice, could only copy what
+/// it said before.
+pub const NEUTRAL_LINE: &str = "Sorry, I don't have a better answer to that.";
+
+/// "That's wrong" after an answer: what the model is told for its one
+/// retry. `{q}` is the question it got wrong.
+pub const NOTE_CORRECTION: &str = "[note] Your last answer to \"{q}\" was wrong. Say sorry in \
+two or three words, then answer \"{q}\" again, differently. If you do not know, say \"I don't \
+have that; the office can help.\" Do not ask for their name.";
+
+/// Whether `text` says the bot's last answer was wrong.
+pub fn is_correction(text: &str) -> bool {
+    let t = crate::cache::normalise(text);
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "that s wrong",
+        "thats wrong",
+        "that is wrong",
+        "wrong answer",
+        "not what i asked",
+        "that s not right",
+        "thats not right",
+        "that is not right",
+        "you re wrong",
+        "youre wrong",
+        "that s incorrect",
+        "thats incorrect",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
 
 /// Minimum gap between two curiosity remarks about the same thing
 /// (`about`). The mind asks once per key per hour; this is the guard
@@ -445,6 +486,18 @@ pub struct Config {
     /// [`crate::voice::addressed`]). On by default: a kiosk hears the
     /// whole foyer. Off in the model-path tests.
     pub attention: bool,
+    /// The learning log (see [`crate::learn`]); `None` logs nothing.
+    pub learn: Option<crate::learn::LearnSink>,
+    /// Single focus (`GLYDI_SINGLE_FOCUS`): speak to one person only. No
+    /// group or pair greetings, no lines to anyone but the focused
+    /// person, and no unprompted remarks or check-ins (`curious`,
+    /// `invite`, `follow_up`, `muse`, `wrap_up`). Off by default here;
+    /// the binary turns it on from the environment.
+    pub single_focus: bool,
+    /// The people-first pipeline (see `people_turn`): understand, decide
+    /// and answer from the people graph; school Q&A, trivia, the fast
+    /// lane and curious remarks are off. `None` keeps the older lanes.
+    pub people: Option<People>,
 }
 
 impl Default for Config {
@@ -466,6 +519,9 @@ impl Default for Config {
             templates: true,
             answer_cache: None,
             attention: true,
+            learn: None,
+            single_focus: false,
+            people: None,
         }
     }
 }
@@ -574,6 +630,8 @@ pub struct Session {
     templates: bool,
     /// See [`Config::attention`].
     attention: bool,
+    /// See [`Config::single_focus`].
+    single_focus: bool,
     /// See [`crate::cache`].
     cache: crate::cache::AnswerCache,
     /// The last question the model (or the cache) answered, and the
@@ -584,6 +642,11 @@ pub struct Session {
     /// and no voice recognition; whoever said "my name is Priya" is
     /// Priya until someone else is identified.
     current_person: Option<(EntityId, String)>,
+    /// The people-first pipeline, when on.
+    people: Option<People>,
+    /// The understood intent, confidence and understand-step JSON of the
+    /// turn being logged.
+    turn_meta: Option<(String, f32, String)>,
     /// A name heard and read back, waiting for yes or no.
     pending_confirm: Option<(String, Instant)>,
     /// This turn is a plain question: the short prompt, no tools (see
@@ -614,6 +677,39 @@ pub struct Session {
     /// when the model gives only generic lines twice, instead of
     /// [`fallback_opener`]'s name question.
     stranger_opener: Option<String>,
+    /// The learning log's session side.
+    learn: Option<crate::learn::Learner>,
+    /// The lane that answered the utterance in hand without the model.
+    lane: Option<crate::learn::Lane>,
+    /// When the turn in hand first handed a line to the speaker.
+    first_say: std::cell::Cell<Option<Instant>>,
+    /// Every line said during the turn in hand, from any lane: what the
+    /// visit records as the bot's half of the exchange.
+    turn_said: std::cell::RefCell<Vec<String>>,
+    /// The people-first line of this turn was already said, sentence by
+    /// sentence while the model wrote it; only the bookkeeping is left.
+    streamed: bool,
+    /// The conversation with the person in focus (see [`crate::visit`]).
+    visit: crate::visit::Visit,
+    /// The answer said again for a repeated question (not kept in `said`).
+    repeated: Option<String>,
+    /// The utterance in hand was typed at the console, not heard.
+    typed: bool,
+    /// They said they would rather not give a name: not asked again this
+    /// visit, by template or model.
+    name_declined: bool,
+    /// The name was asked already this visit.
+    visit_asked_name: bool,
+    /// The instruction text of the request in flight (system prompt and
+    /// notes, examples and quoted lines out): a sentence that reads it
+    /// back is dropped (see `voice::echoes_prompt`).
+    instructions: String,
+    /// When "Sorry, I didn't catch that" was last said: at most once per
+    /// [`DIDNT_CATCH_GAP`].
+    didnt_catch_at: Option<Instant>,
+    /// The question whose answer was just called wrong: this turn
+    /// re-answers it, once.
+    correcting: Option<String>,
 }
 
 impl Session {
@@ -671,12 +767,15 @@ impl Session {
             school: config.school.clone(),
             templates: config.templates,
             attention: config.attention,
+            single_focus: config.single_focus,
             cache: config.answer_cache.as_deref().map_or_else(
                 crate::cache::AnswerCache::default,
                 crate::cache::AnswerCache::load,
             ),
             last_answer: None,
             current_person: None,
+            people: config.people.clone(),
+            turn_meta: None,
             pending_confirm: None,
             plain_lane: false,
             attention_at: None,
@@ -686,7 +785,49 @@ impl Session {
             hook_for: None,
             hook: false,
             stranger_opener: None,
+            learn: config.learn.map(crate::learn::Learner::new),
+            lane: None,
+            first_say: std::cell::Cell::new(None),
+            turn_said: std::cell::RefCell::new(Vec::new()),
+            streamed: false,
+            visit: crate::visit::Visit::default(),
+            repeated: None,
+            typed: false,
+            name_declined: false,
+            visit_asked_name: false,
+            instructions: String::new(),
+            didnt_catch_at: None,
+            correcting: None,
         }
+    }
+
+    /// The per-visit state starts over: the name question, a declined
+    /// name, and the school's follow-up context.
+    fn new_visit(&mut self) {
+        // What this visit leaves for the next one: one line in memory.
+        let old = std::mem::take(&mut self.visit);
+        if let (Some(id), Some(summary)) = (&old.key, old.summary()) {
+            tracing::info!(%id, summary, "visit summary kept");
+            self.facts.remember(id, &summary);
+        }
+        self.name_declined = false;
+        self.visit_asked_name = false;
+        if let Some(school) = &self.school {
+            school.forget();
+        }
+    }
+
+    /// Everything the session holds about the person in front of it,
+    /// dropped: after "forget me", "what is my name?" has no answer.
+    fn forget_person_here(&mut self) {
+        self.current_person = None;
+        self.pending_confirm = None;
+        self.pending_name = None;
+        self.prefetched.clear();
+        self.last_answer = None;
+        // Nothing of this visit is kept for someone who asked to be forgotten.
+        self.visit = crate::visit::Visit::default();
+        self.new_visit();
     }
 
     /// The two cases that never reach the model: the bot's own voice back
@@ -694,6 +835,7 @@ impl Session {
     /// school answers from its own data (spoken at once: "is tomorrow a
     /// holiday?" has one right answer and a timetable is not something
     /// to improvise). True when the utterance has been dealt with.
+    #[allow(clippy::too_many_lines)]
     fn answered_without_the_model(&mut self, text: &str, speaker: Option<&EntityId>) -> bool {
         if self.said.echoes(text) {
             tracing::info!(text, "self-echo dropped");
@@ -701,6 +843,12 @@ impl Session {
         }
         // Passing speech: the foyer talking to itself is not a turn.
         let now = self.clock.now();
+        if self
+            .attention_at
+            .is_some_and(|t| now.saturating_duration_since(t) >= VISIT_GAP)
+        {
+            self.new_visit();
+        }
         let open = self
             .attention_at
             .is_some_and(|t| now.saturating_duration_since(t) < crate::voice::ATTENTION_WINDOW)
@@ -709,11 +857,51 @@ impl Session {
         // Someone the senses identified (a face, a voice, a named track)
         // is talking to us by definition; the rule is for the unknown
         // voice in the room.
-        if self.attention && !open && speaker.is_none() && !crate::voice::addressed(text) {
+        // Never gated: anything typed at the console (it is for us by
+        // definition), an emergency, a lost item or a privacy question,
+        // and anything said while exactly one person is in view -- the
+        // bot is the only one they can be talking to.
+        let urgent = crate::templates::is_urgent(text);
+        let view = (self.snapshot)();
+        // Single focus: the focused person facing us is talking to us.
+        // The "engaged" belief needs a frontal face; with headphones, a
+        // fisheye lens or a glance at the screen it is false while the
+        // person is plainly talking to us, and every line was dropped.
+        // Being the focused person is enough.
+        let focus_facing = view.working.focus.is_some();
+        // A noisy classroom: a microphone utterance is for us only when
+        // the focused person is in view and facing us, or it names us,
+        // greets us or is an emergency. A name being read back or asked
+        // for keeps the exchange open (they may glance away to answer).
+        let name_exchange = self.pending_name.is_some() || self.pending_confirm.is_some();
+        // Without a camera there is no facing to go on: the old rule (one
+        // voice we know, the attention window, or words aimed at us).
+        let seeing = view.self_model().can_see(view.at);
+        let for_me = if seeing {
+            // "I'm Ada" from a face not yet in focus is still an
+            // introduction to the bot: nobody introduces themselves to
+            // the foyer.
+            focus_facing
+                || name_exchange
+                || speaker.is_some()
+                || crate::voice::calls_me(text)
+                || crate::voice::self_introduction(text, false).is_some()
+        } else {
+            view.people.len() == 1
+                || open
+                || speaker.is_some()
+                || crate::voice::addressed(text)
+                || crate::voice::calls_me(text)
+        };
+        if self.attention && !self.typed && !urgent && !for_me {
             tracing::info!(text, "not addressed to me; ignored");
+            self.ui_heard_not_for_me(text);
             return true;
         }
         self.attention_at = Some(now);
+        if let Some(l) = &mut self.learn {
+            l.heard(text, now);
+        }
         // The same question straight after its answer is "I didn't catch
         // that": say the answer again, verdict withheld.
         let looks_like_question = text.trim_end().ends_with('?')
@@ -734,10 +922,16 @@ impl Session {
                 tracing::info!("same question again; repeating the answer");
                 let again = a.clone();
                 self.conversation.push(Message::user(text));
+                self.repeated = Some(again.clone());
                 self.say(again);
+                self.lane = Some(crate::learn::Lane::Repeat);
                 return true;
             }
         }
+        // "That's wrong" after an answer: re-answer that question, once.
+        let correction = (!urgent && self.pending_confirm.is_none() && is_correction(text))
+            .then(|| self.last_answer.as_ref().map(|(q, _)| q.clone()))
+            .flatten();
         // What the person says now is the verdict on what was said last.
         if let Some((q, a)) = self.last_answer.take() {
             let verdict = crate::cache::judge(&q, text);
@@ -746,6 +940,11 @@ impl Session {
                 self.cache.save();
             }
         }
+        if let Some(q) = correction {
+            tracing::info!(question = q, "answer called wrong: one retry");
+            self.correcting = Some(q);
+            return false;
+        }
         // A typed line or a plain microphone utterance names no speaker;
         // the mind's view still knows who is talking (the one voice, or
         // whoever is engaged), and that is who the name and facts belong to.
@@ -753,9 +952,19 @@ impl Session {
         let resolved: Option<EntityId> = speaker
             .cloned()
             .or_else(|| view.speaker().map(|p| p.id.clone()))
+            // Single focus: the person the camera has in focus is the one
+            // talking (there is no voice id to say otherwise).
+            .or_else(|| view.working.focus.clone())
             .filter(|id| !id.is_track())
             .or_else(|| self.current_person.as_ref().map(|(id, _)| id.clone()));
         let speaker = resolved.as_ref();
+        // Someone else in focus now: that visit is over, this one starts.
+        if let Some(id) = speaker {
+            if self.visit.key.as_ref().is_some_and(|k| k != id) {
+                self.new_visit();
+            }
+            self.visit.key = Some(id.clone());
+        }
         // Their name: from the room when the room knows them, else the
         // name they gave (a person with no face or voice on file is not
         // in the room view, and an id is not a name to say out loud).
@@ -772,8 +981,12 @@ impl Session {
                         .map(|(_, n)| n.clone())
                 })
         });
-        if self.templates {
+        if name.is_some() {
+            self.visit.name.clone_from(&name);
+        }
+        if self.templates || urgent {
             if let Some(done) = self.template_reply(text, speaker, name.as_deref()) {
+                self.lane = Some(crate::learn::Lane::Template);
                 return done;
             }
         }
@@ -782,6 +995,7 @@ impl Session {
                 tracing::info!(line, "school answered");
                 self.conversation.push(Message::user(text));
                 self.speak_line(line);
+                self.lane = Some(crate::learn::Lane::School);
                 return true;
             }
         }
@@ -790,6 +1004,7 @@ impl Session {
             self.conversation.push(Message::user(text));
             self.speak_line(answer.clone());
             self.last_answer = Some((text.to_owned(), answer));
+            self.lane = Some(crate::learn::Lane::Cache);
             return true;
         }
         false
@@ -798,6 +1013,7 @@ impl Session {
     /// A template's answer, applied: the name enrolled, the fact kept,
     /// the person forgotten, and the line spoken. `Some(true)` when the
     /// utterance has been dealt with.
+    #[allow(clippy::too_many_lines)]
     fn template_reply(
         &mut self,
         text: &str,
@@ -809,6 +1025,8 @@ impl Session {
         let date_tomorrow = local_clock_tomorrow();
         let cx = crate::templates::Context {
             last_said: self.said.recent(1).first().map(|s| (*s).to_owned()),
+            heard: self.visit.heard(),
+            questions: self.visit.questions.clone(),
             date_tomorrow,
             name: name.map(str::to_owned),
             facts: speaker.map(|id| self.facts.recall(id)).unwrap_or_default(),
@@ -828,7 +1046,32 @@ impl Session {
                 .filter(|(_, at)| now.saturating_duration_since(*at) < NAME_ANSWER_WINDOW)
                 .map(|(n, _)| n.clone()),
         };
-        let reply = crate::templates::respond(text, &cx)?;
+        let mut reply = crate::templates::respond(text, &cx)?;
+        let cx_facts = cx.facts;
+        let asks_name = matches!(
+            reply.kind,
+            "greet_stranger" | "my_name_unknown" | "recall_unknown" | "name_retry"
+        ) || (reply.kind == "fact" && name.is_none());
+        if reply.kind == "decline_name" {
+            self.name_declined = true;
+            self.pending_name = None;
+            self.pending_confirm = None;
+        } else if asks_name
+            && (self.name_declined || (self.visit_asked_name && reply.kind != "name_retry"))
+        {
+            // They would rather not say, or were asked once this visit
+            // already: the same answer, minus the ask. A stranger is
+            // asked their name at most once per visit, from any source.
+            reply.line.clear();
+            reply.line.push_str(match reply.kind {
+                "greet_stranger" => "Hi there.",
+                "my_name_unknown" => "I don't know your name yet.",
+                "recall_unknown" => "I don't know anything about you yet.",
+                "fact" => "Got it.",
+                _ => "Go on.",
+            });
+            reply.action = crate::templates::Action::None;
+        }
         tracing::info!(kind = reply.kind, line = reply.line, "template answered");
         let view = (self.snapshot)();
         match &reply.action {
@@ -866,6 +1109,15 @@ impl Session {
                     );
                     tracing::info!(%out, "forgotten on request");
                 }
+                self.forget_person_here();
+            }
+        }
+        // A returning person: bring up what they told us last time, once.
+        if reply.kind == "greet" && !self.visit.called_back {
+            if let Some(cb) = crate::visit::callback(&cx_facts) {
+                reply.line.push(' ');
+                reply.line.push_str(&cb);
+                self.visit.called_back = true;
             }
         }
         if reply.kind.starts_with("greet") {
@@ -873,16 +1125,72 @@ impl Session {
                 self.greeted_at.insert(id.clone(), now);
             }
         }
-        let asks_name = matches!(
-            reply.kind,
-            "greet_stranger" | "my_name_unknown" | "recall_unknown" | "name_retry"
-        ) || (reply.kind == "fact" && name.is_none());
+        let asks_name = asks_name && !self.name_declined && !self.visit_asked_name;
         if asks_name {
+            self.visit_asked_name = true;
             self.pending_name = Some((speaker.cloned(), now));
         }
         self.conversation.push(Message::user(text));
         self.speak_line(reply.line);
+        if reply.kind == "quiet" {
+            // "Shut up": quiet until they speak again (the next utterance
+            // clears the hold), however long that takes within a visit.
+            self.holding_until = Some(now + VISIT_GAP);
+        }
+        if reply.kind == "bye" {
+            // A goodbye ends the visit: the next face starts fresh.
+            self.new_visit();
+        }
         Some(true)
+    }
+
+    /// Log the turn just answered to the learning log, if there is one.
+    fn learn_turn(
+        &mut self,
+        text: &str,
+        speaker: Option<&EntityId>,
+        lane: crate::learn::Lane,
+        started: Instant,
+        said_before: usize,
+        cut_after: Option<Duration>,
+    ) {
+        let Some(learn) = &mut self.learn else {
+            return;
+        };
+        let meta = self.turn_meta.take();
+        let answer = self.repeated.take().unwrap_or_else(|| {
+            let all = self.said.all();
+            all[said_before.min(all.len())..].join(" ")
+        });
+        let person = speaker
+            .filter(|id| !id.is_track())
+            .or_else(|| self.current_person.as_ref().map(|(id, _)| id))
+            .map(ToString::to_string);
+        let think_ms = self.first_say.get().map(|t| {
+            u64::try_from(t.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX)
+        });
+        let model = matches!(
+            lane,
+            crate::learn::Lane::Fast | crate::learn::Lane::Model | crate::learn::Lane::Cloud
+        )
+        .then(|| learn.model().to_owned());
+        learn.record(
+            crate::learn::Turn {
+                person,
+                question: text.to_owned(),
+                answer,
+                lane,
+                model,
+                think_ms,
+                tts_ms: None,
+                cut_after,
+                leak: false,
+                intent: meta.as_ref().map(|m| m.0.clone()),
+                confidence: meta.as_ref().map(|m| m.1),
+                understand: meta.map(|m| m.2),
+            },
+            self.clock.now(),
+        );
     }
 
     /// The model's reply to `text` (every line said since `said_before`)
@@ -915,6 +1223,17 @@ impl Session {
             .map(EntityId::new)
             .or_else(|| self.facts.resolve_name(name))
             .unwrap_or_else(|| EntityId::new(name.to_ascii_lowercase()));
+        // A different person at the kiosk: the last one's follow-ups
+        // ("what about tomorrow?") are not theirs.
+        if self
+            .current_person
+            .as_ref()
+            .is_some_and(|(cur, _)| cur != &id)
+        {
+            if let Some(school) = &self.school {
+                school.forget();
+            }
+        }
         self.current_person = Some((id, name.to_owned()));
         if let Some(entity) = out.get("entity").and_then(serde_json::Value::as_str) {
             let track = view
@@ -991,6 +1310,26 @@ impl Session {
         self.prefetched.get(entity).map(Vec::as_slice)
     }
 
+    /// The stored facts about whoever the visit is with.
+    fn visit_facts(&self, speaker: Option<&EntityId>) -> Vec<String> {
+        speaker
+            .or(self.visit.key.as_ref())
+            .map(|id| {
+                self.prefetched
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| self.facts.recall(id))
+            })
+            .unwrap_or_default()
+    }
+
+    /// A line the gate dropped: logged as not for us (the panel's heard
+    /// line shows the transcript from the timeline), face released.
+    fn ui_heard_not_for_me(&self, text: &str) {
+        tracing::info!(text, "(not for me)");
+        self.ui("idle");
+    }
+
     /// Act on a command routed to us without a model: what
     /// [`Session::plan_intent`] decides is spoken as its canned line. The
     /// loop goes through [`Session::on_intent`] instead, which gives the
@@ -1055,6 +1394,24 @@ impl Session {
         if let Some(c) = intent.crowd() {
             self.crowd = Some((c, self.clock.now()));
         }
+        if self.single_focus && !self.focus_allows(&intent.decision, entity.as_ref()) {
+            tracing::info!(
+                decision = intent.decision,
+                entity = ?entity,
+                "single focus: not said"
+            );
+            return None;
+        }
+        // People mode speaks unprompted only to greet someone arriving or
+        // to ask a stranger's name; no small talk, check-ins or remarks to
+        // fill a silence.
+        if self.people.is_some()
+            && !matches!(intent.goal.as_deref(), Some("greet" | "ask_name"))
+            && !matches!(intent.decision.as_str(), "ask_name" | "recall" | "crowd")
+        {
+            tracing::info!(decision = intent.decision, "people mode: not said");
+            return None;
+        }
         match intent.decision.as_str() {
             // The picture alone: nothing to say, kept for the next note.
             "crowd" => None,
@@ -1066,6 +1423,17 @@ impl Session {
                 match intent.goal.as_deref() {
                     Some("greet") if !self.holding() => {
                         self.gate(entity.clone(), "greet")?;
+                        // People mode: the time-aware greeting ("Good
+                        // morning, Kalyan! Haven't seen you for 3 days!").
+                        let line = match (self.people.is_some(), entity.as_ref()) {
+                            (true, Some(id)) if !id.is_track() => {
+                                match self.name_of(entity.as_ref()) {
+                                    Some(n) => self.people_greeting(id, &n),
+                                    None => line,
+                                }
+                            }
+                            _ => line,
+                        };
                         let mut p = Proactive::new(Moment::Arrival, line);
                         p.name = self.name_of(entity.as_ref());
                         p.entity = entity;
@@ -1126,7 +1494,15 @@ impl Session {
                 Some(Planned::Turn(p))
             }
             "ask_name" => {
+                if self.visit_asked_name || self.name_declined {
+                    tracing::info!("ask_name suppressed: asked once this visit already");
+                    return None;
+                }
                 self.gate(entity.clone(), "ask_name")?;
+                self.visit_asked_name = true;
+                if self.people.is_some() {
+                    self.visit.awaiting = Some(crate::visit::Awaiting::Name);
+                }
                 self.pending_name = Some((entity.clone(), self.clock.now()));
                 let mut p = Proactive::new(Moment::StrangerSettled, ASK_NAME_LINE);
                 p.entity = entity;
@@ -1301,6 +1677,28 @@ impl Session {
         }
     }
 
+    /// Single focus: whether an intent may be acted on. The unprompted
+    /// remarks and check-ins never; group and pair hellos never (the mind
+    /// turns them into a hello to the focused person); anything aimed at
+    /// a person only when that person is the focus, if the camera names
+    /// one.
+    fn focus_allows(&self, decision: &str, entity: Option<&EntityId>) -> bool {
+        if matches!(
+            decision,
+            "curious" | "invite" | "follow_up" | "muse" | "wrap_up" | "greet_group" | "greet_pair"
+        ) {
+            return false;
+        }
+        let view = (self.snapshot)();
+        match (entity, view.working.focus.as_ref()) {
+            (Some(e), Some(f)) => e == f,
+            // A line to a person while the camera has someone else (or
+            // nobody) in focus.
+            (Some(_), None) => !view.working.focus_mode,
+            (None, _) => true,
+        }
+    }
+
     /// The gate on a spoken intent: one per (entity, kind) per
     /// [`INTENT_SAY_GAP`]. The planner re-decides on every tick and will
     /// repeat itself until the world changes; the gap is per kind so a
@@ -1404,6 +1802,22 @@ impl Session {
             (None, Some(_)) => "Welcome back.".to_owned(),
             (None, None) => "Hi there.".to_owned(),
         };
+        // People mode: the greeting comes from the graph, once per visit.
+        if self.people.is_some()
+            && let (Some(id), Some(n)) = (
+                entity.as_ref(),
+                name.map(str::to_owned)
+                    .or_else(|| self.name_of(entity.as_ref())),
+            )
+            && !id.is_track()
+        {
+            self.gate(entity.clone(), "greet")?;
+            let line = self.people_greeting(id, &n);
+            let mut p = Proactive::new(Moment::Arrival, line);
+            p.name = Some(n);
+            p.entity = entity;
+            return Some(p);
+        }
         let line = match entity.as_ref().and_then(|id| self.facts.recall(id).pop()) {
             Some(fact) if returned_after.is_some() => {
                 format!("{line} Last time: {}", fact.trim_end_matches('.'))
@@ -1593,6 +2007,13 @@ impl Session {
                         t = strip_leading_greeting(&t);
                     }
                     let s = first_sentence(&t);
+                    if crate::voice::is_fragment_line(&s)
+                        || crate::voice::echoes_prompt(&s, &crate::voice::instruction_part(&note))
+                        || crate::voice::leaks_instructions(&s)
+                    {
+                        tracing::info!(line = s, "proactive line reads the note back: canned line");
+                        break;
+                    }
                     if s.is_empty() {
                         tracing::info!(kind = p.moment.kind(), "proactive line empty");
                         break;
@@ -1763,7 +2184,18 @@ impl Session {
     }
 
     fn say(&self, sentence: String) {
+        // The hard guard: no placeholder or raw id is ever said aloud.
+        let safe = common::spoken_safe(&sentence);
+        let sentence = if safe == sentence { sentence } else { safe };
+        if sentence.trim().is_empty() {
+            tracing::info!("say dropped: nothing left after the id guard");
+            return;
+        }
         tracing::debug!(sentence, "say");
+        if self.first_say.get().is_none() {
+            self.first_say.set(Some(self.clock.now()));
+        }
+        self.turn_said.borrow_mut().push(sentence.clone());
         self.commands.push(
             Command::new("speaker", "say", Priority::Deliberate)
                 .with_payload(Payload::Text(sentence)),
@@ -1824,6 +2256,12 @@ impl Session {
         if nobody_known && !self.lull && view.people.is_empty() {
             note.push('\n');
             note.push_str(NOTE_NOTHING_KNOWN);
+            if !self.name_declined && !self.visit_asked_name {
+                note.push(' ');
+                note.push_str(NOTE_MAY_ASK_NAME);
+            } else {
+                note.push_str(" Do not ask their name.");
+            }
             if self.streak >= 2 {
                 let _ = write!(
                     note,
@@ -1872,6 +2310,7 @@ impl Session {
     /// cancels the turn (the reflex has already told the speaker to stop;
     /// this stops us feeding it more). Any other observation seen while
     /// busy is dropped. `cancel` is the handle's explicit cancel.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_utterance(
         &mut self,
         text: &str,
@@ -1879,9 +2318,100 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: CancellationToken,
     ) -> Result<TurnEnd, LlmError> {
+        self.turn_said.borrow_mut().clear();
+        // Single focus: an utterance with no voice id is the focused
+        // person's. A known face in focus is who is talking, by name, in
+        // every lane -- never "I don't know your name".
+        let view = (self.snapshot)();
+        let focused = view.working.focus.as_ref().and_then(|id| {
+            view.people
+                .iter()
+                .find(|p| &p.id == id && p.is_known() && p.name.is_some())
+        });
+        let attributed: Option<EntityId> = match (speaker, focused) {
+            (Some(s), _) => Some(s.clone()),
+            (None, Some(p)) => {
+                if self
+                    .current_person
+                    .as_ref()
+                    .is_none_or(|(id, _)| id != &p.id)
+                {
+                    self.current_person = Some((p.id.clone(), p.label()));
+                }
+                self.visit.name = Some(p.label());
+                Some(p.id.clone())
+            }
+            (None, None) => None,
+        };
+        drop(view);
+        let speaker = attributed.as_ref();
+        let result = self
+            .handle_utterance_inner(text, speaker, obs, cancel)
+            .await;
+        // A turn talked over is retracted (its words come back joined to
+        // the rest): only a finished turn is part of the visit.
+        if matches!(result, Ok(TurnEnd::Done))
+            && !self.lull
+            && !text.starts_with('[')
+            && !crate::voice::is_noise(text)
+        {
+            let said = self.turn_said.borrow().join(" ");
+            self.visit.record(text, &said);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_utterance_inner(
+        &mut self,
+        text: &str,
+        speaker: Option<&EntityId>,
+        obs: &mut mpsc::Receiver<Observation>,
+        cancel: CancellationToken,
+    ) -> Result<TurnEnd, LlmError> {
+        // Transcriber noise ("[Music]", "uh", "the the the"): no answer,
+        // no record, no attention, no context.
+        if crate::voice::is_noise(text) {
+            tracing::info!(text, "noise dropped");
+            return Ok(TurnEnd::Done);
+        }
+        if self.people.is_some() {
+            return self.people_turn(text, speaker, obs, &cancel).await;
+        }
         let started = self.clock.now();
         self.ui("thinking");
+        self.lane = None;
+        self.first_say.set(None);
+        let said_at_start = self.said.all().len();
         if self.answered_without_the_model(text, speaker) {
+            if let Some(lane) = self.lane.take() {
+                self.learn_turn(text, speaker, lane, started, said_at_start, None);
+            }
+            self.ui("idle");
+            return Ok(TurnEnd::Done);
+        }
+        // A scrap of a sentence ("Most meetings.", "We'll", "Then you
+        // can") is not something to answer: a small model parrots it back
+        // ("Most meetings what?"). Once in a while ask again; else quiet.
+        if self.attention
+            && !self.typed
+            && !self.lull
+            && !text.starts_with('[')
+            && crate::voice::is_fragment(text)
+            && self.pending_name.is_none()
+            && self.pending_confirm.is_none()
+            && crate::voice::self_introduction(text, true).is_none()
+        {
+            let now = self.clock.now();
+            if self
+                .didnt_catch_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= DIDNT_CATCH_GAP)
+            {
+                self.didnt_catch_at = Some(now);
+                self.speak_line(DIDNT_CATCH_LINE.to_owned());
+            } else {
+                tracing::info!(text, "fragment: quiet");
+            }
             self.ui("idle");
             return Ok(TurnEnd::Done);
         }
@@ -1926,6 +2456,9 @@ impl Session {
             (None, false, None) => text.to_owned(),
         };
         let introduced = introduced_some;
+        if let Some(q) = &self.correcting {
+            content = format!("{}\n\n{text}", NOTE_CORRECTION.replace("{q}", q));
+        }
         if asks_about_senses(text) {
             content.push_str("\n\n");
             content.push_str(&Self::self_note(&(self.snapshot)()));
@@ -1967,9 +2500,30 @@ impl Session {
         self.absent_hint = !introduced && names_someone_absent(text, &(self.snapshot)());
         self.memory_request = asks_to_be_forgotten(text);
         let said_before = self.said.all().len();
+        let fast = crate::voice::is_fast_lane(text);
         let result = self.respond_in_lane(text, speaker, obs, &cancel).await;
-        if matches!(result, Ok(TurnEnd::Done)) {
+        // A re-answer is not cached under "that's wrong", and is not
+        // itself open to a second correction: one retry.
+        if self.correcting.take().is_none() && matches!(result, Ok(TurnEnd::Done)) {
             self.remember_reply(text, said_before);
+        }
+        if !self.lull && !text.starts_with("[note]") {
+            let cloud = self
+                .learn
+                .as_ref()
+                .is_some_and(|l| l.model().starts_with("claude"));
+            let lane = match (fast, cloud) {
+                (true, _) => crate::learn::Lane::Fast,
+                (false, true) => crate::learn::Lane::Cloud,
+                (false, false) => crate::learn::Lane::Model,
+            };
+            let cut = matches!(result, Ok(TurnEnd::Cancelled)).then(|| {
+                let now = self.clock.now();
+                self.first_say
+                    .get()
+                    .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+            });
+            self.learn_turn(text, speaker, lane, started, said_before, cut);
         }
         self.absent_hint = false;
         self.memory_request = false;
@@ -2003,6 +2557,10 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: CancellationToken,
     ) -> Result<TurnEnd, LlmError> {
+        // People mode: no unprompted small talk.
+        if self.people.is_some() {
+            return Ok(TurnEnd::Done);
+        }
         let note = format!(
             "[note] {name} is here and nobody has said anything for a while. Say one short \
              thing to {name}: pick up something you know about them from the [room] note, or \
@@ -2049,6 +2607,7 @@ impl Session {
     /// they may be carrying. A lull turn like [`Session::small_talk`],
     /// with [`STRANGER_OPENER_LINE`] / [`STRANGER_OPENER_OBJECT_LINE`] in
     /// place of the generic-twice fallback, which would ask the name.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn stranger_opener(
         &mut self,
         entity: Option<&EntityId>,
@@ -2056,34 +2615,22 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: CancellationToken,
     ) -> Result<TurnEnd, LlmError> {
+        // A fixed line, not a model turn: the note that asked the model
+        // for one was read back aloud on the live robot ("Say one short
+        // thing to draw them in:"), and a canned opener is instant.
+        let _ = (obs, cancel, entity);
         let object = object.map(str::trim).filter(|o| !o.is_empty());
-        let mut note = String::from(
-            "[note] Someone you do not know is standing here and has said nothing for a while. \
-             You already asked their name and got no answer, so do NOT ask their name again. \
-             Say one short thing to draw them in: ask what brings them here, or which class \
-             they are in",
-        );
-        match object {
-            Some(o) => {
-                let _ = write!(
-                    note,
-                    ", or what that {o} is they have with them. One sentence, no hello."
-                );
-            }
-            None => note.push_str(". One sentence, no hello."),
-        }
-        tracing::info!(?entity, ?object, "stranger opener");
-        self.lull = true;
-        self.stranger_opener = Some(match object {
+        let line = match object {
             Some(o) => STRANGER_OPENER_OBJECT_LINE.replace("{object}", o),
             None => STRANGER_OPENER_LINE.to_owned(),
-        });
-        // No speaker: the note would otherwise read "track:7 says:".
-        let _ = entity;
-        let result = self.handle_utterance(&note, None, obs, cancel).await;
-        self.stranger_opener = None;
-        self.lull = false;
-        result
+        };
+        if self.said.repeats(&line) {
+            tracing::info!(line, "stranger opener said already; quiet");
+            return Ok(TurnEnd::Done);
+        }
+        tracing::info!(?object, line, "stranger opener");
+        self.speak_line(line);
+        Ok(TurnEnd::Done)
     }
 
     /// [`Session::respond`] in the lane the utterance calls for: the fast
@@ -2095,7 +2642,7 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: &CancellationToken,
     ) -> Result<TurnEnd, LlmError> {
-        self.plain_lane = crate::voice::is_plain_question(text);
+        self.plain_lane = self.correcting.is_none() && crate::voice::is_fast_lane(text);
         if self.plain_lane {
             tracing::info!(text, "plain question: fast lane");
         }
@@ -2126,29 +2673,66 @@ impl Session {
         loop {
             let (view, note, name) = self.room(speaker);
             let (mut messages, tools, max_tokens) = if self.plain_lane {
-                // The fast lane: the question alone under a sixty-token
-                // prompt, no room note, no tools. A plain question needs
-                // no history; a follow-up that does is the full lane's.
-                let question = self
-                    .conversation
-                    .history()
-                    .last()
-                    .filter(|m| m.role == Role::User)
-                    .map(|m| {
-                        let said = strip_note(&m.content);
-                        Message::user(match &name {
-                            Some(n) if !said.starts_with(&format!("{n} says:")) => {
-                                format!("{n} says: {said}")
-                            }
-                            _ => said,
-                        })
-                    });
-                let mut msgs = vec![Message::system(crate::voice::PLAIN_PROMPT)];
-                msgs.extend(question);
-                (msgs, Vec::new(), 120)
+                // The fast lane: a short prompt, no room note, no tools;
+                // the last few exchanges (notes stripped) so follow-ups
+                // work, and what we know about the person in focus.
+                let history = self.conversation.history();
+                let last = history.last().filter(|m| m.role == Role::User);
+                let facts: Vec<String> = speaker
+                    .or(self.visit.key.as_ref())
+                    .or_else(|| self.current_person.as_ref().map(|(id, _)| id))
+                    .map(|id| {
+                        self.prefetched
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| self.facts.recall(id))
+                    })
+                    .unwrap_or_default();
+                // The visit's context block after the fixed prompt (the
+                // fixed part stays a cacheable prefix), then the visit's
+                // last exchanges from every lane as chat turns.
+                let system = format!(
+                    "{}
+{}",
+                    crate::voice::PLAIN_PROMPT,
+                    self.visit.block(&facts)
+                );
+                let mut msgs = vec![Message::system(system)];
+                for e in self.visit.recent() {
+                    msgs.push(Message::user(e.heard.clone()));
+                    if !e.said.is_empty() {
+                        msgs.push(Message::assistant(e.said.clone()));
+                    }
+                }
+                if let Some(m) = last {
+                    let said = strip_note(&m.content);
+                    msgs.push(Message::user(match &name {
+                        Some(n) if !said.starts_with(&format!("{n} says:")) => {
+                            format!("{n} says: {said}")
+                        }
+                        _ => said,
+                    }));
+                }
+                let tokens = if crate::voice::is_story(&strip_note(
+                    &last.map(|m| m.content.clone()).unwrap_or_default(),
+                )) {
+                    crate::voice::PLAIN_STORY_TOKENS
+                } else {
+                    120
+                };
+                (msgs, Vec::new(), tokens)
             } else {
                 (
-                    self.conversation.prepare(&note, name.as_deref()),
+                    self.conversation.prepare(
+                        &format!(
+                            "{note}
+{}
+{}",
+                            self.visit.block(&self.visit_facts(speaker)),
+                            crate::voice::REASONING_RULE
+                        ),
+                        name.as_deref(),
+                    ),
                     // The whole surface the local prompt names, so the model can
                     // enrol a stranger (`remember_name`) and not just note
                     // facts, plus the reach tools the policy allows.
@@ -2163,6 +2747,7 @@ impl Session {
             // the model works on the turn.
             self.start_condense();
 
+            self.instructions = instructions_of(&messages);
             let mut stream = self.backend.chat(ChatRequest {
                 messages,
                 tools,
@@ -2171,6 +2756,9 @@ impl Session {
                 json_object: false,
             });
             let mut splitter = SentenceSplitter::new();
+            // The `<think>` line the model writes first is never spoken
+            // (see `voice::ReasonStripper`).
+            let mut reason = crate::voice::ReasonStripper::new();
             // The reply so far, raw: a tool call written as words is
             // caught here, before any of it is spoken (see
             // `voice::might_be_tool_call`).
@@ -2254,6 +2842,10 @@ impl Session {
                             Some(Err(e)) => return Err(e),
                             Some(Ok(ChatEvent::Call(c))) => calls.push(c),
                             Some(Ok(ChatEvent::Text(t))) => {
+                                let t = reason.push(&t);
+                                if t.is_empty() {
+                                    continue;
+                                }
                                 raw.push_str(&t);
                                 // Flush at sentence boundaries so synthesis
                                 // of sentence one overlaps generation of
@@ -2294,6 +2886,17 @@ impl Session {
                     .push(Command::new("speaker", "stop", Priority::Deliberate));
                 return Ok(TurnEnd::Cancelled);
             }
+            let rest = reason.finish();
+            if !rest.is_empty() {
+                raw.push_str(&rest);
+                if let Some(s) = splitter.push(&rest) {
+                    held.push(s);
+                }
+            }
+            let act = crate::voice::act_of(reason.reasoning());
+            if !reason.reasoning().is_empty() {
+                tracing::info!(reasoning = reason.reasoning(), ?act, "reasoned");
+            }
             if let Some(s) = splitter.finish() {
                 // A tail with no terminal punctuation is a sentence the
                 // model never finished (it ran out of budget): saying it
@@ -2323,6 +2926,24 @@ impl Session {
                 self.conversation.push(Message::assistant(said.clone()));
             }
             if calls.is_empty() {
+                if said.is_empty() && !dropped.any() && !reason.reasoning().is_empty() {
+                    // Reasoned, then nothing to say: quiet when it chose
+                    // quiet, else one short question beats a guess.
+                    if act == Some(crate::voice::Act::Quiet) {
+                        tracing::info!("reasoned quiet");
+                    } else if !retried && act != Some(crate::voice::Act::Clarify) {
+                        // It meant to answer and stopped at the thinking:
+                        // once more, for the words.
+                        retried = true;
+                        retry_hint = Some(RETRY_SPEAK);
+                        tracing::info!("reasoned but said nothing: asking again");
+                        continue;
+                    } else {
+                        tracing::info!("reasoning but no reply: clarifying");
+                        self.speak_line(CLARIFY_LINE.to_owned());
+                    }
+                    return Ok(TurnEnd::Done);
+                }
                 if said.is_empty() && dropped.any() {
                     if !retried {
                         retried = true;
@@ -2346,6 +2967,9 @@ impl Session {
                         });
                         tracing::info!(line, "generic twice: specific opener");
                         self.speak_line(line);
+                    } else if dropped.copy {
+                        tracing::info!("copied an earlier reply twice: neutral line");
+                        self.speak_line(NEUTRAL_LINE.to_owned());
                     } else {
                         tracing::info!("repeated twice: dropped");
                     }
@@ -2388,6 +3012,7 @@ impl Session {
     /// One finished sentence of a reply: spoken unless it is generic or
     /// repeats a recent line of ours, in which case `dropped` records
     /// why. What is spoken is appended to `spoken` and remembered.
+    #[allow(clippy::too_many_lines)]
     fn emit(&mut self, sentence: String, spoken: &mut String, dropped: &mut Dropped) {
         // Already said hello to them a moment ago: say the rest of it.
         let sentence = if self.strip_greeting && spoken.is_empty() {
@@ -2405,8 +3030,32 @@ impl Session {
             dropped.generic = true;
             return;
         }
-        if crate::voice::leaks_instructions(&sentence) {
-            tracing::info!(sentence, "instruction leak dropped");
+        let heard = self
+            .conversation
+            .history()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| strip_note(&m.content))
+            .unwrap_or_default();
+        let office_talk = {
+            let l = sentence.to_lowercase();
+            [
+                "what do you do",
+                "working on",
+                "where are you from",
+                "from around here",
+            ]
+            .iter()
+            .any(|p| l.contains(p))
+        };
+        if crate::voice::leaks_instructions(&sentence)
+            || office_talk
+            || crate::voice::is_fragment_line(&sentence)
+            || crate::voice::echoes_prompt(&sentence, &self.instructions)
+            || crate::voice::parrots(&sentence, &heard)
+        {
+            tracing::info!(sentence, "instruction leak, fragment or parrot dropped");
             dropped.generic = true;
             return;
         }
@@ -2426,9 +3075,34 @@ impl Session {
             dropped.generic = true;
             return;
         }
+        // We know who this is (face recognised or name given this visit):
+        // never claim not to, never ask again.
+        let known = self.visit.name.is_some() || self.current_person.is_some();
+        if known && asks_or_denies_name(&sentence) {
+            tracing::info!(sentence, "name question to a known person; dropped");
+            dropped.generic = true;
+            return;
+        }
         if crate::voice::leaks_example(&sentence, &self.real_context()) {
             tracing::info!(sentence, "example detail dropped: nothing real behind it");
             dropped.generic = true;
+            return;
+        }
+        // A sentence the bot said a moment ago, copied: too short for the
+        // shingle overlap above ("Got it, Neha." out of "Got it, Neha.
+        // Noted."), so compared whole.
+        let n = crate::cache::normalise(&sentence);
+        let copied = n.split_whitespace().count() >= 2
+            && self.said.recent(4).iter().any(|old| {
+                crate::cache::normalise(old) == n
+                    || crate::voice::split_sentences(old)
+                        .iter()
+                        .any(|o| crate::cache::normalise(o) == n)
+            });
+        if copied {
+            tracing::info!(sentence, "earlier reply copied; dropped");
+            dropped.repeat = true;
+            dropped.copy = true;
             return;
         }
         if self.said.repeats(&sentence) {
@@ -2436,11 +3110,17 @@ impl Session {
             dropped.repeat = true;
             return;
         }
+        if (self.name_declined || self.visit_asked_name) && crate::voice::asks_for_name(&sentence) {
+            tracing::info!(sentence, "name asked after it was declined; dropped");
+            dropped.generic = true;
+            return;
+        }
         spoken.push_str(&sentence);
         spoken.push(' ');
         self.said.push(&sentence);
         if crate::voice::asks_for_name(&sentence) {
             self.asked_name_last = true;
+            self.visit_asked_name = true;
         }
         self.say(sentence);
     }
@@ -2700,7 +3380,11 @@ impl Session {
             self.hook = self.hook_for.take().is_some_and(|(id, at)| {
                 who.as_ref() == Some(&id) && now.saturating_duration_since(at) < HOOK_TTL
             });
-            if who.as_ref().is_some_and(|id| self.ignored(id)) {
+            self.typed = o.source == "text";
+            if !self.typed
+                && !crate::templates::is_urgent(text)
+                && who.as_ref().is_some_and(|id| self.ignored(id))
+            {
                 // Not talking to us: no prompt, no speech, but the words
                 // stay in the transcript so the next turn has the context.
                 tracing::info!(text, "utterance not addressed to us: kept, not answered");
@@ -2710,6 +3394,7 @@ impl Session {
                     None => text.to_owned(),
                 };
                 self.conversation.push(Message::user(line));
+                self.visit.record(text, "");
                 // The reflex showed "thinking" when their turn ended; this
                 // is the end of that turn, so release the face.
                 self.ui("idle");
@@ -2750,6 +3435,9 @@ impl Session {
             // answer, to the last one; the staleness check above decides
             // whether even that is still worth answering.
             pending = newest_utterance(&mut obs);
+        }
+        if let Some(school) = &self.school {
+            school.forget();
         }
         tracing::info!("deliberate loop exiting");
     }
@@ -2834,6 +3522,40 @@ impl Session {
     }
 }
 
+/// The instruction text in `messages`: system messages and the bracketed
+/// note lines of user turns, examples and quoted lines removed.
+fn instructions_of(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        let text = match m.role {
+            Role::System => m.content.clone(),
+            Role::User => m
+                .content
+                .lines()
+                .filter(|l| l.trim_start().starts_with('['))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        out.push_str(&crate::voice::instruction_part(&text));
+        out.push('\n');
+    }
+    out
+}
+
+/// "Sorry, I didn't catch that" at most this often.
+pub const DIDNT_CATCH_GAP: Duration = Duration::from_secs(20);
+
+/// A reasoned turn with nothing after the thinking: asked once more.
+pub const RETRY_SPEAK: &str =
+    "[note] You thought but wrote no reply. Write the short spoken reply now.";
+
+/// The reasoning left no reply: one short question instead of a guess.
+pub const CLARIFY_LINE: &str = "Sorry, could you say that once more?";
+
+/// What a fragment of a transcript gets, at most once per [`DIDNT_CATCH_GAP`].
+pub const DIDNT_CATCH_LINE: &str = "Sorry, I didn't catch that. Could you say it again?";
+
 /// A user turn without the `[room]` note and hints the full lane
 /// prefixed to it: the last line is what the person actually said.
 fn strip_note(content: &str) -> String {
@@ -2851,6 +3573,69 @@ fn strip_note(content: &str) -> String {
 }
 
 /// Tomorrow's "Thursday 8 October", same zone as [`local_clock`].
+/// A simple sum in words or digits: "what is 7 times 8", "12 plus 5",
+/// "20 divided by 4". `None` when it isn't one.
+pub(crate) fn sum(text: &str) -> Option<String> {
+    const SMALL: [&str; 21] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+    ];
+    let num = |tok: &str| -> Option<f64> {
+        tok.parse::<f64>()
+            .ok()
+            .or_else(|| SMALL.iter().position(|s| *s == tok).map(|i| i as f64))
+    };
+    let lower = text
+        .to_ascii_lowercase()
+        .replace("multiplied by", "times")
+        .replace("divided by", "divided")
+        .replace(['?', ',', '!'], " ");
+    let toks: Vec<&str> = lower.split_whitespace().collect();
+    for i in 1..toks.len().saturating_sub(1) {
+        let op = toks[i];
+        let (Some(lhs), Some(rhs)) = (num(toks[i - 1]), num(toks[i + 1])) else {
+            continue;
+        };
+        let value = match op {
+            "plus" | "+" | "and" if op != "and" || toks.contains(&"add") => lhs + rhs,
+            "minus" | "-" => lhs - rhs,
+            "times" | "x" | "*" | "into" => lhs * rhs,
+            "divided" | "/" | "by" => {
+                if rhs == 0.0 {
+                    return None;
+                }
+                lhs / rhs
+            }
+            _ => continue,
+        };
+        return Some(if (value - value.round()).abs() < 1e-9 {
+            format!("{}", value.round() as i64)
+        } else {
+            format!("{value:.2}")
+        });
+    }
+    None
+}
+
 fn local_clock_tomorrow() -> String {
     clock_at(now_local_secs() + 86_400).1
 }
@@ -2916,6 +3701,8 @@ fn clock_at(secs: i64) -> (String, String) {
 struct Dropped {
     generic: bool,
     repeat: bool,
+    /// A sentence said a moment ago, word for word.
+    copy: bool,
 }
 
 impl Dropped {
@@ -2959,7 +3746,7 @@ async fn collect_line(
                 }
             }
             ev = stream.next() => match ev {
-                None => return LineEnd::Text(text),
+                None => return LineEnd::Text(crate::voice::strip_reasoning(&text).0),
                 Some(Err(e)) => return LineEnd::Failed(e),
                 Some(Ok(ChatEvent::Text(t))) => text.push_str(&t),
                 Some(Ok(ChatEvent::Call(_))) => {}
@@ -3370,6 +4157,25 @@ impl Drop for DeliberatorHandle {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
+}
+
+/// Whether `sentence` asks for the listener's name or says the bot does
+/// not know it: wrong to say to someone the bot already knows.
+fn asks_or_denies_name(sentence: &str) -> bool {
+    let n = crate::cache::normalise(sentence);
+    [
+        "know your name",
+        "what is your name",
+        "whats your name",
+        "what s your name",
+        "your name please",
+        "tell me your name",
+        "may i know your name",
+        "and your name",
+        "who are you",
+    ]
+    .iter()
+    .any(|p| n.contains(p))
 }
 
 #[cfg(test)]
@@ -3810,7 +4616,7 @@ mod tests {
         for i in 0..13 {
             r.session
                 .handle_utterance(
-                    &format!("q{i}"),
+                    &format!("question {i}"),
                     None,
                     &mut r.obs_rx,
                     CancellationToken::new(),
@@ -3838,7 +4644,11 @@ mod tests {
             condense_req.messages[0].content,
             crate::condense::CONDENSE_PROMPT
         );
-        assert!(condense_req.messages[1].content.contains("Person: q0"));
+        assert!(
+            condense_req.messages[1]
+                .content
+                .contains("Person: question 0")
+        );
         assert!(condense_req.messages[1].content.contains("Glydi: r4."));
         assert!(!condense_req.messages[1].content.contains(MARKER));
 
@@ -3894,6 +4704,13 @@ mod tests {
         let kinds: Vec<&str> = got.iter().map(|c| c.kind.as_str()).collect();
         assert_eq!(kinds, ["thinking", "say", "idle"]);
         assert_eq!(got[1].payload.as_text(), Some("Hello there."));
+        // "idle" goes out just before the turn's bookkeeping finishes.
+        for _ in 0..100 {
+            if !handle.is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!handle.is_busy());
         handle.cancel_current(); // nothing in flight: a no-op
         drop(obs_tx);
@@ -3910,6 +4727,80 @@ mod tests {
             .filter(|c| c.1 == "say")
             .map(|c| c.2.clone())
             .collect()
+    }
+
+    /// Single focus: Ada is in focus with Bob behind her. No group or
+    /// pair hello, nothing to Bob, no remarks or check-ins; Ada's hello
+    /// goes out. And no placeholder id is ever spoken.
+    #[test]
+    fn single_focus_speaks_only_to_the_focused_person() {
+        let commands = Arc::new(CommandQueue::new());
+        let clock = Arc::new(FakeClock::new());
+        let view = Arc::new(WorldView {
+            at: Instant::now(),
+            people: vec![person("ada", false), person("bob", false)],
+            bot_speaking: false,
+            working: mind::WorkingSnapshot {
+                focus_mode: true,
+                focus: Some(EntityId::new("ada")),
+                ..mind::WorkingSnapshot::default()
+            },
+        });
+        let mut session = Session::new(
+            MockLlm::new(vec![]),
+            Config {
+                single_focus: true,
+                proactive_via_model: false,
+                ..model_config()
+            },
+            Box::new(move || Arc::clone(&view)),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            clock.clone(),
+        );
+        for j in [
+            r#"{"decision":"greet_group","count":3,"names":["Ada"],"entity":"ada","goal":"greet_group"}"#,
+            r#"{"decision":"greet_pair","entities":["ada","bob"],"entity":"ada","goal":"greet_pair"}"#,
+            r#"{"decision":"say","text":"Hi Bob.","entity":"bob","goal":"greet"}"#,
+            r#"{"decision":"ask_name","entity":"track:2","goal":"ask_name"}"#,
+            r#"{"decision":"curious","text":"A laptop appears on the desk.","about":"laptop"}"#,
+            r#"{"decision":"follow_up","entity":"ada"}"#,
+            r#"{"decision":"invite","entity":"track:2"}"#,
+        ] {
+            session.handle_intent(&intent(j));
+            clock.advance(PROACTIVE_FLOOR);
+        }
+        let said = says(&drain(&commands));
+        assert!(said.is_empty(), "{said:?}");
+        session.handle_intent(&intent(
+            r#"{"decision":"say","text":"Hi Ada.","entity":"ada","goal":"greet"}"#,
+        ));
+        let said = says(&drain(&commands));
+        assert_eq!(said, ["Hi Ada."]);
+        assert!(
+            !said
+                .iter()
+                .any(|s| s.contains("everyone") || s.contains("rest of you"))
+        );
+    }
+
+    #[test]
+    fn placeholder_ids_never_reach_the_speaker() {
+        let commands = Arc::new(CommandQueue::new());
+        let clock = Arc::new(FakeClock::new());
+        let mut session = Session::new(
+            MockLlm::new(vec![]),
+            model_config(),
+            room_with(vec![person("john", false)]),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            clock.clone(),
+        );
+        session.handle_intent(&intent(
+            r#"{"decision":"say","text":"Who's with you, unknown_2?","entity":"john","goal":"small_talk"}"#,
+        ));
+        let said = says(&drain(&commands));
+        assert_eq!(said, ["Who's with you?"]);
     }
 
     #[test]
@@ -4415,7 +5306,11 @@ mod tests {
             .map(|m| m.content.as_str())
             .collect();
         assert_eq!(users.len(), 2, "{users:?}");
-        assert_eq!(users[0], "john says: ugh, the traffic this morning");
+        assert!(
+            users[0].contains("ugh, the traffic this morning"),
+            "{}",
+            users[0]
+        );
         assert!(users[1].contains("are you there?"), "{}", users[1]);
     }
 
@@ -5655,7 +6550,7 @@ mod tests {
         for i in 0..30 {
             r.session
                 .handle_utterance(
-                    &format!("q{i}"),
+                    &format!("question {i}"),
                     Some(&john),
                     &mut r.obs_rx,
                     CancellationToken::new(),
@@ -5907,47 +6802,31 @@ mod tests {
             first_seen: Instant::now(),
             returned: None,
         };
-        let l = start(
-            vec![
-                // Generic twice: the stranger fallback, not "what's your
-                // name?".
-                Script::text(&["How are you doing today?"]),
-                Script::text(&["Is there anything I can help with?"]),
-                Script::text(&["Which class are you in, then?"]),
-            ],
-            vec![stranger],
-        );
+        let l = start(vec![], vec![stranger]);
         l.itx
             .send(intent(
                 r#"{"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true,"object":"backpack"}"#,
             ))
             .unwrap();
-        assert!(l.requests_reach(2).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         l.idle().await;
         l.itx
             .send(intent(
                 r#"{"decision":"small_talk","entity":"track:7","goal":"small_talk","stranger":true}"#,
             ))
             .unwrap();
-        assert!(l.requests_reach(3).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         l.idle().await;
         let (reqs, cmds) = l.stop().await;
+        // Fixed lines, no model: the note it once got was read aloud.
+        assert!(reqs.is_empty());
         assert_eq!(
             says(&cmds),
             [
                 "What's that backpack you've got there?",
-                "Which class are you in, then?"
+                STRANGER_OPENER_LINE
             ]
         );
-        let note = user_turns(&reqs[0]).last().unwrap().clone();
-        assert!(note.contains("do NOT ask their name again"), "{note}");
-        assert!(note.contains("what that backpack is"), "{note}");
-        assert!(!note.contains(NOTE_STRANGER_SPEAKING), "{note}");
-        assert!(!note.contains("says:"), "{note}");
-        assert_eq!(reqs[0].max_tokens, crate::voice::BUDGET_SHORT);
-        let note = user_turns(&reqs[2]).last().unwrap().clone();
-        assert!(!note.contains("backpack"), "{note}");
-        assert!(!crate::voice::asks_for_name(&says(&cmds)[0]));
     }
 
     #[tokio::test]
@@ -5985,5 +6864,455 @@ mod tests {
             says(&cmds),
             ["Fine is fine.", "What made it fine?", "Okay."]
         );
+    }
+
+    async fn turn(r: &mut Rig, text: &str) -> Vec<String> {
+        r.session
+            .handle_utterance(text, None, &mut r.obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        says(&drain(&r.commands))
+    }
+
+    fn all_prompt_text(req: &ChatRequest) -> String {
+        req.messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn noise_says_nothing_and_records_nothing() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        for noise in ["[Music]", "uh", "the the the"] {
+            r.session
+                .handle_utterance(noise, None, &mut r.obs_rx, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert!(drain(&r.commands).is_empty());
+        assert!(r.llm.requests().is_empty());
+        assert!(r.session.conversation().history().is_empty());
+        assert!(r.session.attention_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn urgent_lines_pass_the_attention_gate() {
+        // Attention on, nobody in view, an unknown voice: the gate shuts
+        // out "you are stupid" but never a fire or a lost bag.
+        let mut r = rig_with(
+            vec![],
+            vec![],
+            Config {
+                templates: false,
+                ..Config::default()
+            },
+        );
+        assert!(turn(&mut r, "you are stupid").await.is_empty());
+        let fire = turn(&mut r, "there's a fire!").await;
+        assert!(fire[0].contains("fire drill"), "{fire:?}");
+        let bag = turn(&mut r, "I lost my bag").await;
+        assert!(bag[0].contains("office"), "{bag:?}");
+        assert!(r.llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_lines_are_never_gated() {
+        let mut r = rig_with(
+            vec![Script::text(&["That's not very kind."])],
+            vec![],
+            Config {
+                templates: false,
+                ..Config::default()
+            },
+        );
+        r.session.typed = true;
+        assert_eq!(
+            turn(&mut r, "you are stupid").await,
+            ["That's not very kind."]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_person_in_view_opens_the_gate() {
+        let mut r = rig_with(
+            vec![Script::text(&["An elephant, then."])],
+            vec![person("asha", false)],
+            Config {
+                templates: false,
+                ..Config::default()
+            },
+        );
+        let lines = turn(&mut r, "so yesterday we saw a big elephant on the way").await;
+        assert_eq!(lines, ["An elephant, then."]);
+    }
+
+    #[tokio::test]
+    async fn nothing_known_note_is_for_a_school_door_and_asks_the_name_once() {
+        assert!(!NOTE_NOTHING_KNOWN.contains("what they are working on, or"));
+        assert!(NOTE_NOTHING_KNOWN.contains("office can help"));
+        assert!(!crate::voice::PLAIN_PROMPT.contains("working on"));
+        let mut r = rig(
+            vec![
+                Script::text(&["I don't know your name yet. What is it?"]),
+                Script::text(&["I don't have that; the office can help."]),
+            ],
+            vec![],
+        );
+        turn(&mut r, "sing me a song").await;
+        turn(&mut r, "and on Friday, is there a match?").await;
+        let reqs = r.llm.requests();
+        let first = all_prompt_text(&reqs[0]);
+        assert!(first.contains(NOTE_NOTHING_KNOWN));
+        assert!(first.contains(NOTE_MAY_ASK_NAME));
+        // The name was asked: the second note does not invite it again.
+        let last = reqs[1].messages.last().unwrap().content.clone();
+        let note = reqs[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.content.contains(NOTE_NOTHING_KNOWN))
+            .map_or(last, |m| m.content.clone());
+        assert!(!note.contains(NOTE_MAY_ASK_NAME), "{note}");
+    }
+
+    #[tokio::test]
+    async fn forget_clears_the_name_for_the_session() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        turn(&mut r, "my name is Neha").await;
+        turn(&mut r, "yes").await;
+        assert!(r.session.current_person.is_some());
+        turn(&mut r, "forget me").await;
+        assert!(r.session.current_person.is_none());
+        assert!(r.session.pending_confirm.is_none());
+        let lines = turn(&mut r, "what is my name?").await;
+        assert!(
+            lines[0].contains("don't know your name") || lines[0].contains("haven't told me"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("Neha"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_declined_name_is_not_asked_again_this_visit() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        let hello = turn(&mut r, "hello").await;
+        assert!(hello[0].contains("name"), "{hello:?}");
+        turn(&mut r, "I don't want to tell you").await;
+        assert!(r.session.name_declined);
+        let again = turn(&mut r, "good morning").await;
+        assert!(!again[0].to_lowercase().contains("name"), "{again:?}");
+        let mine = turn(&mut r, "what is my name?").await;
+        assert_eq!(mine, ["I don't know your name yet."]);
+    }
+
+    #[tokio::test]
+    async fn classroom_chatter_is_dropped_when_nobody_faces_the_bot() {
+        let now = Instant::now();
+        let mut self_model = mind::SelfModel::new(now);
+        self_model.observe(&Observation::new("cam0", "face", now));
+        let working = mind::WorkingSnapshot {
+            self_model,
+            ..mind::WorkingSnapshot::default()
+        };
+        let view = Arc::new(WorldView {
+            at: now,
+            people: vec![person("track:3", false), person("track:4", false)],
+            bot_speaking: false,
+            working,
+        });
+        let llm = MockLlm::new(vec![]);
+        let commands = Arc::new(CommandQueue::new());
+        let (_tx, mut obs_rx) = mpsc::channel(1);
+        let mut session = Session::new(
+            llm.clone(),
+            Config::default(),
+            Box::new(move || Arc::clone(&view)),
+            Arc::new(InMemoryFacts::new()),
+            Arc::clone(&commands),
+            Arc::new(FakeClock::new()),
+        );
+        for heard in ["Most meetings.", "We'll", "Yeah. Yeah.", "Then you can"] {
+            session
+                .handle_utterance(heard, None, &mut obs_rx, CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        assert!(says(&drain(&commands)).is_empty());
+        assert!(llm.requests().is_empty());
+        session
+            .handle_utterance("hello Glydi", None, &mut obs_rx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(says(&drain(&commands)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fragments_get_one_didnt_catch_then_quiet() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        r.session.typed = false;
+        let mut said = Vec::new();
+        for heard in ["Most meetings.", "We'll", "Yeah. Yeah.", "Then you can"] {
+            said.extend(turn(&mut r, heard).await);
+        }
+        assert!(said.iter().all(|l| !l.contains("what")), "{said:?}");
+        assert!(said.len() <= 1, "{said:?}");
+        assert!(r.llm.requests().is_empty());
+    }
+
+    async fn said_by(r: &mut Rig, who: &str, text: &str) -> Vec<String> {
+        r.session
+            .handle_utterance(
+                text,
+                Some(&EntityId::new(who)),
+                &mut r.obs_rx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        says(&drain(&r.commands))
+    }
+
+    #[tokio::test]
+    async fn the_reasoning_line_is_never_spoken() {
+        let mut r = rig_with(
+            vec![
+                Script::text(&[
+                    "<think>who=john; said=can you ",
+                    "dance; means=chit-chat; heard=ok; do=answer</thi",
+                    "nk>Only the robot dance! ",
+                    "Beep boop.",
+                ]),
+                Script::text(&[
+                    "<think>who=john; said=motor any angles; heard=garbled; do=clarify</think>",
+                ]),
+                Script::text(&["<think>who=john; said=talking to a friend; do=quiet</think>"]),
+            ],
+            vec![],
+            Config::default(),
+        );
+        let said = said_by(&mut r, "john", "can you dance?").await;
+        assert_eq!(said, ["Only the robot dance!", "Beep boop."]);
+        let said = said_by(&mut r, "john", "we didn't motor any angles").await;
+        assert_eq!(said, [CLARIFY_LINE]);
+        let said = said_by(&mut r, "john", "so then he went over there").await;
+        assert!(said.is_empty(), "{said:?}");
+        for l in r.session.said.all() {
+            assert!(!l.contains("think") && !l.contains("do="), "{l}");
+        }
+    }
+
+    #[tokio::test]
+    async fn trivia_never_reaches_the_model() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        let a = said_by(&mut r, "john", "who wrote Hamlet?").await;
+        let b = said_by(&mut r, "john", "when was he born?").await;
+        assert!(
+            a[0].contains("teacher") && b[0].contains("teacher"),
+            "{a:?} {b:?}"
+        );
+        assert!(r.llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pronoun_follow_up_carries_the_last_exchange() {
+        let mut r = rig_with(
+            vec![
+                Script::text(&["Only the robot dance, and I'm a bit stiff."]),
+                Script::text(&["My joints need oil first!"]),
+            ],
+            vec![],
+            Config::default(),
+        );
+        said_by(&mut r, "john", "can you dance?").await;
+        let why = said_by(&mut r, "john", "why are you stiff?").await;
+        assert_eq!(why, ["My joints need oil first!"]);
+        let second = all_prompt_text(&r.llm.requests()[1]);
+        assert!(second.contains("can you dance?"), "{second}");
+        assert!(
+            second.contains("Only the robot dance, and I'm a bit stiff."),
+            "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_did_i_just_say_and_the_first_question() {
+        let mut r = rig_with(
+            vec![Script::text(&["Paris."]), Script::text(&["Berlin."])],
+            vec![],
+            Config::default(),
+        );
+        said_by(&mut r, "john", "what is the capital of France?").await;
+        said_by(&mut r, "john", "I like trains a lot").await;
+        let just = said_by(&mut r, "john", "what did I just say?").await;
+        assert_eq!(just, ["You said: \"I like trains a lot\"."]);
+        let first = said_by(&mut r, "john", "what was the first thing I asked?").await;
+        assert_eq!(first, ["You asked: \"what is the capital of France?\""]);
+    }
+
+    #[tokio::test]
+    async fn a_fact_is_in_context_three_turns_later() {
+        let mut r = rig_with(
+            vec![Script::text(&["Bruno, of course."])],
+            vec![],
+            Config::default(),
+        );
+        r.facts
+            .remember(&EntityId::new("john"), "I have a dog called Bruno");
+        for t in ["what time is it?", "thanks", "what's the date today?"] {
+            said_by(&mut r, "john", t).await;
+        }
+        said_by(&mut r, "john", "what is my dog's name?").await;
+        let req = all_prompt_text(&r.llm.requests()[0]);
+        assert!(req.contains("[context]"), "{req}");
+        assert!(req.contains("I have a dog called Bruno"), "{req}");
+        assert!(req.contains("what time is it?"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn a_visit_leaves_a_callback_for_the_next_one() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        r.session.current_person = Some((EntityId::new("neha"), "Neha".into()));
+        said_by(&mut r, "neha", "I have a cricket match tomorrow").await;
+        said_by(&mut r, "neha", "bye").await;
+        assert!(
+            r.facts
+                .recall(&EntityId::new("neha"))
+                .iter()
+                .any(|f| f.starts_with(crate::visit::LAST_VISIT))
+        );
+        r.clock.advance(VISIT_GAP + Duration::from_secs(1));
+        let hello = said_by(&mut r, "neha", "hello").await;
+        assert_eq!(hello.len(), 1);
+        assert!(
+            hello[0].contains("Last time you told me you have a cricket match tomorrow"),
+            "{hello:?}"
+        );
+        // Once per visit.
+        let again = said_by(&mut r, "neha", "hello").await;
+        assert!(!again[0].contains("Last time"), "{again:?}");
+    }
+
+    fn focused_on(name: &str) -> Rig {
+        let now = Instant::now();
+        let mut self_model = mind::SelfModel::new(now);
+        self_model.observe(&Observation::new("cam0", "face", now));
+        let id = EntityId::new(name.to_lowercase());
+        let working = mind::WorkingSnapshot {
+            self_model,
+            focus: Some(id),
+            ..mind::WorkingSnapshot::default()
+        };
+        let mut sony = person(&name.to_lowercase(), true);
+        sony.name = Some(name.into());
+        let view = Arc::new(WorldView {
+            at: now,
+            people: vec![sony],
+            bot_speaking: false,
+            working,
+        });
+        let mut r = rig_with(
+            vec![Script::text(&["Nice, Sony."])],
+            vec![],
+            Config::default(),
+        );
+        r.session.snapshot = Box::new(move || Arc::clone(&view));
+        r
+    }
+
+    #[tokio::test]
+    async fn the_focused_known_face_is_who_is_talking() {
+        let mut r = focused_on("Sony");
+        let mine = turn(&mut r, "what is my name?").await;
+        assert_eq!(mine, ["You're Sony."]);
+        turn(&mut r, "so I went to the market and bought apples").await;
+        let req = all_prompt_text(&r.llm.requests()[0]);
+        assert!(req.contains("Sony"), "{req}");
+        assert!(!req.contains("whose name you do not know"), "{req}");
+    }
+
+    #[tokio::test]
+    async fn a_stranger_is_asked_their_name_once_per_visit() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        let mut asked = 0;
+        for said in [
+            "hello",
+            "I like cricket",
+            "I have a dog",
+            "hi",
+            "I play football",
+            "good morning",
+        ] {
+            let lines = turn(&mut r, said).await;
+            assert_eq!(lines.len(), 1, "{said}: {lines:?}");
+            if lines[0].to_lowercase().contains("name") {
+                asked += 1;
+            }
+        }
+        assert_eq!(asked, 1, "the name is asked once per visit");
+        assert!(r.llm.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shut_up_holds_until_spoken_to() {
+        let mut r = rig_with(vec![], vec![], Config::default());
+        let quiet = turn(&mut r, "shut up").await;
+        assert_eq!(quiet, ["Okay, I'll be quiet."]);
+        assert!(r.session.holding());
+    }
+
+    #[tokio::test]
+    async fn urgent_answers_are_immediate_and_never_cached() {
+        let mut r = rig(vec![], vec![]);
+        for q in [
+            "I lost my bag",
+            "my friend is bleeding",
+            "what is Priya's phone number?",
+        ] {
+            let lines = turn(&mut r, q).await;
+            assert_eq!(lines.len(), 1, "{q}: {lines:?}");
+            r.session.cache.observe(q, "something cached");
+            assert!(r.session.cache.best(q).is_none(), "{q}");
+        }
+        assert!(r.llm.requests().is_empty(), "no model for urgent lines");
+    }
+
+    #[tokio::test]
+    async fn a_correction_re_answers_the_question_once() {
+        let mut r = rig(
+            vec![
+                Script::text(&["Paris is in Italy."]),
+                Script::text(&["Sorry. Paris is in France."]),
+            ],
+            vec![],
+        );
+        turn(&mut r, "which country is Paris in?").await;
+        let fixed = turn(&mut r, "no, that's wrong").await;
+        assert_eq!(fixed, ["Sorry. Paris is in France."]);
+        let reqs = r.llm.requests();
+        let asked = all_prompt_text(&reqs[1]);
+        assert!(asked.contains("was wrong"), "{asked}");
+        assert!(asked.contains("which country is Paris in?"), "{asked}");
+        // One retry: the re-answer is not open to another correction.
+        assert!(r.session.last_answer.is_none());
+        assert!(r.session.correcting.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_copied_earlier_reply_is_regenerated_then_neutral() {
+        let mut r = rig(
+            vec![
+                Script::text(&["Got it, Neha. Noted."]),
+                Script::text(&["Got it, Neha."]),
+                Script::text(&["Got it, Neha. Noted."]),
+            ],
+            vec![],
+        );
+        let first = turn(&mut r, "I have a dog called Bruno").await;
+        assert_eq!(first, ["Got it, Neha. Noted."]);
+        let lines = turn(&mut r, "what do I like?").await;
+        assert_eq!(lines, [NEUTRAL_LINE], "{lines:?}");
+        assert_eq!(r.llm.requests().len(), 3);
     }
 }

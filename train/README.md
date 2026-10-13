@@ -234,3 +234,108 @@ files were not kept), and the Jetson creates it under the name `glydi-1.5b`
 (`deploy/jetson/install.sh`). Earlier runs reported 22 "request failed"
 cases: the evaluator sent tool-call `arguments` as objects in the history
 and Ollama's OpenAI endpoint wants strings (`verify_ollama.wire_messages`).
+
+## Self-improvement
+
+The robot learns from its own turns, offline, with a gate in front of every change.
+
+**The loop.** `rust/deliberate/src/learn.rs` writes every turn to `data/glydi.learn.db`
+(`turns`: question, answer, lane, model, think/tts ms, the last few `{q,a}` of context, and a
+reward in [-1, 1] with the `signals` that made it). `train/selfimprove.py` closes the loop:
+
+    python train/selfimprove.py report --days 7        # lanes, mean reward per lane, worst 20, latency p50/p90/p99
+    python train/selfimprove.py cache [--dry-run]      # fold rewards into data/glydi.answers.json
+    python train/selfimprove.py curate [--dry-run --limit 5] [--cloud-teacher]
+    python train/selfimprove.py train [--dry-run]      # needs >= 200 new SFT examples (SI_MIN_NEW)
+    python train/selfimprove.py gate                   # promote glydi-1.5b-candidate or delete it
+    python train/selfimprove.py rollback               # glydi-1.5b-prev -> glydi-1.5b
+    python train/selfimprove.py nightly                # all of it, locked, logged to train/logs/
+    python -m unittest discover -s train/tests -v
+
+**Reward signals** (learn.rs `score`, summed and clamped): `thanked` +0.5, `followed_up`
++0.3 (a follow-up question that reuses the answer's words), `slow` -0.2 (think time over the
+budget), `cut_off` -0.5 (barge-in soon after the reply started), `repeated` -1 (the same
+question again at once), `corrected` -1 ("no", "that's wrong"), `empty` -1, `leak` -1.
+
+**Cache.** Answers from the `model`/`fast` lanes with mean reward >= 0.3 over >= 2 turns of
+the same normalised question (`cache.rs::normalise`, ported) are raised to the reuse score
+(`REUSE_AFTER`); cached answers whose turns averaged <= -0.5 are lowered, or removed after two
+bad turns. Never cached, because they must stay live: anything mentioning a person's name
+(gallery `persons`, the turn's `person`, the generator's NAMES, "Mr X", "I'm X"), a date or
+time, or a school fact (class, teacher, attendance, timetable, fees, exams, holidays, ...).
+cache.rs itself only excludes template and tool-call turns; these rules are added here. The
+write is atomic with `glydi.answers.json.bak` beside it; the fold is idempotent.
+
+**Curate.** SFT examples from turns with reward >= 0.5 in the generated lanes
+(model/fast/cloud/cache; templates and school lookups are live facts), passed through
+`checks.target_ok`, deduplicated, in `build_dataset.py`'s exact shape (system_short, `[room]`
+note + `<name> says:`, tools on model-lane turns), so they mix with the original set. Names
+are scrubbed to the generator's NAMES (stable per real name). Preference pairs
+(`prompt`/`chosen`/`rejected`) for questions with both a good and a bad answer. For bad turns
+with no good alternative a teacher writes the better reply: local `qwen2.5:3b` with the full
+prompt (`teacher.py`), filtered by `checks.target_ok`. Output:
+`train/data/selfimprove-YYYYMMDD.jsonl` and `selfimprove-pairs-YYYYMMDD.jsonl`; state
+(what has been curated/trained, which adapter is live) in `train/logs/selfimprove-state.json`.
+
+**Train.** New examples plus a replay sample of `data/train.jsonl` (3 per new one, against
+forgetting) are staged in `train/selfimprove-run/data/` and `train_cuda.py` runs with
+`RESUME_FROM=<live adapter>` (first time `adapters-1b5-tools`, the shipped glydi-1.5b),
+LR 2e-5, TOOL_WEIGHT 3, into `adapters-1b5-si-<stamp>`; `export_cuda.py` imports it as
+`glydi-1.5b-candidate`.
+
+**Gate.** Promote only if `eval_quick.py --system short` overall for the candidate >= the
+live model's, the `tool` group does not drop, and `scripts/simulate.py` exits 0 (0 gaps)
+with `GLYDI_LOCAL_MODEL=glydi-1.5b-candidate`. On pass: `ollama cp glydi-1.5b
+glydi-1.5b-prev`, `ollama cp glydi-1.5b-candidate glydi-1.5b`. On fail: the candidate is
+removed and the reason recorded. Every decision goes to `train/logs/selfimprove-history.jsonl`.
+`rollback` restores `glydi-1.5b-prev` (and the adapter pointer). The Jetson's model is the
+GGUF in `models/`; after a promotion on the PC, copy the new blob there as before.
+
+**Nightly.** `nightly` = report, cache, curate, then train and gate when the threshold is
+met. A lock file (`train/logs/selfimprove.lock`, pid inside, stale ones taken over) keeps two
+runs apart; training is skipped on battery or when `nvidia-smi` reports > 30% utilisation;
+exits non-zero on failure. On aarch64/Jetson it never trains: only report, cache, curate.
+Copy the curated data to the PC and train there:
+
+    scp jetson:bot/train/data/selfimprove-*.jsonl train/data/   # on the PC
+    python train/selfimprove.py train && python train/selfimprove.py gate
+
+Scheduling: Linux/Jetson `deploy/selfimprove/install.sh` (systemd
+`glydi-selfimprove.service` + `.timer`, 03:00, `Persistent=true`, as the bot user with the
+repo `.env`); this PC `deploy/selfimprove/register-task.ps1` (Task Scheduler, 03:00,
+start-when-available, not on battery).
+
+**The eval set (measure, don't guess).** `scripts/eval/cases.jsonl`: 134 fixed cases (215
+turns), single utterances and short conversations, labelled with the expected intent, slots
+(names, relation, pronoun, facts, heard_ok) and a rubric for the reply (must/must-not
+mention, max words, no invented names, no volunteered private facts). `scripts/eval/run.py`
+scores two ways: `--mode understand` sends each turn straight to Ollama with the
+understander's SYSTEM and schema read from `understand.rs` at run time (the model alone,
+no rules; temperature 0, seed 7), `--mode e2e` drives the release binary in text mode
+through `simulate.py`'s `run_scenario` (one fresh process and gallery per case, intent read
+from the throwaway learn DB). Scorecard `train/logs/eval-<stamp>-<label>.json` + `.md`;
+`--compare A.json B.json` diffs two. Understand-only takes ~2 min, e2e ~50 min (~22 s per
+case, mostly start-up). GPU Ollama at temperature 0 is not bit-exact: two runs of one model
+differ by 1-2 points, so gates use a margin.
+
+**The understander loop.** `train/understand_train.py` (`curate`, `train`, `gate`,
+`rollback`, `nightly`; also run at the end of `selfimprove.py nightly` under the same lock,
+`--no-understand` skips it). Curate: turns the *model* understood (`understand.by ==
+"model"`) with reward < 0 or a correction on the next turn, and model failures; the log does
+not keep the model's JSON, so a teacher (`qwen2.5:7b-instruct`, or `--cloud-teacher`) labels
+the scrubbed utterance again with the bot's own prompt and the label must pass the bot's
+validator; bot-internal nudges logged as questions are dropped; eval-set utterances are
+never trained on. Plus 600 synthetic labelled examples once (every intent). Output
+`train/data/understand-YYYYMMDD.jsonl`, state `train/logs/understand-state.json`. Train:
+LoRA on the last 12 layers, LR 1e-4, base `Qwen/Qwen2.5-3B-Instruct` (`--base 1.5b` for the
+1.5B), exported as `glydi-understand-candidate`. Gate: understand-only scores, the candidate
+must beat the live understander (`GLYDI_UNDERSTAND_MODEL`, default `qwen2.5:3b`) on intent AND
+slot accuracy by `SI_UNDERSTAND_MARGIN` (0.01), keep the valid-JSON rate, and drop in no
+group; pass -> `glydi-understand` (set `GLYDI_UNDERSTAND_MODEL=glydi-understand`), fail ->
+deleted. `--smoke` (5 steps) proves the pipeline and is never promoted.
+
+**Privacy.** The turn log, the cache and the curated data never leave the device; nothing
+here uploads them. The only exception is the cloud teacher: it is used only when
+`--cloud-teacher` is passed AND `ANTHROPIC_API_KEY` is set, the run logs a loud warning, and
+only the scrubbed question and context of bad turns are sent. `nightly` never passes it
+unless you add the flag to the unit/task yourself.

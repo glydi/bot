@@ -135,6 +135,9 @@ pub struct Parts {
     /// Speak proactive moments as their canned line instead of asking the
     /// model (tests). `false` here means "canned"; see `Parts::default`.
     pub canned_proactive: bool,
+    /// Keep the older model lanes instead of the people-first pipeline
+    /// (tests of the model path); otherwise `GLYDI_PEOPLE_FIRST` decides.
+    pub legacy_lanes: bool,
 }
 
 /// The window's inputs, handed to the main thread because eframe insists
@@ -288,6 +291,13 @@ impl App {
         // local) get the hour from here.
         let mut rules = cognitive_rules();
         rules.retain(|r| r.name() != "muse");
+        let single_focus = common::single_focus();
+        if single_focus {
+            // One person at a time: no remarks about the room, no
+            // check-ins, no inviting or rotating to the background.
+            rules.retain(|r| !mind::rules::SINGLE_FOCUS_OFF.contains(&r.name()));
+            tracing::info!("single focus on (GLYDI_SINGLE_FOCUS=0 engages the whole group)");
+        }
         rules.push(Box::new(mind::initiative::Muse::new().with_quiet_hours(
             22,
             7,
@@ -299,6 +309,9 @@ impl App {
                 (secs.rem_euclid(86_400) / 3_600) as u8
             },
         )));
+        if single_focus {
+            rules.retain(|r| r.name() != "muse");
+        }
         let reflex = Reflex::with_rules(session_id.as_str(), epoch, rules)
             .with_event_tap(Some(tap_tx))
             .spawn(Arc::clone(&clock), reflex_rx, queue.clone(), Some(delib_tx))
@@ -337,7 +350,26 @@ impl App {
                     // throwaway gallery gets a throwaway cache, so a
                     // scripted answer never serves the real door, and the
                     // real cache never skips a test's model turn.
-                    answer_cache: Some(answer_cache_path(&db)),
+                    // Off unless GLYDI_ANSWER_CACHE=1: replies are worded
+                    // fresh each time, not replayed from a store.
+                    answer_cache: std::env::var("GLYDI_ANSWER_CACHE")
+                        .is_ok_and(|v| v.trim() == "1")
+                        .then(|| answer_cache_path(&db)),
+                    single_focus: common::single_focus(),
+                    // People first (`GLYDI_PEOPLE_FIRST=0` turns it off):
+                    // the small model understands, code answers from the
+                    // people graph, out-of-zone goes to the hand-off.
+                    people: if parts.legacy_lanes {
+                        None
+                    } else {
+                        people_first(config)
+                    },
+                    // Every answered turn and its reward, for offline
+                    // learning (`GLYDI_LEARN=0` turns it off).
+                    learn: deliberate::learn::LearnSink::from_env(
+                        &deliberate::learn::path_beside(&db),
+                        &learn_model(config),
+                    ),
                     base_url: config.local_llm_url.clone(),
                     model: config.local_model.clone(),
                     max_tokens: config.max_tokens,
@@ -471,9 +503,12 @@ impl App {
         );
 
         // -- audio ------------------------------------------------------
+        // The camera's word on who is talking, for the audio lip gate.
+        let speaking = lip_board(config, &parts);
         let audio = spawn_audio(
             config,
             &mut parts,
+            speaking.clone(),
             Arc::clone(&store),
             &clock,
             &obs_tx,
@@ -502,6 +537,7 @@ impl App {
         let vision = spawn_vision(
             config,
             &parts,
+            speaking,
             Arc::clone(&store),
             Arc::clone(&clock),
             obs_tx.clone(),
@@ -832,6 +868,16 @@ fn backends(
     };
     let extractor = extractor.unwrap_or_else(|| Arc::new(NoLlm));
     (chat, extractor)
+}
+
+/// The model that answers, for the learning log: the cloud model when
+/// there is a key, else the local one.
+fn learn_model(config: &Config) -> String {
+    if std::env::var(deliberate::claude::API_KEY_ENV).is_ok_and(|k| !k.trim().is_empty()) {
+        deliberate::claude::DEFAULT_MODEL.to_owned()
+    } else {
+        config.local_model.clone()
+    }
 }
 
 /// A backend that fails every request: what fact extraction gets when no
@@ -1244,12 +1290,67 @@ fn spawn_speaker(
     }
 }
 
+/// `GLYDI_STT=remote`: the Whisper service (services/stt) at
+/// `GLYDI_STT_URL`, Parakeet as its fallback. The people the robot knows
+/// go with each utterance as spelling hints, plus `GLYDI_STT_HINTS`
+/// (comma list).
+fn apply_remote_stt(cfg: &mut AudioConfig, people: Arc<Store>) {
+    if let Ok(url) = std::env::var("GLYDI_STT_URL")
+        && !url.trim().is_empty()
+    {
+        url.trim().clone_into(&mut cfg.stt_url);
+    }
+    if cfg.stt != sense_audio::SttKind::Remote {
+        return;
+    }
+    let extra: Vec<String> = std::env::var("GLYDI_STT_HINTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    cfg.stt_hints = Some(Arc::new(move || {
+        let mut names = extra.clone();
+        names.extend(
+            people
+                .people()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.name)
+                .filter(|n| !n.trim().is_empty()),
+        );
+        names
+    }));
+}
+
+/// `GLYDI_SAVE_UTTERANCES=1` keeps every utterance (WAV + transcript) in
+/// `data/utterances` for `scripts/stt-ab.py`; any other value but `0` is
+/// the directory to use.
+fn save_utterances_dir() -> Option<PathBuf> {
+    let dir = std::env::var("GLYDI_SAVE_UTTERANCES")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty() && v != "0")
+        .map(|v| {
+            if v == "1" {
+                PathBuf::from("data/utterances")
+            } else {
+                PathBuf::from(v)
+            }
+        })?;
+    tracing::info!(dir = %dir.display(), "saving every utterance");
+    Some(dir)
+}
+
+#[allow(clippy::too_many_lines)]
 /// The microphone (or mock) with whichever models are present. A model
 /// that fails to load costs only its stage: the sense retries without
 /// models rather than leaving the bot deaf.
+#[allow(clippy::too_many_arguments)]
 fn spawn_audio(
     config: &Config,
     parts: &mut Parts,
+    speaking: Option<Arc<common::SpeakingBoard>>,
     store: Arc<Store>,
     clock: &Arc<dyn Clock>,
     tx: &RingSender,
@@ -1262,6 +1363,7 @@ fn spawn_audio(
     }
     let mut cfg = AudioConfig::with_models_dir(&config.models_dir);
     apply_hangover(&mut cfg);
+    apply_crowd(&mut cfg, speaking);
     // Echo cancellation: the speaker's far-end blocks let the mic stay
     // open while the bot talks. The two crates keep their own block
     // types (sense-audio must not depend on act-speaker), mapped here.
@@ -1283,7 +1385,8 @@ fn spawn_audio(
     );
     cfg.device.clone_from(&config.mic_device);
     cfg.ort_lib.clone_from(&config.ort_lib);
-    cfg.gallery = Some(store);
+    cfg.save_utterances = save_utterances_dir();
+    cfg.gallery = Some(store.clone());
     if parts.no_models {
         cfg = cfg.without_models();
         cfg.warm_up = false;
@@ -1306,6 +1409,7 @@ fn spawn_audio(
             cfg.stt = sense_audio::SttKind::Whisper;
         }
         cfg.parakeet_model = Some(parakeet_dir);
+        apply_remote_stt(&mut cfg, store);
         tracing::info!(stt = ?cfg.stt, "transcriber");
         // None = detect per utterance (needs a multilingual whisper
         // model, e.g. "base"; a ".en" model always reports English).
@@ -1361,6 +1465,17 @@ fn spawn_audio(
         }
     };
     if deferred && let Some(h) = &handle {
+        // The real microphone is kept attached: unplugged or taken, it is
+        // reopened with backoff when it returns.
+        if parts.open_frames.is_none() {
+            let device = config.mic_device.clone();
+            h.keep_attached(
+                DEVICE_OPEN_TIMEOUT * 2,
+                Box::new(move || {
+                    MicInput::open(device.as_deref()).map(|m| Box::new(m) as Box<dyn FrameSource>)
+                }),
+            );
+        }
         let open: SourceOpener = parts.open_frames.take().unwrap_or_else(|| {
             let device = config.mic_device.clone();
             Box::new(move || {
@@ -1417,6 +1532,7 @@ impl DeferredVision {
 fn spawn_vision(
     config: &Config,
     parts: &Parts,
+    speaking: Option<Arc<common::SpeakingBoard>>,
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     tx: RingSender,
@@ -1438,12 +1554,23 @@ fn spawn_vision(
         },
         models_dir: config.face_models_dir.clone(),
         ort_lib: config.ort_lib.clone(),
+        single_focus: common::single_focus(),
+        speaking,
         ..VisionConfig::default()
     };
     // The object detector lives beside the other models
     // (`models/vision/yolov8n.onnx` or `yolov5n.onnx`); a missing file
     // only costs the object path, not the camera.
     cfg.objects.model_dir = Some(config.models_dir.join("vision"));
+    // Single focus: the focused person's skeleton, for a wave hello/bye
+    // (`models/vision/yolov8n-pose.onnx`; missing costs only the wave).
+    // Off unless GLYDI_WAVE=1: visitors don't wave at a door robot, and
+    // the pose model costs GPU time every frame.
+    if std::env::var("GLYDI_WAVE").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")) {
+        cfg.pose = Some(sense_vision::pose::PoseConfig::in_dir(
+            &config.models_dir.join("vision"),
+        ));
+    }
     if !cfg.models_present() {
         tracing::warn!(dir = %cfg.models_dir.display(), "face models not found; camera disabled");
         return None;
@@ -1537,7 +1664,9 @@ fn apply_hangover(cfg: &mut AudioConfig) {
 /// How many events back the strip's "heard" line looks for a `SAID`. A
 /// few sightings and speaking transitions can land between two
 /// utterances; 32 covers that without walking the whole log every frame.
-const HEARD_LOOKBACK: usize = 32;
+const HEARD_LOOKBACK: usize = 256;
+/// How long the panel keeps showing the last words heard.
+const HEARD_HOLD: Duration = Duration::from_secs(60);
 
 fn ui_sources(
     reflex: &Arc<ReflexHandle>,
@@ -1557,17 +1686,30 @@ fn ui_sources(
     // The strip's "heard" line: the newest SAID event's text. Read from
     // the same event log the panel shows, so there is no second copy of
     // the transcript to keep in step.
+    // Sticky: with the camera on, sightings fill the recent events within
+    // seconds and the line would blank while the reply is still showing.
+    // The last words heard stay up for HEARD_HOLD.
     s.heard = Box::new({
         let events = Arc::clone(reflex);
+        let last: Mutex<Option<(String, Instant)>> = Mutex::new(None);
         move || {
-            events
+            let found = events
                 .recent_events(HEARD_LOOKBACK)
                 .into_iter()
                 .rev()
                 .find_map(|e| match e.kind {
                     mind::EventKind::Said(text) => Some(text),
                     _ => None,
-                })
+                });
+            let mut last = last.lock();
+            if let Some(text) = found
+                && last.as_ref().is_none_or(|(t, _)| *t != text)
+            {
+                *last = Some((text, Instant::now()));
+            }
+            last.as_ref()
+                .filter(|(_, at)| at.elapsed() < HEARD_HOLD)
+                .map(|(t, _)| t.clone())
         }
     });
     s.known_count = Some(Box::new({
@@ -1634,6 +1776,10 @@ impl sense_vision::FaceGallery for StoreFaces {
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), sense_vision::Error> {
         memory::FaceGallery::enrol(&*self.0, id.clone(), emb)
             .map_err(|e| sense_vision::Error::Model(e.to_string()))
+    }
+
+    fn name_of(&self, id: &EntityId) -> Option<String> {
+        self.0.name_of(id)
     }
 }
 
@@ -1727,5 +1873,85 @@ mod tests {
         }));
         app.stop();
         let _ = std::fs::remove_file(&db);
+    }
+}
+
+/// The people-first pipeline, unless `GLYDI_PEOPLE_FIRST=0`. The
+/// understander is `GLYDI_UNDERSTAND_MODEL` (default: the local model) on
+/// the local Ollama; the hand-off is `GLYDI_HANDOFF_URL` or one line.
+fn people_first(config: &Config) -> Option<deliberate::People> {
+    if std::env::var("GLYDI_PEOPLE_FIRST").is_ok_and(|v| v.trim() == "0") {
+        tracing::info!("people-first off (GLYDI_PEOPLE_FIRST=0)");
+        return None;
+    }
+    let model = std::env::var("GLYDI_UNDERSTAND_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| config.local_model.clone());
+    tracing::info!(model, "people-first: understand step on");
+    Some(deliberate::People {
+        understander: Some(std::sync::Arc::new(
+            deliberate::understand::OllamaUnderstander::new(
+                &config.local_llm_url,
+                &model,
+                // Bounded: a stuck Ollama costs one short wait, then rests.
+                Duration::from_secs(3),
+            ),
+        )),
+        handoff: deliberate::handoff::from_env(),
+        think_ack: std::env::var("GLYDI_THINK_ACK").is_ok_and(|v| v.trim() == "1"),
+    })
+}
+
+/// The board the camera and the microphone share for the lip gate
+/// (`GLYDI_LIP_GATE=1`; off by default, untried on the robot): only when the camera will run with
+/// single focus; `None` otherwise, and the audio side then never drops a
+/// turn for a still mouth.
+fn lip_board(config: &Config, parts: &Parts) -> Option<Arc<common::SpeakingBoard>> {
+    let camera = cfg!(feature = "vision") && !parts.no_camera && config.identity;
+    let wanted = common::speaking::lip_gate_from(
+        std::env::var(common::speaking::LIP_GATE_ENV)
+            .ok()
+            .as_deref(),
+    );
+    if camera && wanted && common::single_focus() {
+        tracing::info!(
+            "lip gate on: turns the focused face did not say are dropped (GLYDI_LIP_GATE)"
+        );
+        Some(Arc::new(common::SpeakingBoard::new()))
+    } else {
+        if camera && !wanted {
+            tracing::info!("lip gate off (GLYDI_LIP_GATE=1 turns it on)");
+        }
+        None
+    }
+}
+
+/// Noise suppression (`GLYDI_DENOISE`), the lip gate's board and the
+/// per-visit level gate (`GLYDI_LEVEL_GATE_DB`, default 0 = off until tried
+/// on the robot; 12 is the suggested margin).
+fn apply_crowd(cfg: &mut AudioConfig, speaking: Option<Arc<common::SpeakingBoard>>) {
+    cfg.denoise = sense_audio::denoise::DenoiseKind::from_env();
+    if cfg.denoise != sense_audio::denoise::DenoiseKind::Off {
+        tracing::info!(kind = ?cfg.denoise, "noise suppression before the VAD");
+    }
+    cfg.speaking = speaking;
+    cfg.level_gate_db = std::env::var(sense_audio::gate::LEVEL_GATE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.0);
+    // Dynamic end of turn: the judge a short pause in, the hangover
+    // (`GLYDI_HANGOVER_MS`) the most a turn waits.
+    cfg.turn_early_ms = std::env::var("GLYDI_TURN_EARLY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        // Off unless set: the dynamic end of turn is untried on the robot
+        // (sense_audio::DEFAULT_TURN_EARLY_MS = 220 is the suggested value).
+        .unwrap_or(0);
+    if let Some(p) = std::env::var("GLYDI_TURN_EARLY_PROB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+    {
+        cfg.turn_early_prob = p.clamp(0.5, 0.99);
     }
 }

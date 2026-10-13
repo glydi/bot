@@ -125,6 +125,14 @@ pub struct Stats {
     pub deferrals: AtomicU64,
     /// Utterances handed to the worker.
     pub utterances: AtomicU64,
+    /// Turns ended early by the judge, ahead of the hangover.
+    pub early_ends: AtomicU64,
+    /// Deferred turns answered at the wait cap, no more speech having come.
+    pub forced_ends: AtomicU64,
+    /// Turns dropped by the lip gate: the focused mouth was still.
+    pub gated_not_focused: AtomicU64,
+    /// Turns dropped by the level gate: far under the visit's level.
+    pub gated_too_far: AtomicU64,
     /// Utterances dropped because the worker was still busy.
     pub dropped_utterances: AtomicU64,
     /// Observations evicted from the ring because the mind fell behind.
@@ -257,7 +265,48 @@ impl TurnGate {
 
     /// The VAD says the person went quiet. `heard` is what they said since
     /// the last VAD start.
-    pub fn on_end(&mut self, mut heard: Vec<f32>) -> Verdict {
+    pub fn on_end(&mut self, heard: Vec<f32>) -> Verdict {
+        self.on_end_judged(heard, None)
+    }
+
+    /// Dynamic end of turn: the judge's view of `voiced` (plus anything
+    /// held) a short pause in, before the hangover. `None` without a
+    /// judge, with deferrals spent, or on a model error.
+    pub fn early(&mut self, voiced: &[f32]) -> Option<(bool, f32)> {
+        if self.deferrals >= self.max_deferrals {
+            return None;
+        }
+        let judge = self.judge.as_mut()?;
+        let r = if self.held.is_empty() {
+            judge.predict(voiced)
+        } else {
+            let mut all = self.held.clone();
+            all.extend_from_slice(voiced);
+            judge.predict(&all)
+        };
+        r.map_err(|e| tracing::debug!(error = %e, "early turn prediction failed"))
+            .ok()
+    }
+
+    /// [`on_end`](Self::on_end) with the judge's verdict already known
+    /// (an early end): it is not asked again.
+    pub fn on_end_judged(
+        &mut self,
+        mut heard: Vec<f32>,
+        prejudged: Option<(bool, f32)>,
+    ) -> Verdict {
+        if let Some(j) = prejudged {
+            if !self.held.is_empty() {
+                let mut all = std::mem::take(&mut self.held);
+                all.append(&mut heard);
+                heard = all;
+            }
+            self.deferrals = 0;
+            return Verdict::Emit {
+                samples: heard,
+                judged: Some(j),
+            };
+        }
         if !self.held.is_empty() {
             let mut all = std::mem::take(&mut self.held);
             all.append(&mut heard);
@@ -308,6 +357,10 @@ impl TurnGate {
     }
 }
 
+/// A live source silent (no frames at all, not quiet audio) this long is
+/// gone.
+pub const MIC_LOST_AFTER: Duration = Duration::from_secs(5);
+
 /// Everything the pipeline thread owns.
 pub(crate) struct Pipeline {
     /// `None` until a deferred source is attached (see
@@ -348,7 +401,27 @@ pub(crate) struct Pipeline {
     pub stop: Arc<AtomicBool>,
     pub jobs: Sender<Utterance>,
     pub stats: Arc<Stats>,
+    /// Noise suppression ahead of the VAD (`GLYDI_DENOISE`).
+    pub denoise: Option<Box<dyn crate::denoise::Denoiser>>,
+    /// The lip and level gates a finished turn passes (see [`crate::gate`]).
+    pub crowd: crate::gate::CrowdGate,
+    /// Dynamic end of turn: quiet frames after which the judge is asked
+    /// early (`GLYDI_TURN_EARLY_MS`); 0 = off, the hangover alone ends.
+    pub early_end_frames: usize,
+    /// How sure the judge must be to end the turn early.
+    pub early_prob: f32,
+    /// Quiet frames after a deferral before the held turn is answered
+    /// anyway; 0 holds until speech resumes.
+    pub defer_cap_frames: usize,
 }
+
+/// `Observation.modality` sent at every turn end while a camera watches:
+/// whether the focused person was the one talking. `Payload::Bool`, the
+/// focused face as `EntityHint::Track`, confidence = how sure (the mouth
+/// opening's std relative to the threshold, clamped to 0..1). `false` is
+/// followed by no `utterance` (the turn was dropped); `true` or no
+/// `speaking` at all (no camera opinion) by the utterance as usual.
+pub const MODALITY_SPEAKING: &str = "speaking";
 
 impl Pipeline {
     fn emit(&self, o: Observation) {
@@ -382,6 +455,11 @@ impl Pipeline {
         let mut voiced_len = 0usize;
         let mut live_spec: Option<u64> = None;
         let mut next_spec_id = 0u64;
+        // When the turn's speech began (the first start since the last
+        // emitted turn), for the lip gate's window.
+        let mut turn_started_at: Option<Instant> = None;
+        // Quiet frames since a deferral, for `defer_cap_frames`.
+        let mut quiet_after_defer = 0usize;
         // The VAD needs `start_frames` loud frames before it believes
         // speech began, and the Go loop only kept audio from that point:
         // the first ~64 ms of every utterance was lost, and whisper heard
@@ -393,6 +471,11 @@ impl Pipeline {
             self.listening.store(true, Ordering::Release);
         }
 
+        // When the live source last gave a frame: a microphone that gives
+        // nothing for `MIC_LOST_AFTER` was unplugged (cpal keeps the stream
+        // object but its callback stops), so it is dropped and the slot
+        // opened for a new one (see `AudioSenseHandle::keep_attached`).
+        let mut last_frame = std::time::Instant::now();
         while !self.stop.load(Ordering::Relaxed) {
             // No source yet (the microphone is still behind the permission
             // prompt): idle on the slot, and emit nothing -- not even
@@ -401,6 +484,7 @@ impl Pipeline {
                 match self.source_rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(s) => {
                         tracing::info!(source = %s.describe(), "listening");
+                        last_frame = std::time::Instant::now();
                         self.source = Some(s);
                         self.listening.store(true, Ordering::Release);
                     }
@@ -411,7 +495,13 @@ impl Pipeline {
                 continue;
             };
             match source.pull(&mut frame, Duration::from_millis(500)) {
-                Ok(Pull::Frame) => {}
+                Ok(Pull::Frame) => last_frame = std::time::Instant::now(),
+                Ok(Pull::Idle) if last_frame.elapsed() >= MIC_LOST_AFTER => {
+                    tracing::warn!(source = %source.describe(), "microphone gave nothing for a while; dropped, waiting for it to come back");
+                    self.source = None;
+                    self.listening.store(false, Ordering::Release);
+                    continue;
+                }
                 Ok(Pull::Idle) => continue,
                 Ok(Pull::Ended) => break,
                 Err(e) => {
@@ -466,7 +556,11 @@ impl Pipeline {
                 self.stats.aec_frames.fetch_add(1, Ordering::Relaxed);
             }
 
+            if let Some(d) = self.denoise.as_mut() {
+                d.process(&mut frame);
+            }
             let state = self.vad.push(&frame);
+            let mut early: Option<(bool, f32)> = None;
             // Sound classes ride on the same frame, after the VAD so the
             // heuristic knows whether it is hearing speech. Muted frames
             // (the bot's own voice) never get here.
@@ -488,6 +582,11 @@ impl Pipeline {
                 if !speaking {
                     speaking = true;
                     since_start = 0;
+                    if turn_started_at.is_none() {
+                        let pre = Duration::from_millis(32 * preroll.len() as u64);
+                        let now = self.clock.now();
+                        turn_started_at = Some(now.checked_sub(pre).unwrap_or(now));
+                    }
                     for f in preroll.drain(..) {
                         utterance.extend_from_slice(&f);
                     }
@@ -520,7 +619,27 @@ impl Pipeline {
                     next_spec_id += 1;
                     live_spec = self.speculate(next_spec_id, &utterance[..voiced_len]);
                 }
-                continue;
+                // Dynamic end of turn: a short pause in, ask the judge.
+                // Sure it is finished -> end now rather than after the
+                // whole hangover; unsure or "mid-thought" -> wait it out
+                // (and the judge at the hangover may still defer).
+                if self.early_end_frames > 0 && quiet == self.early_end_frames {
+                    let t0 = Instant::now();
+                    if let Some((true, p)) = self.gate.early(&utterance[..voiced_len])
+                        && p >= self.early_prob
+                    {
+                        tracing::debug!(
+                            prob = p,
+                            ms = t0.elapsed().as_millis() as u64,
+                            "early end of turn"
+                        );
+                        self.stats.early_ends.fetch_add(1, Ordering::Relaxed);
+                        early = Some((true, p));
+                    }
+                }
+                if early.is_none() {
+                    continue;
+                }
             }
             if self.preroll_frames > 0 {
                 if preroll.len() >= self.preroll_frames {
@@ -528,10 +647,13 @@ impl Pipeline {
                 }
                 preroll.push_back(frame.clone());
             }
-            if speaking && state == State::Silent {
+            if speaking && state == State::Silent && early.is_none() {
                 // Too short to count (a cough): the VAD reset itself.
                 speaking = false;
                 utterance.clear();
+                if self.gate.held().is_empty() {
+                    turn_started_at = None;
+                }
                 if live_spec.take().is_some() {
                     self.spec_slot.lock().take();
                 }
@@ -540,7 +662,36 @@ impl Pipeline {
                         .with_payload(Payload::Bool(false)),
                 );
             }
-            if state != State::Ended {
+            // A deferred turn ("and...", then nothing) is not held for
+            // ever: after `defer_cap_frames` more quiet frames it is
+            // answered as it stands. Without this a trailing-off speaker
+            // whom the judge called unfinished got no reply until they
+            // spoke again.
+            if !speaking && state == State::Silent && !self.gate.held().is_empty() {
+                quiet_after_defer += 1;
+                if self.defer_cap_frames > 0 && quiet_after_defer >= self.defer_cap_frames {
+                    quiet_after_defer = 0;
+                    self.stats.forced_ends.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("deferred turn answered after the wait cap");
+                    let now = self.clock.now();
+                    let started_at = turn_started_at.unwrap_or(now);
+                    if !self.on_turn_end(
+                        Vec::new(),
+                        started_at,
+                        now,
+                        last_voiced_at,
+                        None,
+                        Some((true, 0.5)),
+                    ) {
+                        break;
+                    }
+                    turn_started_at = None;
+                    continue;
+                }
+            } else {
+                quiet_after_defer = 0;
+            }
+            if state != State::Ended && early.is_none() {
                 continue;
             }
             speaking = false;
@@ -557,12 +708,69 @@ impl Pipeline {
             if heard.is_empty() {
                 continue;
             }
-            if !self.on_turn_end(heard, ended_at, last_voiced_at, live_spec.take()) {
+            let started_at = turn_started_at.unwrap_or(ended_at);
+            if !self.on_turn_end(
+                heard,
+                started_at,
+                ended_at,
+                last_voiced_at,
+                live_spec.take(),
+                early,
+            ) {
                 break;
+            }
+            if self.gate.held().is_empty() {
+                turn_started_at = None;
             }
         }
         self.listening.store(false, Ordering::Release);
         tracing::info!("pipeline stopped");
+    }
+
+    /// The crowd gates (lips, then level). Emits `speaking` when the
+    /// camera has an opinion; returns whether the turn goes on to the
+    /// worker.
+    fn crowd_check(&mut self, samples: &[f32], from: Instant, to: Instant) -> bool {
+        use common::LipVerdict;
+        let lips = self.crowd.lips(from, to);
+        if let (LipVerdict::Moving(sd) | LipVerdict::Still(sd), Some(track)) =
+            (lips, self.crowd.focus())
+        {
+            let moving = matches!(lips, LipVerdict::Moving(_));
+            let ratio = sd / common::speaking::MOVE_STD;
+            let conf = if moving {
+                (ratio / 2.0).clamp(0.5, 1.0)
+            } else {
+                (1.0 - ratio / 2.0).clamp(0.5, 1.0)
+            };
+            self.emit(
+                self.obs(MODALITY_SPEAKING)
+                    .with_entity(EntityHint::Track(track))
+                    .with_confidence(conf)
+                    .with_payload(Payload::Bool(moving)),
+            );
+        }
+        match self.crowd.decide(samples, lips, Instant::now()) {
+            crate::gate::Decision::Accept => true,
+            crate::gate::Decision::NotFocusedSpeaker(sd) => {
+                self.stats.gated_not_focused.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    mouth_std = sd,
+                    secs = samples.len() as f32 / 16_000.0,
+                    "utterance dropped: not the focused speaker"
+                );
+                false
+            }
+            crate::gate::Decision::TooFar(level, baseline) => {
+                self.stats.gated_too_far.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    level_db = level,
+                    baseline_db = baseline,
+                    "utterance dropped: too far below this visitor's level"
+                );
+                false
+            }
+        }
     }
 
     /// Put everything said so far in the worker's slot. Returns the id the
@@ -592,11 +800,13 @@ impl Pipeline {
     fn on_turn_end(
         &mut self,
         heard: Vec<f32>,
+        started_at: Instant,
         ended_at: Instant,
         last_voiced_at: Instant,
         speculation: Option<u64>,
+        prejudged: Option<(bool, f32)>,
     ) -> bool {
-        match self.gate.on_end(heard) {
+        match self.gate.on_end_judged(heard, prejudged) {
             Verdict::Defer { prob } => {
                 // The speculation for this pause stays in the worker's
                 // cache but is never committed: the next voiced frame
@@ -646,6 +856,13 @@ impl Pipeline {
                     // No judge, or deferrals exhausted: the VAD's word
                     // is final.
                     self.emit(self.obs("turn_ended").with_payload(Payload::Bool(true)));
+                }
+                if !self.crowd_check(&samples, started_at, last_voiced_at) {
+                    if speculation.is_some() {
+                        self.spec_slot.lock().take();
+                    }
+                    self.vad.reset();
+                    return true;
                 }
                 self.stats.utterances.fetch_add(1, Ordering::Relaxed);
                 match self.jobs.try_send(Utterance {
@@ -705,6 +922,8 @@ pub(crate) struct Worker {
     pub gallery: Arc<dyn VoiceGallery>,
     /// Per-speaker prosody baselines for `voice_affect`; `None` disables.
     pub affect: Option<Calibrator>,
+    /// Where to keep each utterance's WAV and transcript; `None` keeps none.
+    pub save_dir: Option<std::path::PathBuf>,
     pub source_name: SmolStr,
     pub clock: Arc<dyn Clock>,
     pub tx: RingSender,
@@ -962,6 +1181,9 @@ impl Worker {
         let now = self.clock.now();
         let speech_end_ms = now.saturating_duration_since(job.last_voiced_at);
         let vad_end_ms = now.saturating_duration_since(job.at);
+        if let Some(dir) = &self.save_dir {
+            crate::wav::save_utterance(dir, &job.samples, &text);
+        }
         if text.trim().is_empty() {
             // Silence, or whisper's blank-audio sentinel. Emitting nothing
             // is the correct response to nothing.
@@ -1076,6 +1298,23 @@ mod tests {
     }
 
     #[test]
+    fn early_verdict_ends_without_asking_again_and_keeps_held_audio() {
+        // Deferred once at the hangover, then sure early in the next pause.
+        let mut g = gate(vec![Ok((false, 0.2)), Ok((true, 0.95))]);
+        assert!(matches!(g.on_end(vec![0.1; 10]), Verdict::Defer { .. }));
+        assert_eq!(g.early(&[0.2; 5]), Some((true, 0.95)));
+        match g.on_end_judged(vec![0.2; 5], Some((true, 0.95))) {
+            Verdict::Emit { samples, judged } => {
+                assert_eq!(samples.len(), 15);
+                assert_eq!(judged, Some((true, 0.95)));
+            }
+            Verdict::Defer { .. } => panic!("deferred"),
+        }
+        // No judge: no early opinion.
+        assert_eq!(TurnGate::new(None, 3).early(&[0.0; 4]), None);
+    }
+
+    #[test]
     fn complete_emits_immediately() {
         let mut g = gate(vec![Ok((true, 0.9))]);
         match g.on_end(vec![1.0; 100]) {
@@ -1187,6 +1426,7 @@ mod tests {
             encoder: None,
             gallery: Arc::new(InMemoryGallery::default()),
             affect: None,
+            save_dir: None,
             source_name: "mic0".into(),
             clock: Arc::new(RealClock),
             tx,
@@ -1349,6 +1589,7 @@ mod tests {
             encoder: None,
             gallery: Arc::new(InMemoryGallery::default()),
             affect: None,
+            save_dir: None,
             source_name: "mic0".into(),
             clock: clock.clone(),
             tx: tx.clone(),
@@ -1375,6 +1616,11 @@ mod tests {
             stop,
             jobs: jobs_tx,
             stats: stats.clone(),
+            denoise: None,
+            early_end_frames: 0,
+            early_prob: 0.8,
+            defer_cap_frames: 0,
+            crowd: crate::gate::CrowdGate::new(None, crate::gate::LevelGate::new(0.0)),
         };
         let worker = std::thread::spawn(move || worker.run());
         pipeline.run();

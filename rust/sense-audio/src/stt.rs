@@ -313,8 +313,31 @@ pub fn is_hallucination(text: &str, secs: f32) -> bool {
         .flat_map(char::to_lowercase)
         .collect::<String>();
     let normalised = normalised.split_whitespace().collect::<Vec<_>>().join(" ");
-    FILLERS.contains(&normalised.as_str())
+    // Under 0.6 s of speech only a one-word answer is believable: in a
+    // noisy classroom the rest is other people's chatter caught in part.
+    let _ = FILLERS;
+    !SHORT_OK.contains(&normalised.as_str())
 }
+
+/// What may be said in under [`MIN_FILLER_SECS`]: yes, no, hi, bye,
+/// thanks and their usual forms.
+const SHORT_OK: &[&str] = &[
+    "yes",
+    "yeah",
+    "yep",
+    "no",
+    "nope",
+    "hi",
+    "hello",
+    "hey",
+    "bye",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "haan",
+    "nahi",
+];
 
 /// Whisper describes sounds it recognises but cannot transcribe as a
 /// bracketed note: `(whistling)`, `[Music]`, `(bell dings)`. Answering those
@@ -356,11 +379,17 @@ mod non_speech_tests {
             "a",
             "you",
             "You.",
-            "Thank you.",
-            "Bye!",
             " thanks for watching ",
+            // Classroom chatter caught in part (live log).
+            "Most meetings.",
+            "We'll",
+            "Then you can",
         ] {
             assert!(is_hallucination(t, 0.4), "{t:?}");
+        }
+        // The owner's call: a short yes/no/hi/bye/thanks is still heard.
+        for t in ["Thank you.", "Bye!", "yes", "Hi", "no"] {
+            assert!(!is_hallucination(t, 0.4), "{t:?}");
         }
     }
 
@@ -377,7 +406,7 @@ mod non_speech_tests {
     #[test]
     fn real_words_on_short_audio_are_kept() {
         for t in ["Hi there", "What?", "Thank you Bob", "42"] {
-            assert!(!is_hallucination(t, 0.3), "{t:?}");
+            assert!(!is_hallucination(t, MIN_FILLER_SECS), "{t:?}");
         }
         // Under two characters is dropped whatever the length.
         assert!(is_hallucination("?", 5.0));

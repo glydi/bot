@@ -11,10 +11,10 @@
 /// `Observation.modality` of a preview.
 pub const MODALITY_CAMERA_PREVIEW: &str = "camera_preview";
 
-/// Widest a preview is allowed to be, in pixels. 320 wide is a quarter of
+/// Widest a preview is allowed to be, in pixels. 640 wide is half of
 /// the 1280 capture: enough to see who is in shot, cheap to resize and
 /// to upload as a texture.
-pub const PREVIEW_MAX_WIDTH: usize = 320;
+pub const PREVIEW_MAX_WIDTH: usize = 640;
 
 /// One face in a [`Preview`], in fractions of the preview so the UI can
 /// draw it at any size without knowing the capture resolution.
@@ -37,6 +37,10 @@ pub struct PreviewFace {
     pub track: u32,
     /// Whether the face is turned toward the camera.
     pub engaged: bool,
+    /// Single focus: this is the one face the robot is attending to.
+    pub focused: bool,
+    /// A wave was seen from this face a moment ago.
+    pub waving: bool,
 }
 
 impl PreviewFace {

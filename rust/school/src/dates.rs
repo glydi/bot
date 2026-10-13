@@ -115,6 +115,21 @@ impl Date {
     }
 }
 
+impl Date {
+    /// The full form for an answer about a coming day: "today, Friday 9
+    /// October", "tomorrow, Saturday 10 October", "on Friday, 16 October".
+    pub fn long(self, today: Self) -> String {
+        let (_, m, d) = self.civil();
+        let month = MONTHS[(m - 1) as usize];
+        let name = self.weekday_name();
+        match today.until(self) {
+            0 => format!("today, {name} {d} {month}"),
+            1 => format!("tomorrow, {name} {d} {month}"),
+            _ => format!("on {name}, {d} {month}"),
+        }
+    }
+}
+
 impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.iso())
@@ -167,6 +182,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// a weekday name (the next one, today included) with `next`/`this`/
 /// `last`/`coming`, `12 October` / `October 12` / `12th of October`,
 /// `12/10` and `12-10` (day first, as spoken here), and `2026-10-12`.
+///
+/// Hinglish too: `aaj` (today), `kal` (tomorrow: the questions a foyer
+/// gets are about days ahead), `parso` (the day after tomorrow), `day
+/// after` alone, and the Hindi weekday names (`somvar` .. `ravivar`),
+/// with `agle`/`agla` for "next".
 pub fn parse_day(text: &str, today: Date) -> Option<Date> {
     let lower = text.to_ascii_lowercase();
     let words: Vec<&str> = lower
@@ -183,11 +203,17 @@ pub fn parse_day(text: &str, today: Date) -> Option<Date> {
         let prev = i.checked_sub(1).map(|j| words[j]);
         let prev2 = i.checked_sub(2).map(|j| words[j]);
         match *w {
-            "today" | "tonight" => consider(i, today),
+            "today" | "tonight" | "aaj" | "aj" | "abhi" => consider(i, today),
+            "parso" | "parson" | "parsoon" | "parsho" => consider(i, today.plus(2)),
+            // "the day after" with no "tomorrow" following: said on its
+            // own it means the day after tomorrow.
+            "after" if prev == Some("day") && words.get(i + 1).is_none_or(|n| *n != "tomorrow") => {
+                consider(i - 1, today.plus(2));
+            }
             "tomorrow" if prev2 == Some("day") && prev == Some("after") => {
                 consider(i - 2, today.plus(2));
             }
-            "tomorrow" => consider(i, today.plus(1)),
+            "tomorrow" | "kal" | "kl" => consider(i, today.plus(1)),
             "yesterday" => consider(i, today.plus(-1)),
             _ => {}
         }
@@ -195,7 +221,7 @@ pub fn parse_day(text: &str, today: Date) -> Option<Date> {
             let ahead = (i64::from(wd) - i64::from(today.weekday())).rem_euclid(7);
             let d = match prev {
                 Some("last" | "previous") => today.plus(if ahead == 0 { -7 } else { ahead - 7 }),
-                Some("next") if ahead == 0 => today.plus(7),
+                Some("next" | "agle" | "agla" | "agli") if ahead == 0 => today.plus(7),
                 _ => today.plus(ahead),
             };
             consider(prev.map_or(i, |_| i.saturating_sub(1)), d);
@@ -223,7 +249,21 @@ pub fn parse_day(text: &str, today: Date) -> Option<Date> {
     best.map(|(_, d)| d)
 }
 
+/// Hindi weekday names as they are typed in Latin script, Monday first.
+const HINDI_WEEKDAYS: [&[&str]; 7] = [
+    &["somvar", "somwar"],
+    &["mangalvar", "mangalwar"],
+    &["budhvar", "budhwar"],
+    &["guruvar", "guruwar", "brihaspativar"],
+    &["shukravar", "shukrawar", "sukravar"],
+    &["shanivar", "shaniwar"],
+    &["ravivar", "raviwar", "itvaar", "itwar"],
+];
+
 fn weekday_index(w: &str) -> Option<u32> {
+    if let Some(p) = HINDI_WEEKDAYS.iter().position(|names| names.contains(&w)) {
+        return Some(p as u32 + 1);
+    }
     let w = w.strip_suffix('s').unwrap_or(w);
     WEEKDAYS
         .iter()
@@ -299,6 +339,31 @@ mod tests {
         assert_eq!(parse_day("tomorrow's timetable", t), Some(t.plus(1)));
         assert_eq!(parse_day("who was absent yesterday", t), Some(t.plus(-1)));
         assert_eq!(parse_day("the day after tomorrow", t), Some(t.plus(2)));
+    }
+
+    #[test]
+    fn hinglish_days() {
+        let t = today();
+        assert_eq!(parse_day("aaj school hai kya", t), Some(t));
+        assert_eq!(parse_day("kal chutti hai kya?", t), Some(t.plus(1)));
+        assert_eq!(parse_day("parso exam hai", t), Some(t.plus(2)));
+        assert_eq!(parse_day("what about the day after?", t), Some(t.plus(2)));
+        assert_eq!(parse_day("day after tomorrow", t), Some(t.plus(2)));
+        assert_eq!(
+            parse_day("shukravar ko PTM hai", t),
+            Some(Date::ymd(2026, 10, 9))
+        );
+        assert_eq!(parse_day("somvar", t), Some(Date::ymd(2026, 10, 12)));
+        assert_eq!(parse_day("agle budhvar", t), Some(t.plus(7)));
+        assert_eq!(parse_day("ravivar", t), Some(Date::ymd(2026, 10, 11)));
+        assert_eq!(parse_day("kalpana is here", t), None);
+    }
+
+    #[test]
+    fn long_form() {
+        let t = today();
+        assert_eq!(t.long(t), "today, Wednesday 7 October");
+        assert_eq!(t.plus(9).long(t), "on Friday, 16 October");
     }
 
     #[test]

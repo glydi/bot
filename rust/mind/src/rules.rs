@@ -77,10 +77,14 @@ impl Rule for GazeFollow {
         };
         // One person: follow them. Several: follow whoever has the floor,
         // so the eyes do not flick between faces.
-        let target = w
-            .engaged_speaker(o.at)
-            .map(|e| e.id.clone())
-            .or_else(|| (w.people_present() == 1).then(|| id.clone()));
+        // Single focus: the eyes stay on the focused person.
+        let target = if w.focus_mode() {
+            w.focus(o.at).cloned()
+        } else {
+            w.engaged_speaker(o.at)
+                .map(|e| e.id.clone())
+                .or_else(|| (w.people_present() == 1).then(|| id.clone()))
+        };
         if target.as_ref() != Some(id) {
             return;
         }
@@ -836,6 +840,46 @@ fn has_intent(out: &Commands) -> bool {
 pub struct WaveHello {
     /// The gesture this pass, for `plan`.
     seen: RefCell<Option<Gesture>>,
+    /// The last wave answered per person, and how.
+    answered: RefCell<std::collections::HashMap<EntityId, (Instant, WaveReply)>>,
+}
+
+/// What a wave gets back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveReply {
+    /// "Hi Kalyan!": they arrived, or have not been greeted.
+    Hi,
+    /// "Bye Kalyan, see you!": we have been with them a while (greeted
+    /// [`WAVE_QUIET`] ago or more), so the wave is a goodbye.
+    Bye,
+    /// A wave answered inside [`WAVE_QUIET`], or one just after the
+    /// hello: nothing more.
+    Nothing,
+}
+
+/// No second answer to the same person's waves inside this.
+pub const WAVE_QUIET: Duration = Duration::from_secs(30);
+
+/// Hi or bye for a wave at `now`, from when they were last greeted and
+/// how their last wave was answered. Deterministic, no model.
+pub fn wave_reply(
+    greeted_at: Option<Instant>,
+    last: Option<(Instant, WaveReply)>,
+    now: Instant,
+) -> WaveReply {
+    if let Some((at, how)) = last {
+        if now.saturating_duration_since(at) < WAVE_QUIET {
+            return WaveReply::Nothing;
+        }
+        if how == WaveReply::Bye {
+            return WaveReply::Hi;
+        }
+    }
+    match greeted_at.map(|g| now.saturating_duration_since(g)) {
+        Some(since) if since < WAVE_QUIET => WaveReply::Nothing,
+        Some(since) if since < GREET_WINDOW => WaveReply::Bye,
+        _ => WaveReply::Hi,
+    }
 }
 
 /// One gesture, held between `apply` and `plan`: who, what, when. The
@@ -896,17 +940,39 @@ impl Rule for WaveHello {
         };
         match kind.as_slice() {
             b"wave" => {
+                // Single focus: only the focused person's wave counts.
+                if cx.world.focus_mode() && cx.world.focus(now) != Some(&id) {
+                    return;
+                }
                 if cx.world.bot_speaking() || cx.world.anyone_speaking() {
                     return;
                 }
                 out.push(react("nod"));
-                if cx.working.greeted_within(&id, now, GREET_WINDOW) || has_intent(out) {
+                if has_intent(out) {
                     return;
                 }
-                cx.working.greeted(id.clone(), now);
+                let last = self.answered.borrow().get(&id).copied();
+                let reply = wave_reply(cx.working.greeted_at(&id), last, now);
+                let name = cx
+                    .world
+                    .get(&id)
+                    .filter(|e| e.is_known())
+                    .and_then(|e| e.name.as_deref())
+                    .map(|n| n.replace('"', ""));
+                let text = match (reply, name) {
+                    (WaveReply::Nothing, _) => return,
+                    (WaveReply::Hi, Some(n)) => format!("Hi {n}!"),
+                    (WaveReply::Hi, None) => "Hi there!".to_owned(),
+                    (WaveReply::Bye, Some(n)) => format!("Bye {n}, see you!"),
+                    (WaveReply::Bye, None) => "Bye, see you!".to_owned(),
+                };
+                self.answered.borrow_mut().insert(id.clone(), (now, reply));
+                if reply == WaveReply::Hi {
+                    cx.working.greeted(id.clone(), now);
+                }
+                // Goal `wave`: a fixed line, said as is (no model).
                 out.push(intent(format!(
-                    "{{\"decision\":\"say\",\"text\":\"{}\",\"entity\":\"{}\",\"goal\":\"greet\"}}",
-                    Self::HELLO,
+                    "{{\"decision\":\"say\",\"text\":\"{text}\",\"entity\":\"{}\",\"goal\":\"wave\"}}",
                     id.as_str().replace('"', "")
                 )));
             }
@@ -1198,6 +1264,19 @@ impl Rule for AttentionRotation {
     }
 }
 
+/// The rules single-focus mode leaves out: remarks about the room and
+/// newcomers ("Someone new -- who's that?"), check-ins ("Still there?"),
+/// invitations to the background and rotating the floor between people.
+/// The reflexes that matter (barge-in, greeting on arrival through the
+/// planner, a wave back, goodbye) stay.
+pub const SINGLE_FOCUS_OFF: [&str; 5] = [
+    "curiosity",
+    "follow_up",
+    "invite",
+    "muse",
+    "attention_rotation",
+];
+
 /// The standard rule set, in the order they run.
 pub fn default_rules() -> SmallVec<[Box<dyn Rule>; 4]> {
     let mut v: SmallVec<[Box<dyn Rule>; 4]> = SmallVec::new();
@@ -1319,7 +1398,7 @@ mod tests {
         assert_eq!(reacts(&out), ["nod"]);
         assert_eq!(
             intents(&out),
-            [r#"{"decision":"say","text":"Hi!","entity":"track:7","goal":"greet"}"#]
+            [r#"{"decision":"say","text":"Hi there!","entity":"track:7","goal":"wave"}"#]
         );
         assert!(r.working().greeted_at(&EntityId::for_track(7)).is_some());
         // A second wave inside the greet window: a nod, no second hello.
@@ -1333,6 +1412,71 @@ mod tests {
         // A wave from nobody in particular is not a wave.
         let out = r.on_observation(&text_obs(clock.at_secs(32.0), GESTURE, "wave"));
         assert!(reacts(&out).is_empty());
+    }
+
+    #[test]
+    fn wave_reply_is_hi_then_quiet_then_bye_then_hi() {
+        let t0 = Instant::now();
+        let s = |x: u64| t0 + Duration::from_secs(x);
+        // Never greeted: hi.
+        assert_eq!(wave_reply(None, None, s(0)), WaveReply::Hi);
+        // Greeted by the planner a moment ago: a wave is not a second hi.
+        assert_eq!(wave_reply(Some(s(0)), None, s(5)), WaveReply::Nothing);
+        // Talking a while, then a wave: goodbye.
+        assert_eq!(wave_reply(Some(s(0)), None, s(90)), WaveReply::Bye);
+        // A second wave inside 30 s of the answer: nothing.
+        assert_eq!(
+            wave_reply(Some(s(0)), Some((s(90), WaveReply::Bye)), s(100)),
+            WaveReply::Nothing
+        );
+        // After a goodbye and 30 s, a wave is a new hello.
+        assert_eq!(
+            wave_reply(Some(s(0)), Some((s(90), WaveReply::Bye)), s(125)),
+            WaveReply::Hi
+        );
+        // Long gone: hi again.
+        assert_eq!(wave_reply(Some(s(0)), None, s(3600)), WaveReply::Hi);
+    }
+
+    #[test]
+    fn a_known_person_waving_hello_then_goodbye() {
+        let clock = FakeClock::new();
+        let mut r = Reflex::with_rules("wave-bye", clock.now(), cognitive_rules());
+        r.world_mut().set_name(&EntityId::new("kalyan"), "Kalyan");
+        let k = EntityHint::Known(EntityId::new("kalyan"));
+        // In focus (single focus on) and seen, then waves before any hello.
+        // The arrival and the wave together get one hello, not two.
+        let mut said = intents(&r.on_observation(
+            &Observation::new("cam0", "focus", clock.at_secs(0.0)).with_entity(k.clone()),
+        ));
+        said.extend(intents(&r.on_observation(&gesture(
+            clock.at_secs(0.2),
+            k.clone(),
+            "wave",
+        ))));
+        assert_eq!(
+            said.iter().filter(|i| i.contains("Hi Kalyan")).count(),
+            1,
+            "{said:?}"
+        );
+        // Talk for a minute (kept in view), then a wave while leaving.
+        for i in 1..=60u32 {
+            let t = clock.at_secs(f64::from(i));
+            r.on_observation(&Observation::new("cam0", "focus", t).with_entity(k.clone()));
+            r.on_observation(&face(t, k.clone()));
+        }
+        let out = r.on_observation(&gesture(clock.at_secs(60.5), k.clone(), "wave"));
+        let said = intents(&out);
+        assert_eq!(
+            said,
+            [r#"{"decision":"say","text":"Bye Kalyan, see you!","entity":"kalyan","goal":"wave"}"#]
+        );
+        // Someone else in the background waving: ignored in single focus.
+        let t9 = EntityHint::Track(9);
+        r.on_observation(&face(clock.at_secs(61.0), t9.clone()));
+        r.on_observation(&Observation::new("cam0", "focus", clock.at_secs(61.0)).with_entity(k));
+        let out = r.on_observation(&gesture(clock.at_secs(61.2), t9, "wave"));
+        assert!(intents(&out).is_empty() && reacts(&out).is_empty());
     }
 
     #[test]

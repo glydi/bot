@@ -25,6 +25,10 @@ pub trait SchoolLink: Send + Sync {
     /// `speaker` is the gallery name of whoever asked, when known, so
     /// "what do I have today" reads their own timetable.
     fn answer(&self, text: &str, speaker: Option<&str>) -> Option<String>;
+
+    /// The conversation reset (a forget, a new visit): drop whatever
+    /// follow-up context `answer` keeps. Nothing by default.
+    fn forget(&self) {}
 }
 
 impl fmt::Debug for dyn SchoolLink {

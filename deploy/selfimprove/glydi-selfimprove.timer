@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GLYDI self-improvement nightly at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

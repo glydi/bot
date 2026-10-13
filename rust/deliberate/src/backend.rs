@@ -323,7 +323,7 @@ fn drain_sse_lines(buf: &mut String) -> Vec<String> {
 
 impl OpenAiBackend {
     /// The default local server: Ollama's `OpenAI` endpoint.
-    pub const DEFAULT_BASE_URL: &'static str = "http://localhost:11434/v1";
+    pub const DEFAULT_BASE_URL: &'static str = "http://127.0.0.1:11434/v1";
     /// The default model (see the module docs for why).
     pub const DEFAULT_MODEL: &'static str = "qwen2.5:3b";
 

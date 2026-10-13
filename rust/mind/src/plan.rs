@@ -408,6 +408,7 @@ impl Planner {
                 // answers must not block the question for everyone).
                 let engaged = entity.attentive(now);
                 let addressed = working.crowd.present < BUSY
+                    || world.focus(now) == Some(id)
                     || working.crowd.engaged.as_ref() == Some(id)
                     || entity
                         .last_spoke
@@ -445,6 +446,13 @@ impl Planner {
         let Some(entity) = world.get(id) else {
             return Decision::Wait;
         };
+        // Only someone who looks at us gets a hello: a person walking past
+        // or busy with something else is left in peace. `attentive` is
+        // facing the bot for ATTENTIVE_AFTER (1.5 s), or already talking
+        // with it; with no camera data it is always true.
+        if !entity.attentive(now) {
+            return Decision::Wait;
+        }
         let returned = entity.returned.filter(|(when, away)| {
             *away >= RETURN_GREET_MIN_AWAY
                 && now.saturating_duration_since(*when) < RETURN_GREET_TTL
@@ -714,6 +722,27 @@ impl PlannerRule {
     /// Decide and, if there is something to do, emit the intent and update
     /// the goal stack / working memory to reflect that it was done.
     pub fn run(cx: &mut Cognition<'_>, now: Instant, out: &mut Commands) -> Decision {
+        // Single focus: one person at a time. Nobody in focus, or a top
+        // goal about someone else, and nothing is said.
+        if cx.world.focus_mode() {
+            let Some(focus) = cx.world.focus(now).cloned() else {
+                return Decision::Wait;
+            };
+            cx.goals.focus_on(&focus);
+            if !cx.goals.current().is_about(&focus) {
+                return Decision::Wait;
+            }
+            // A group hello folded into theirs, for someone already
+            // greeted: owed to nobody.
+            if *cx.goals.current() == Goal::Greet(focus.clone())
+                && cx
+                    .working
+                    .greeted_within(&focus, now, crate::goal::GREET_WINDOW)
+            {
+                cx.goals.pop();
+                return Decision::Wait;
+            }
+        }
         let decision = Planner::decide_at(cx.world, cx.working, cx.goals, now);
         if decision == Decision::Wait {
             return decision;

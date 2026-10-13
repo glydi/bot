@@ -59,6 +59,8 @@ ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "l
 # and output tensors are `half::f16` (ort's `half` feature).
 half = { version = "2", default-features = false }
 whisper-rs = "0.16"
+# sense-audio: RNNoise in pure Rust (GLYDI_DENOISE=rnnoise).
+nnnoiseless = { version = "0.5", default-features = false }
 
 # act-speaker: espeak-ng for the Kokoro phonemizer is dlopen'd (no build-time
 # link), the rest of the speaker rides on cpal/ort above.
@@ -84,6 +86,8 @@ block2 = "0.6"
 # other Linux box). Safe ioctl wrappers over `v4l2-sys-mit`; used only from
 # sense-vision/src/camera_v4l2.rs.
 v4l = "0.14"
+# Windows camera (Media Foundation), safe API; only sense-vision/src/camera_msmf.rs.
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-msmf"] }
 
 [workspace.lints.rust]
 # Sense/actuator crates that need FFI override this per crate, isolating the

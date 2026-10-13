@@ -584,6 +584,8 @@ mod tests {
             score: 0.8,
             track,
             engaged: true,
+            focused: false,
+            waving: false,
         };
         let preview = |faces: Vec<PreviewFace>| {
             Observation::new("cam0", MODALITY_CAMERA_PREVIEW, now).with_payload(Payload::Opaque(

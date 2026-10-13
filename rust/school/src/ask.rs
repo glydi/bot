@@ -51,27 +51,36 @@ pub fn parse_span(text: &str, today: Date) -> Option<(Date, Date)> {
 /// order), said as one line: "This week: PTM on Friday; no school on
 /// Monday (Gandhi Jayanti)."
 pub fn answer_span(question: Question, days: &[Day], today: Date, label: &str) -> String {
-    let mut items: Vec<String> = Vec::new();
+    let mut items: Vec<(Date, String)> = Vec::new();
     for d in days {
         let Some(date) = d.date() else { continue };
         let when = date.spoken(today);
         if !d.open {
             if matches!(question, Question::Open | Question::Events) {
-                items.push(format!(
-                    "no school {when} ({})",
-                    d.reason.as_deref().unwrap_or("holiday")
+                items.push((
+                    date,
+                    format!(
+                        "no school {when} ({})",
+                        d.reason.as_deref().unwrap_or("holiday")
+                    ),
                 ));
             }
             continue;
         }
         if matches!(question, Question::Events | Question::Open) {
             for e in &d.events {
-                items.push(format!("{e} {when}"));
+                // "PTM on Friday" listed under today names its own day:
+                // said as it is, placed on that day, never "on Friday today".
+                if parse_day(e, date).is_some() {
+                    items.push((event_date(e, date), e.clone()));
+                } else {
+                    items.push((date, format!("{e} {when}")));
+                }
             }
         }
         if matches!(question, Question::Exams | Question::Open) {
             for e in &d.exams {
-                items.push(format!("{} {when}", e.name));
+                items.push((date, format!("{} {when}", e.name)));
             }
         }
     }
@@ -81,6 +90,8 @@ pub fn answer_span(question: Question, days: &[Day], today: Date, label: &str) -
             _ => format!("Nothing special {label}; every day is a normal school day."),
         };
     }
+    items.sort_by_key(|(d, _)| *d);
+    let items: Vec<String> = items.into_iter().map(|(_, s)| s).collect();
     format!("{}: {}.", capitalise(label), items.join("; "))
 }
 
@@ -101,9 +112,13 @@ pub fn classify(text: &str, today: Date) -> Option<(Question, Date)> {
         "missing today",
         "late today",
         "who is late",
+        "kaun absent",
+        "kon absent",
+        "nahi aaya",
+        "nahi aayi",
     ]) {
         Question::Absent
-    } else if has(&["exam", "test paper", "unit test"]) {
+    } else if has(&["exam", "test paper", "unit test", "pariksha"]) {
         Question::Exams
     } else if has(&[
         "timetable",
@@ -147,6 +162,13 @@ pub fn classify(text: &str, today: Date) -> Option<(Question, Date)> {
         "day off",
         "closed",
         "is it open",
+        "chutti",
+        "chhutti",
+        "chuti",
+        "school hai",
+        "school khula",
+        "school band",
+        "school open",
     ]) {
         Question::Open
     } else {
@@ -339,6 +361,341 @@ pub fn answer(question: Question, day: &Day, school: &Day, today: Date, asker: &
     }
 }
 
+/// What a "when is ..." question is looking for in the days ahead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Topic {
+    /// A day off; with a name ("summer", "Diwali") when one was said.
+    Holiday(Option<String>),
+    /// Exams; with a qualifier ("maths", "unit") when one was said.
+    Exam(Option<String>),
+    /// A named event: "ptm", "annual day", "sports day".
+    Event(String),
+}
+
+/// Words that make a phrase an event worth searching the calendar for.
+const EVENT_WORDS: [&str; 23] = [
+    "ptm",
+    "parent",
+    "meeting",
+    "event",
+    "function",
+    "match",
+    "assembly",
+    "celebration",
+    "festival",
+    "fest",
+    "trip",
+    "picnic",
+    "competition",
+    "ceremony",
+    "annual",
+    "sports",
+    "independence",
+    "republic",
+    "olympiad",
+    "exhibition",
+    "fair",
+    "concert",
+    "orientation",
+];
+
+/// A forward search: "when is the PTM?", "when are the exams?", "next
+/// holiday", "PTM kab hai". `None` when `text` is not one, or names a day
+/// already (that is [`classify`]'s question).
+#[allow(clippy::too_many_lines)]
+pub fn classify_when(text: &str, today: Date) -> Option<Topic> {
+    let lower = text
+        .to_ascii_lowercase()
+        .replace(['?', '.', ',', '!', '\''], " ");
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let joined = words.join(" ");
+    let asks_when = [
+        "when is",
+        "when are",
+        "when s",
+        "when do",
+        "when does",
+        "when will",
+    ]
+    .iter()
+    .any(|p| joined.contains(p))
+        || ["kab", "next", "upcoming", "agla", "agli"]
+            .iter()
+            .any(|w| words.contains(w));
+    if !asks_when || parse_day(&joined, today).is_some() || parse_span(&joined, today).is_some() {
+        return None;
+    }
+    let filler = [
+        "when",
+        "is",
+        "are",
+        "s",
+        "do",
+        "does",
+        "will",
+        "the",
+        "a",
+        "an",
+        "next",
+        "upcoming",
+        "coming",
+        "start",
+        "starts",
+        "begin",
+        "begins",
+        "be",
+        "kab",
+        "hai",
+        "hain",
+        "agla",
+        "agli",
+        "our",
+        "my",
+        "school",
+        "held",
+        "happen",
+        "happening",
+        "there",
+        "going",
+        "to",
+        "of",
+        "please",
+        "tell",
+        "me",
+        "can",
+        "you",
+        "ka",
+        "ki",
+        "ke",
+    ];
+    let rest: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| !filler.contains(w))
+        .collect();
+    let holiday = [
+        "holiday",
+        "holidays",
+        "vacation",
+        "vacations",
+        "chutti",
+        "chhutti",
+        "chuti",
+    ];
+    let exam = [
+        "exam",
+        "exams",
+        "examination",
+        "examinations",
+        "test",
+        "tests",
+        "pariksha",
+    ];
+    let without = |set: &[&str]| -> Option<String> {
+        let name: Vec<&str> = rest.iter().copied().filter(|w| !set.contains(w)).collect();
+        (!name.is_empty()).then(|| name.join(" "))
+    };
+    if rest.iter().any(|w| holiday.contains(w)) {
+        return Some(Topic::Holiday(without(&holiday)));
+    }
+    if rest.iter().any(|w| exam.contains(w)) {
+        return Some(Topic::Exam(without(&exam)));
+    }
+    if !rest.is_empty() && rest.len() <= 4 && rest.iter().any(|w| EVENT_WORDS.contains(w)) {
+        return Some(Topic::Event(rest.join(" ")));
+    }
+    None
+}
+
+/// The date an event falls on: its own text may name it ("PTM on
+/// Friday" listed under Monday), else the day it is listed under.
+pub fn event_date(event: &str, listed: Date) -> Date {
+    parse_day(event, listed)
+        .filter(|d| *d >= listed && listed.until(*d) < 7)
+        .unwrap_or(listed)
+}
+
+/// Whether `event` is the one `want` names: every word of `want` in it
+/// ("ptm" also matches "parent-teacher meeting").
+pub fn event_matches(event: &str, want: &str) -> bool {
+    let e = event.to_ascii_lowercase();
+    want.split_whitespace().all(|w| {
+        e.contains(w)
+            || (w == "ptm" && e.contains("parent") && e.contains("teacher"))
+            || (w == "parent" && e.contains("ptm"))
+    })
+}
+
+/// The spoken name of a topic: "PTM", "annual day".
+fn topic_name(want: &str) -> String {
+    want.split_whitespace()
+        .map(|w| {
+            if w == "ptm" {
+                "PTM".to_owned()
+            } else {
+                w.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a closed day is only a weekend, not a holiday worth naming.
+fn weekend_only(day: &Day) -> bool {
+    day.reason.as_deref().is_none_or(|r| {
+        matches!(
+            r.to_ascii_lowercase().as_str(),
+            "saturday" | "sunday" | "weekend"
+        )
+    })
+}
+
+/// The answer to a forward search over `days` (the school-wide days
+/// from today on, in order, as far ahead as the snapshot reaches), and
+/// the date found. Says plainly when the calendar does not have it and
+/// sends the asker to the office; never guesses.
+#[allow(clippy::too_many_lines)]
+pub fn answer_when(topic: &Topic, days: &[Day], today: Date) -> (String, Option<Date>) {
+    if days.is_empty() {
+        return (
+            "I don't have the school calendar loaded yet; the office would know.".to_owned(),
+            None,
+        );
+    }
+    let last = days.iter().filter_map(Day::date).max().unwrap_or(today);
+    // A short snapshot is not worth a number of days: "in the calendar
+    // I have" says the same without sounding like a limit of the school.
+    let span = today.until(last) + 1;
+    let reach = if span < 14 {
+        "in the calendar I have".to_owned()
+    } else {
+        format!("in the school calendar for the next {span} days")
+    };
+    match topic {
+        Topic::Holiday(name) => {
+            for d in days {
+                let Some(date) = d.date() else { continue };
+                let hit = match name {
+                    None => {
+                        (!d.open && !weekend_only(d))
+                            || d.events
+                                .iter()
+                                .any(|e| e.to_ascii_lowercase().contains("holiday"))
+                    }
+                    Some(n) => {
+                        (!d.open && d.reason.as_deref().is_some_and(|r| event_matches(r, n)))
+                            || d.events.iter().any(|e| event_matches(e, n))
+                    }
+                };
+                if hit {
+                    let why = d
+                        .reason
+                        .clone()
+                        .or_else(|| d.events.first().cloned())
+                        .unwrap_or_else(|| "a holiday".to_owned());
+                    let label = name.as_deref().map_or_else(
+                        || "The next holiday".to_owned(),
+                        |n| format!("The {n} holiday"),
+                    );
+                    return (
+                        format!("{label} is {}: {why}.", date.long(today)),
+                        Some(date),
+                    );
+                }
+            }
+            let what = name
+                .as_deref()
+                .map_or_else(|| "a holiday".to_owned(), |n| format!("the {n} holidays"));
+            (
+                format!("I don't see {what} {reach}; the office would know."),
+                None,
+            )
+        }
+        Topic::Exam(name) => {
+            let hits: Vec<(Date, &crate::day::Exam)> = days
+                .iter()
+                .filter_map(|d| d.date().map(|date| (date, d)))
+                .flat_map(|(date, d)| d.exams.iter().map(move |e| (date, e)))
+                .filter(|(_, e)| {
+                    name.as_deref().is_none_or(|n| {
+                        let all = format!(
+                            "{} {} {}",
+                            e.name,
+                            e.subject.as_deref().unwrap_or(""),
+                            e.class.as_deref().unwrap_or("")
+                        );
+                        event_matches(&all, n)
+                    })
+                })
+                .collect();
+            let Some((first, _)) = hits.first().copied() else {
+                return (
+                    format!("There are no exams {reach}; the office would know the exam dates."),
+                    None,
+                );
+            };
+            let on_first: Vec<String> = hits
+                .iter()
+                .filter(|(d, _)| *d == first)
+                .map(|(_, e)| match &e.subject {
+                    Some(sub) => format!("{sub} ({})", e.name),
+                    None => e.name.clone(),
+                })
+                .collect();
+            let mut s = format!(
+                "The next exams are {}: {}.",
+                first.long(today),
+                list(&on_first)
+            );
+            let more = hits.iter().filter(|(d, _)| *d != first).count();
+            if more > 0 {
+                let _ = write!(s, " There {} {more} more after that.", plural_verb(more));
+            }
+            (s, Some(first))
+        }
+        Topic::Event(want) => {
+            for d in days {
+                let Some(listed) = d.date() else { continue };
+                if let Some(e) = d.events.iter().find(|e| event_matches(e, want)) {
+                    let date = event_date(e, listed);
+                    return (
+                        format!("The {} is {}.", topic_name(want), date.long(today)),
+                        Some(date),
+                    );
+                }
+            }
+            (
+                format!(
+                    "I don't see the {} {reach}; the office would know.",
+                    topic_name(want)
+                ),
+                None,
+            )
+        }
+    }
+}
+
+/// The event word a day question is about, when it names one: "is there
+/// assembly today" -> "assembly". Generic words ("event", "what's on")
+/// give `None`, which means all events.
+pub fn event_topic(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    [
+        "ptm",
+        "assembly",
+        "match",
+        "celebration",
+        "function",
+        "sports day",
+        "annual day",
+        "trip",
+        "picnic",
+        "competition",
+    ]
+    .into_iter()
+    .find(|w| lower.contains(w))
+}
+
 fn list(items: &[String]) -> String {
     match items {
         [] => String::new(),
@@ -425,6 +782,94 @@ mod tests {
         assert_eq!(classify("what's on today", t), Some((Question::Events, t)));
         assert_eq!(classify("I like holidays", t), None);
         assert_eq!(classify("what is your name", t), None);
+    }
+
+    #[test]
+    fn hinglish_questions() {
+        let t = today();
+        assert_eq!(
+            classify("kal chutti hai kya?", t),
+            Some((Question::Open, t.plus(1)))
+        );
+        assert_eq!(
+            classify("kal school hai kya", t),
+            Some((Question::Open, t.plus(1)))
+        );
+        assert_eq!(
+            classify("parso exam hai?", t),
+            Some((Question::Exams, t.plus(2)))
+        );
+    }
+
+    #[test]
+    fn forward_search_classifies() {
+        let t = today();
+        assert_eq!(
+            classify_when("when is the PTM?", t),
+            Some(Topic::Event("ptm".into()))
+        );
+        assert_eq!(
+            classify_when("when are the exams?", t),
+            Some(Topic::Exam(None))
+        );
+        assert_eq!(
+            classify_when("when is the next holiday?", t),
+            Some(Topic::Holiday(None))
+        );
+        assert_eq!(
+            classify_when("when do summer holidays start?", t),
+            Some(Topic::Holiday(Some("summer".into())))
+        );
+        assert_eq!(
+            classify_when("when is the annual day?", t),
+            Some(Topic::Event("annual day".into()))
+        );
+        assert_eq!(
+            classify_when("PTM kab hai", t),
+            Some(Topic::Event("ptm".into()))
+        );
+        assert_eq!(classify_when("when is the PTM on friday", t), None);
+        assert_eq!(classify_when("when is your birthday", t), None);
+        assert_eq!(classify_when("when is Mrs Rao free", t), None);
+    }
+
+    #[test]
+    fn forward_search_answers_from_the_days() {
+        let t = today(); // Wednesday 7 October
+        let mut d0 = open_day(t);
+        d0.events.push("PTM on Friday".into());
+        let d1 = Day::closed(t.plus(1), "Gandhi Jayanti");
+        let mut d5 = open_day(t.plus(5));
+        d5.exams.push(Exam {
+            name: "Unit test".into(),
+            subject: Some("Maths".into()),
+            class: None,
+            starts: None,
+        });
+        let days = vec![d0, d1, open_day(t.plus(2)), d5];
+        let a = |topic: Topic| answer_when(&topic, &days, t).0;
+        assert_eq!(
+            a(Topic::Event("ptm".into())),
+            "The PTM is on Friday, 9 October."
+        );
+        assert_eq!(
+            a(Topic::Holiday(None)),
+            "The next holiday is tomorrow, Thursday 8 October: Gandhi Jayanti."
+        );
+        assert_eq!(
+            a(Topic::Exam(None)),
+            "The next exams are on Monday, 12 October: Maths (Unit test)."
+        );
+        assert_eq!(
+            a(Topic::Holiday(Some("summer".into()))),
+            "I don't see the summer holidays in the calendar I have; the office would know."
+        );
+        assert_eq!(
+            a(Topic::Event("annual day".into())),
+            "I don't see the annual day in the calendar I have; the office would know."
+        );
+        assert!(a(Topic::Exam(Some("science".into()))).starts_with("There are no exams"));
+        assert!(answer_when(&Topic::Exam(None), &[], t).0.contains("office"));
     }
 
     #[test]

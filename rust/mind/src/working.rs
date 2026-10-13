@@ -429,7 +429,6 @@ impl WorkingMemory {
     pub fn has_asked_name(&self, entity: &EntityId) -> bool {
         self.name_asked.contains(entity)
     }
-
     /// Record that we asked `entity` something.
     pub fn ask(&mut self, entity: EntityId, text: impl Into<String>, at: Instant) {
         if self.open_questions.len() >= MAX_OPEN_QUESTIONS {
@@ -686,6 +685,10 @@ pub struct WorkingSnapshot {
     pub dark: bool,
     /// The room as a crowd. `Default` (nobody) for a bare snapshot.
     pub crowd: CrowdSnapshot,
+    /// Single focus (`World::focus_mode`) is running.
+    pub focus_mode: bool,
+    /// The one person in focus (`World::focus`), if any.
+    pub focus: Option<EntityId>,
 }
 
 impl WorkingSnapshot {
@@ -703,6 +706,8 @@ impl WorkingSnapshot {
             })
             .collect();
         let engaged = world.engaged_speaker(now).map(|e| e.id.clone());
+        let focus_mode = world.focus_mode();
+        let focus = world.focus(now).cloned();
         match working {
             Some(w) => Self {
                 topic: w.topic.clone(),
@@ -722,10 +727,14 @@ impl WorkingSnapshot {
                 objects: w.objects.clone(),
                 dark: w.dark,
                 crowd: CrowdSnapshot::capture(&w.crowd, world),
+                focus_mode,
+                focus,
             },
             None => Self {
                 beliefs,
                 engaged,
+                focus_mode,
+                focus,
                 ..Self::default()
             },
         }

@@ -67,6 +67,10 @@ pub const DIM: u8 = 0xdc;
 pub const KNOWN: egui::Color32 = egui::Color32::from_rgb(0x3f, 0x8e, 0x6a);
 /// A stranger.
 pub const STRANGER: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x2a);
+/// The focused face (single focus).
+pub const FOCUS: egui::Color32 = egui::Color32::from_rgb(0x1f, 0xc0, 0x4a);
+/// Any other face in single focus.
+pub const BACKGROUND: egui::Color32 = egui::Color32::from_gray(0x9a);
 
 /// One boxed face in the strip, ready to draw: where the box goes (in
 /// fractions of the thumbnail, as the preview gives them), what to write
@@ -86,6 +90,13 @@ pub struct StripRow {
     /// Whether the mind says they are engaged (turned toward the camera),
     /// which thickens the box.
     pub engaged: bool,
+    /// Single focus: the one face the robot is attending to (drawn green
+    /// and thick; the others thin and grey).
+    pub focused: bool,
+    /// Whether any face in the preview is focused (single-focus mode).
+    pub focus_mode: bool,
+    /// A wave was seen from this face a moment ago.
+    pub waving: bool,
     /// Left edge, 0..1 of the thumbnail width.
     pub x: f32,
     /// Top edge, 0..1 of the height.
@@ -99,12 +110,26 @@ pub struct StripRow {
 impl StripRow {
     /// The box colour: green when the person is named, amber when not.
     pub fn colour(&self) -> egui::Color32 {
+        if self.focus_mode {
+            return if self.focused { FOCUS } else { BACKGROUND };
+        }
         if self.known { KNOWN } else { STRANGER }
+    }
+
+    /// Box stroke width: the focused face thick, background faces thin.
+    pub fn stroke(&self) -> f32 {
+        match (self.focus_mode, self.focused, self.engaged) {
+            (true, true, _) => 3.5,
+            (true, false, _) => 0.75,
+            (false, _, true) => 2.5,
+            (false, _, false) => 1.0,
+        }
     }
 
     /// `ana 0.87` -- what goes under the box.
     pub fn caption(&self) -> String {
-        format!("{} {}", self.label, self.score)
+        let hand = if self.waving { "WAVE " } else { "" };
+        format!("{hand}{} {}", self.label, self.score)
     }
 }
 
@@ -114,6 +139,7 @@ impl StripRow {
 /// difference between "camera off" and "nobody there".
 pub fn strip_rows(preview: Option<&Preview>) -> Vec<StripRow> {
     preview.map_or_else(Vec::new, |p| {
+        let focus_mode = p.faces.iter().any(|f| f.focused);
         p.faces
             .iter()
             .map(|f| StripRow {
@@ -126,6 +152,9 @@ pub fn strip_rows(preview: Option<&Preview>) -> Vec<StripRow> {
                 track: format!("#{}", f.track),
                 known: f.is_known(),
                 engaged: f.engaged,
+                focused: f.focused,
+                focus_mode,
+                waving: f.waving,
                 x: f.x,
                 y: f.y,
                 w: f.w,
@@ -257,7 +286,7 @@ pub fn show(
         painter.rect_stroke(
             boxed,
             2,
-            egui::Stroke::new(if r.engaged { 2.5 } else { 1.0 }, colour),
+            egui::Stroke::new(r.stroke(), colour),
             egui::StrokeKind::Outside,
         );
         // On a plate: a name drawn straight onto a lit face was the one
@@ -346,6 +375,8 @@ mod tests {
             score,
             track,
             engaged,
+            focused: false,
+            waving: false,
         }
     }
 

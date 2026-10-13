@@ -71,6 +71,14 @@ enum Cmd {
         /// goes: faces, voices, facts, episodes.
         #[arg(long = "forget", value_name = "NAME|ID")]
         forget: Vec<String>,
+        /// Enrol a person's face from photos: `--enrol Kalyan --image a.jpg
+        /// --image b.jpg`. The largest face in each photo is used; a photo
+        /// with no clear face is skipped and said so.
+        #[arg(long = "enrol", value_name = "NAME", requires = "image")]
+        enrol: Option<String>,
+        /// Photo(s) for `--enrol`.
+        #[arg(long = "image", value_name = "PATH")]
+        image: Vec<PathBuf>,
     },
     /// The school ERP: check the sign-in, link an enrolled face to its
     /// record, ask about a day. Reads `GLYDI_ERP_URL`, `GLYDI_ERP_USER` and
@@ -168,28 +176,12 @@ fn main() -> anyhow::Result<()> {
             };
             run(&config, parts, &window)
         }
-        Cmd::People { config, forget } => {
-            let config = Config::load(config.as_deref())?;
-            let store = memory::Store::open(&config.db)?;
-            for who in &forget {
-                match store.forget_named(who) {
-                    Ok(true) => println!("forgot {who}"),
-                    Ok(false) => println!("no one called {who}"),
-                    Err(e) => println!("could not forget {who}: {e}"),
-                }
-            }
-            let people = store.people()?;
-            if people.is_empty() {
-                println!("the gallery is empty");
-            }
-            for p in &people {
-                println!(
-                    "{:<14} {:<16} faces={:<3} voices={:<3} facts={}",
-                    p.id, p.name, p.faces, p.voices, p.facts
-                );
-            }
-            Ok(())
-        }
+        Cmd::People {
+            config,
+            forget,
+            enrol,
+            image,
+        } => people(config.as_deref(), &forget, enrol.as_deref(), &image),
         Cmd::School { what } => {
             let config = Config::load(None)?;
             school(&config, what)
@@ -465,6 +457,107 @@ mod gpu {
         tracing::debug!(n = libs.len(), dir = %dir.display(), "cuda libraries loaded");
         libs
     }
+}
+
+/// `glydi people`: forget, enrol from photos, then list the gallery.
+fn people(
+    config: Option<&std::path::Path>,
+    forget: &[String],
+    enrol: Option<&str>,
+    image: &[PathBuf],
+) -> anyhow::Result<()> {
+    let config = Config::load(config)?;
+    let store = memory::Store::open(&config.db)?;
+    if let Some(name) = enrol {
+        enrol_from_photos(&config, &store, name, image)?;
+    }
+    for who in forget {
+        match store.forget_named(who) {
+            Ok(true) => println!("forgot {who}"),
+            Ok(false) => println!("no one called {who}"),
+            Err(e) => println!("could not forget {who}: {e}"),
+        }
+    }
+    let people = store.people()?;
+    if people.is_empty() {
+        println!("the gallery is empty");
+    }
+    for p in &people {
+        println!(
+            "{:<14} {:<16} faces={:<3} voices={:<3} facts={}",
+            p.id, p.name, p.faces, p.voices, p.facts
+        );
+    }
+    Ok(())
+}
+
+/// Enrol `name` from photos: SCRFD finds the largest face in each, the
+/// five landmarks align it, `ArcFace` fingerprints it, and the gallery keeps
+/// the fingerprints under that name -- the same path a live enrolment
+/// takes, so the camera recognises the person from then on.
+#[cfg(feature = "vision")]
+fn enrol_from_photos(
+    config: &Config,
+    store: &memory::Store,
+    name: &str,
+    images: &[PathBuf],
+) -> anyhow::Result<()> {
+    use sense_vision::arcface::FaceEmbedder;
+    use sense_vision::scrfd::FaceDetector;
+    let vc = sense_vision::VisionConfig {
+        models_dir: config.face_models_dir.clone(),
+        ort_lib: config.ort_lib.clone(),
+        ..sense_vision::VisionConfig::default()
+    };
+    let mut detector =
+        sense_vision::scrfd::Scrfd::open(&vc.detector_path(), &vc.ort_lib, 640, 0.5, 0.4, 2)?;
+    let mut embedder = sense_vision::arcface::ArcFace::open(&vc.recogniser_path(), &vc.ort_lib, 2)?;
+    let mut embeddings = Vec::new();
+    for path in images {
+        let img = image::open(path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?
+            .to_rgb8();
+        let frame = sense_vision::image::Rgb {
+            w: img.width() as usize,
+            h: img.height() as usize,
+            pix: img.into_raw(),
+        };
+        let faces = detector.detect(&frame)?;
+        let Some(face) = faces
+            .iter()
+            .max_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())))
+        else {
+            println!("{}: no face found, skipped", path.display());
+            continue;
+        };
+        let crop = sense_vision::align::norm_crop(&frame, &face.landmarks, 112);
+        embeddings.push(embedder.embed(&crop)?);
+        println!(
+            "{}: face {:.0}x{:.0} px, score {:.2}",
+            path.display(),
+            face.width(),
+            face.height(),
+            face.score
+        );
+    }
+    anyhow::ensure!(
+        !embeddings.is_empty(),
+        "no usable face in the photos; nothing enrolled"
+    );
+    let refs: Vec<&[f32]> = embeddings.iter().map(Vec::as_slice).collect();
+    let id = store.enrol(name, None, memory::Modality::Face, &refs)?;
+    println!("enrolled {name} as {id} with {} face sample(s)", refs.len());
+    Ok(())
+}
+
+#[cfg(not(feature = "vision"))]
+fn enrol_from_photos(
+    _config: &Config,
+    _store: &memory::Store,
+    _name: &str,
+    _images: &[PathBuf],
+) -> anyhow::Result<()> {
+    anyhow::bail!("this build has no vision; rebuild with --features vision")
 }
 
 /// The repository `.env`, applied to this process's environment.

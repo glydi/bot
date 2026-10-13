@@ -336,3 +336,35 @@ fn wav_to_utterance_end_to_end() {
     );
     assert_eq!(utt.entity, Some(EntityHint::Known("mukesh".into())));
 }
+
+/// The lip gate: a turn heard while the focused face's mouth stayed still
+/// is announced as `speaking=false` and goes no further; one with the
+/// mouth moving as `speaking=true`.
+#[test]
+#[allow(clippy::expect_used)]
+fn lip_gate_reports_whether_the_focused_face_spoke() {
+    use std::time::Instant;
+    for moving in [false, true] {
+        let board = Arc::new(::common::SpeakingBoard::new());
+        board.set_focus(Some(7));
+        let t0 = Instant::now();
+        for i in 0..400u64 {
+            let at = t0 + Duration::from_millis(50 * i);
+            let wobble = if moving { 0.15 } else { 0.004 };
+            board.push_mouth(at, 7, 0.3 + wobble * ((i as f32) * 1.3).sin());
+        }
+        let mut cfg = AudioConfig::default().without_models();
+        cfg.speaking = Some(board);
+        let src = MockInput::tone_with_silence(0.5, 1.0, 1.0, 0.3).realtime(true);
+        let obs = run_to_end(cfg, Box::new(src));
+        let ev = events(&obs);
+        let spoke: Vec<_> = ev.iter().filter(|e| e.0 == "speaking").collect();
+        assert_eq!(spoke.len(), 1, "{ev:?}");
+        assert_eq!(spoke[0].1, Some(moving), "{ev:?}");
+        let o = obs
+            .iter()
+            .find(|o| o.modality == "speaking")
+            .expect("speaking");
+        assert_eq!(o.entity, Some(EntityHint::Track(7)));
+    }
+}

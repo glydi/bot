@@ -7,8 +7,9 @@ actual bot in typed mode, every reply checked.
     python scripts/simulate.py --list
 
 Each scenario is one bot process (so memory starts fresh) fed one line at a
-time; the reply and the lane that produced it (template, school table,
-fast lane, cache, model) are read from the log. Checks per reply:
+time; the reply and the lane that produced it (people = the people-first
+pipeline: understand, decide, answer from the people graph) are read from
+the log. Checks per reply:
 
   * a reply came, and within the budget (LATENCY_BUDGET_MS, first audio);
     the timing is the bot's own `turn N: stt .., think .., tts .., total ..`
@@ -35,92 +36,219 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / "rust" / "target" / "release" / "glydi.exe"
-LATENCY_BUDGET_MS = 1000
+# GLYDI_SIM_EXE points at another build (e.g. rust/target-sim/release/glydi.exe) while
+# the robot itself runs the usual one and holds its lock.
+EXE = Path(os.environ.get("GLYDI_SIM_EXE") or ROOT / "rust" / "target" / "release" / "glydi.exe")
+# The owner accepts 1-1.5 s per reply now that decided lines are reworded.
+LATENCY_BUDGET_MS = 1500
+MAX_WORDS = 35
 
-# (utterance, expectations). Expectations: lane in {template, school, fast, cache, model, any};
-# "has": a substring that must appear (case-insensitive); "not": one that must not.
+# (utterance, expectations). Expectations: lane in {people, any}; "people" is the
+# people-first pipeline (understand -> decide -> answer from the people graph).
+# "has": a substring that must appear (case-insensitive; a list = any one);
+# "not": one that must not; "words": max words; "budget": ms to first audio;
+# "silent": no reply at all. A model-written chit-chat line gets CHAT budget.
+P = {"lane": "people"}
+CHAT = {"lane": "people", "words": 22, "budget": 1500, "not": ["teacher!"]}
+HANDOFF = {"lane": "people", "has": "front desk", "same_ok": True}
+
 SCENARIOS: dict[str, list[tuple[str, dict]]] = {
-    "student": [
-        ("good morning", {"lane": "template", "has": "name"}),
-        ("my name is Priya", {"lane": "template", "has": "Priya. Did I get"}),
-        ("yes", {"lane": "template", "has": "Nice to meet you, Priya"}),
-        ("I'm in class 7 B", {"lane": "template", "has": "Got it, Priya"}),
-        ("what do I have today?", {"lane": "school"}),
-        ("when is the next break?", {"lane": "school"}),
-        ("who teaches maths to class 7 B?", {"lane": "school", "has": "Rao"}),
-        ("thanks", {"lane": "template", "has": "Priya"}),
-        ("bye", {"lane": "template", "has": "Bye, Priya"}),
+    "parent_and_son": [
+        ("namaste", {**P, "has": "name"}),
+        ("I'm Suresh, Rohan's father", {**P, "has": ["Suresh", "Rohan's father"]}),
+        ("is my son here?", {**P, "has": "Rohan", "not": "only talk"}),
+        ("how is he?", {**P, "has": "Rohan", "same_ok": True}),
+        ("what's my name?", {**P, "has": ["Suresh"]}),
+        ("what is the capital of France?", HANDOFF),
+        ("bye", {**P, "has": "Suresh"}),
     ],
-    "parent": [
-        ("hello", {"lane": "template"}),
-        ("I am Anil, Priya's father", {"lane": "template"}),
-        ("yes", {"lane": "template", "has": "Anil"}),
-        ("is there a PTM this week?", {"lane": "any"}),
-        ("where is Mrs Rao?", {"lane": "school", "has": "Rao"}),
-        ("is tomorrow a holiday?", {"lane": "school"}),
-        ("thank you", {"lane": "template", "has": "Anil"}),
+    "return_visit_check_in": [
+        ("hello", P),
+        ("I'm Suresh, Rohan's father", {**P, "has": "Suresh"}),
+        ("Rohan has a cricket match on Sunday", {**P, "not": "teacher"}),
+        ("bye", {**P, "has": "Suresh"}),
+        ("hello, I'm Suresh", {**P, "has": "How did Rohan's match go"}),
+        ("he won!", {"lane": "people", "budget": 1500}),
+        ("bye bye", {**P, "has": "Suresh"}),
     ],
-    "teacher": [
-        ("hi", {"lane": "template"}),
-        ("my name is Rao", {"lane": "template", "has": "Rao. Did I get"}),
-        ("yes", {"lane": "template"}),
-        ("what's next for class 5 A?", {"lane": "school"}),
-        ("who is absent today?", {"lane": "school"}),
-        ("what period is it?", {"lane": "school"}),
-        ("is school open on Friday?", {"lane": "school"}),
+    "sister_introduced": [
+        ("my name is Sony", {**P, "has": "Sony"}),
+        ("this is my sister Priya", {**P, "has": "Priya"}),
+        ("who is Priya?", {**P, "has": ["sibling", "sister"]}),
+        ("how is she?", {**P, "has": "Priya"}),
+        ("bye", {**P, "has": "Sony"}),
+        ("hi, I'm Priya", {**P, "has": ["Sony"]}),
+        ("what's my name?", {**P, "has": "Priya"}),
     ],
-    "misheard": [
-        ("hello", {"lane": "template", "has": "name"}),
-        ("Thundery", {"lane": "template", "has": "Thundery. Did I get"}),
-        ("no", {"lane": "template", "has": "slowly"}),
-        ("Mukesh", {"lane": "template", "has": "Mukesh. Did I get"}),
-        ("yes", {"lane": "template", "has": "Nice to meet you, Mukesh"}),
-        ("what is my name?", {"lane": "template", "has": "Mukesh"}),
+    "stranger_gives_name": [
+        ("hello", {**P, "has": "name"}),
+        ("Meera", {**P, "has": "Nice to meet you, Meera"}),
+        ("what's my name?", {**P, "has": "Meera"}),
+        ("do you know me?", {**P, "has": "Meera", "same_ok": True}),
+        ("see you later", {**P, "has": "Meera"}),
     ],
-    "curious_child": [
-        ("what is your name?", {"lane": "template", "has": "Glydi"}),
-        ("what can you do?", {"lane": "template"}),
-        ("what is 7 times 8?", {"lane": "fast", "has": "56"}),
-        ("how many legs does a spider have?", {"lane": "fast", "has": "eight"}),
-        ("what is the capital of India?", {"lane": "fast", "has": "Delhi"}),
-        ("tell me a joke", {"lane": "model"}),
-        ("do you have a brain?", {"lane": "any"}),
+    "name_correction": [
+        ("my name is Raju", {**P, "has": "Raju"}),
+        ("that's not my name, it's Rahul", {**P, "has": "Rahul"}),
+        ("what's my name?", {**P, "has": "Rahul", "not": "Raju"}),
+        ("good, thanks", {"lane": "people", "budget": 1500}),
+        ("bye", {**P, "has": "Rahul"}),
     ],
-    "short_words": [
-        ("hello", {"lane": "template"}),
-        ("yeah", {"lane": "template", "has": "Go on"}),
-        ("hmm", {"lane": "template", "has": "Go on"}),
-        ("ok", {"lane": "template", "has": "Go on"}),
-        ("what?", {"lane": "any"}),
+    "facts_update": [
+        ("I'm Dev", {**P, "has": "Dev"}),
+        ("my favourite colour is blue", {**P, "not": "teacher"}),
+        ("what do you know about me?", {**P, "has": "blue"}),
+        ("actually my favourite colour is red now", {**P, "not": "teacher"}),
+        ("what do you know about me?", {**P, "has": "red", "not": "blue"}),
+        ("bye", {**P, "has": "Dev"}),
     ],
-    "memory": [
-        ("my name is Dev", {"lane": "template"}),
-        ("yes", {"lane": "template"}),
-        ("I like cricket", {"lane": "template", "has": "Got it, Dev"}),
-        ("my favourite subject is science", {"lane": "template", "has": "Got it, Dev"}),
-        ("what do you know about me?", {"lane": "template", "has": "cricket"}),
-        ("forget me", {"lane": "template", "has": "forgotten"}),
-        ("what do you know about me?", {"lane": "template"}),
+    "forget_me": [
+        ("I'm Neha", {**P, "has": "Neha"}),
+        ("I have a dog called Bruno", {**P, "not": "teacher"}),
+        ("what do you know about me?", {**P, "has": ["Neha"]}),
+        ("please forget me", {**P, "has": "forgotten"}),
+        ("what's my name?", {**P, "has": "don't know", "not": "Neha"}),
     ],
-    "two_things_at_once": [
-        ("good morning, my name is Kai and I am in class 5 A", {"lane": "template", "has": "Kai. Did I get"}),
-        ("yes", {"lane": "template"}),
-        ("what period is it and who is teaching?", {"lane": "school"}),
+    "privacy": [
+        ("I'm Suresh, Rohan's father", {**P, "has": "Suresh"}),
+        ("bye", {**P, "has": "Suresh"}),
+        ("hello, I'm Meena", {**P, "has": "Meena"}),
+        ("is Rohan here?", {**P, "has": "only talk", "not": ["came in", "right here"]}),
+        ("how is Rohan doing?", {**P, "has": "only talk", "same_ok": True}),
+        ("what's my name?", {**P, "has": "Meena", "not": "Suresh"}),
     ],
-    "time_and_date": [
-        ("what time is it?", {"lane": "template", "has": "It's"}),
-        ("what's the date today?", {"lane": "template", "has": "It's"}),
-        ("what day is tomorrow?", {"lane": "any"}),
+    "out_of_zone": [
+        ("I'm Kabir", {**P, "has": "Kabir"}),
+        ("what is 7 times 8?", {**P, "has": "56"}),  # everyday sums are answered
+        ("when are the fees due?", HANDOFF),
+        ("is tomorrow a holiday?", HANDOFF),
+        ("who is the prime minister of India?", {**HANDOFF, "not": "Modi"}),
+        ("tell me a joke", {**CHAT, "not": ["front desk"]}),
+        ("bye", {**P, "has": "Kabir"}),
     ],
-    "repeat": [
-        ("what is the capital of France?", {"lane": "fast", "has": "Paris"}),
-        ("what is the capital of France?", {"lane": "any", "has": "Paris"}),
-        ("say that again", {"lane": "any"}),
+    "feelings_and_chat": [
+        ("I'm Tara", {**P, "has": "Tara"}),
+        ("I'm so tired today", CHAT),
+        ("I had a long day at school", CHAT),
+        ("you are funny", CHAT),
+        ("what's my name?", {**P, "has": "Tara"}),
+        ("bye", {**P, "has": "Tara"}),
+    ],
+    "friend_and_pronoun": [
+        ("hi", {**P, "has": "name"}),
+        ("my name is Kabir", {**P, "has": "Kabir"}),
+        ("meet my friend Arjun", {**P, "has": "Arjun"}),
+        ("who is Arjun?", {**P, "has": "your friend"}),
+        ("is he here?", {**P, "has": "Arjun"}),
+        ("what do you know about me?", {**P, "has": ["Kabir", "Arjun"]}),
+        ("bye", {**P, "has": "Kabir"}),
+    ],
+    "mother_and_daughter": [
+        ("good morning", {**P, "has": "name"}),
+        ("I am Asha, Diya's mother", {**P, "has": ["Asha", "Diya"]}),
+        ("is my daughter here?", {**P, "has": "Diya"}),
+        ("Diya started dancing classes", {**P, "not": "teacher"}),
+        ("how is she?", {**P, "has": "Diya", "same_ok": True}),
+        ("who am I?", {**P, "has": "Asha"}),
+        ("ok bye", {**P, "has": "Asha"}),
+    ],
+    # --- Harder: adults, visitors, staff; relation chains; changing facts;
+    # interruptions; misheard names; two people taking turns (text mode has
+    # one keyboard, so the second person introduces themselves).
+    "visitor_adult": [
+        ("good afternoon", {**P, "has": "name"}),
+        ("I'm Anil Kapoor, here for a meeting with the principal", {**P, "has": "Anil"}),
+        ("it's my first time here", CHAT),
+        ("what's my name?", {**P, "has": "Anil"}),
+        ("thank you, goodbye", {**P, "has": "Anil"}),
+    ],
+    "staff_member": [
+        ("morning glydi", {**P, "has": "name"}),
+        ("I'm Lakshmi, I work in the front office", {**P, "has": "Lakshmi"}),
+        ("the printer broke again today", CHAT),
+        ("who am I?", {**P, "has": "Lakshmi"}),
+        ("see you later", {**P, "has": "Lakshmi"}),
+    ],
+    "relation_chain": [
+        ("hi, I'm Ravi", {**P, "has": "Ravi"}),
+        ("this is my wife Sunita", {**P, "has": "Sunita"}),
+        ("my wife's brother Arjun is visiting today", {**P, "has": "Arjun"}),
+        ("who is Sunita?", {**P, "has": ["wife", "spouse"]}),
+        ("what do you know about me?", {**P, "has": ["Sunita"]}),
+        ("bye", {**P, "has": "Ravi"}),
+    ],
+    "changing_facts_adult": [
+        ("I'm Meena", {**P, "has": "Meena"}),
+        ("I work at the bank", {**P, "not": "teacher"}),
+        ("actually I moved, I work at the hospital now", {**P, "not": "teacher"}),
+        ("what do you know about me?", {**P, "has": "hospital", "not": "bank"}),
+        ("bye", {**P, "has": "Meena"}),
+    ],
+    "misheard_name": [
+        ("hello", {**P, "has": "name"}),
+        ("Neha", {**P, "has": "Neha"}),
+        ("no, it's Nisha, not Neha", {**P, "has": "Nisha"}),
+        ("what's my name?", {**P, "has": "Nisha", "not": "Neha"}),
+        ("bye", {**P, "has": "Nisha"}),
+    ],
+    "two_people_turns": [
+        ("hi I'm Kabir", {**P, "has": "Kabir"}),
+        ("and this is my friend Zoya", {**P, "has": "Zoya"}),
+        ("who is Zoya?", {**P, "has": "your friend"}),
+        ("bye", {**P, "has": "Kabir"}),
+        ("hi, I'm Zoya", {**P, "has": "Zoya"}),
+        ("who is Kabir?", {**P, "has": "Kabir"}),
+        ("what's my name?", {**P, "has": "Zoya", "not": "Kabir"}),
+    ],
+    "child_chatter": [
+        ("hi robot", {**P, "has": "name"}),
+        ("I'm Tara and I'm seven", {**P, "has": "Tara"}),
+        ("I lost my tooth today!", CHAT),
+        ("I'm scared of the dentist", CHAT),
+        ("bye bye", {**P, "has": "Tara"}),
+    ],
+    "grief_and_care": [
+        ("I'm Rahul", {**P, "has": "Rahul"}),
+        ("my grandfather passed away last week", {**CHAT, "not": ["great", "awesome", "fun"]}),
+        ("thanks for listening", {"lane": "people", "budget": 1500}),
+        ("bye", {**P, "has": "Rahul"}),
+    ],
+    "interruption_change_topic": [
+        ("I'm Dev", {**P, "has": "Dev"}),
+        ("I'm going to the zoo on Saturday", {**P, "not": "teacher"}),
+        ("wait, actually, is my sister Priya here?", {**P, "has": "Priya"}),
+        ("never mind. what's my name?", {**P, "has": "Dev"}),
+        ("bye", {**P, "has": "Dev"}),
+    ],
+    "parent_of_two": [
+        ("namaste", {**P, "has": "name"}),
+        ("I'm Fatima, Aisha's mother", {**P, "has": ["Fatima", "Aisha"]}),
+        ("my son Imran also studies here", {**P, "has": "Imran"}),
+        ("is my daughter here?", {**P, "has": "Aisha"}),
+        ("is my son here?", {**P, "has": "Imran"}),
+        ("who am I?", {**P, "has": "Fatima"}),
+        ("bye", {**P, "has": "Fatima"}),
+    ],
+    # The safety net: one calm fixed line, always.
+    "emergency": [
+        ("I'm hurt", {"lane": "any", "has": ["teacher", "office", "adult"]}),
+        ("someone fell down on the stairs", {"lane": "any", "same_ok": True, "has": ["teacher", "office", "adult"]}),
+        ("my friend is bleeding", {"lane": "any", "same_ok": True, "has": ["teacher", "office", "adult"]}),
+        ("I feel sick", {"lane": "any", "same_ok": True, "has": ["teacher", "office", "adult"]}),
+        ("there's a fire!", {"lane": "any", "has": ["teacher", "leave", "drill"]}),
+    ],
+    # Transcriber noise is never answered.
+    "noise": [
+        ("hello", {**P, "has": "name"}),
+        ("hmm", {"silent": True}),
+        ("[Music]", {"silent": True}),
+        ("uh", {"silent": True}),
+        ("Meera", {**P, "has": "Meera"}),
     ],
 }
 
 LANE_MARKS = {
+    "people answered": "people",
     "template answered": "template",
     "school answered": "school",
     "school lookup": "school",
@@ -132,6 +260,7 @@ LANE_MARKS = {
 BAD_PATTERNS = [
     (re.compile(r"\[note\]|\[room\]", re.I), "prompt text spoken"),
     (re.compile(r"remember_name|recall_person|remember_fact|forget_person", re.I), "tool name spoken"),
+    (re.compile(r"system prompt|\btools?\b|function call|<\|im_|\[/?(inst|sys)\]|as an ai\b", re.I), "instruction leakage"),
     (re.compile(r"^(hello|hi|hey)\b", re.I), "greeting"),
 ]
 
@@ -238,7 +367,7 @@ def run_scenario(name: str, steps: list[tuple[str, dict]], wait: float) -> list[
         lane = None
         legs = None
         first_reply_at = None
-        end = time.time() + wait
+        end = time.time() + (4 if expect.get("silent") else wait)
         while time.time() < end:
             new = lines[start_idx:]
             reply_lines = [l.split("glydi> ", 1)[1] for l in new if "glydi> " in l]
@@ -285,6 +414,10 @@ def judge(name: str, results: list[dict]) -> list[str]:
     for i, r in enumerate(results):
         tag = f"{name}[{i}] \"{r['said']}\""
         reply = r["reply"]
+        if r["expect"].get("silent"):
+            if reply:
+                gaps.append(f"{tag}: noise answered -> {reply!r}")
+            continue
         if not reply:
             gaps.append(f"{tag}: no reply")
             continue
@@ -296,12 +429,31 @@ def judge(name: str, results: list[dict]) -> list[str]:
         if want != "any" and lane != want:
             gaps.append(f"{tag}: lane {lane}, wanted {want} -> {reply!r}")
         has = r["expect"].get("has")
-        if has and has.lower() not in reply.lower():
-            gaps.append(f"{tag}: missing {has!r} -> {reply!r}")
+        if isinstance(has, str):
+            has = [has]
+        if has and not any(h.lower() in reply.lower() for h in has):
+            gaps.append(f"{tag}: missing {' | '.join(has)!r} -> {reply!r}")
+        nots = r["expect"].get("not") or []
+        if isinstance(nots, str):
+            nots = [nots]
+        for n in nots:
+            hit = re.search(n[3:], reply, re.I) if n.startswith("re:") else n.lower() in reply.lower()
+            if hit:
+                gaps.append(f"{tag}: said {n!r} -> {reply!r}")
+        nwords = len(reply.split())
+        if nwords > r["expect"].get("words", MAX_WORDS):
+            gaps.append(f"{tag}: {nwords} words, too long to speak -> {reply!r}")
+        sents = [re.sub(r"\W", "", x.lower()) for x in re.split(r"(?<=[.!?])\s+", reply) if x.strip()]
+        if any(a and a == b for a, b in zip(sents, sents[1:])):
+            gaps.append(f"{tag}: same sentence twice -> {reply!r}")
+        prev = results[i - 1] if i > 0 else None
+        asks_repeat = "again" in r["said"] or r["said"].strip().lower() in ("what?", "what", "pardon", "sorry?")
+        if prev and prev["reply"] == reply and prev["said"] != r["said"] and not asks_repeat and not r["expect"].get("same_ok"):
+            gaps.append(f"{tag}: same reply as the previous turn -> {reply!r}")
         for pat, why in BAD_PATTERNS:
             if why == "greeting":
                 if pat.search(reply):
-                    if "greeted" in greeted and lane != "template":
+                    if "greeted" in greeted and lane not in ("template", "people"):
                         gaps.append(f"{tag}: second greeting -> {reply!r}")
                     greeted.add("greeted")
             elif pat.search(reply):
@@ -309,8 +461,9 @@ def judge(name: str, results: list[dict]) -> list[str]:
         if re.sub(r"\W", "", reply.lower()) == re.sub(r"\W", "", r["said"].lower()):
             gaps.append(f"{tag}: echoed the question")
         ms = r["turn_ms"] if r["turn_ms"] is not None else r["elapsed_ms"]
-        if lane in ("model", "fast") and r["turn_ms"] is not None and ms > LATENCY_BUDGET_MS:
-            gaps.append(f"{tag}: {ms} ms to first audio, budget {LATENCY_BUDGET_MS}")
+        budget = r["expect"].get("budget", LATENCY_BUDGET_MS)
+        if ms > budget:
+            gaps.append(f"{tag}: {ms} ms to first audio in lane {lane}, budget {budget}")
     return gaps
 
 
@@ -328,6 +481,7 @@ def main() -> None:
     seed_snapshot()
     names = args.names or list(SCENARIOS)
     all_gaps: list[str] = []
+    by_lane: dict[str, list[int]] = {}
     for name in names:
         steps = SCENARIOS[name]
         print(f"\n== {name}")
@@ -340,8 +494,15 @@ def main() -> None:
             else:
                 timing = f"{r['elapsed_ms']:>5} ms~ (no turn line)"
             print(f"  {r['said']:<52} [{r['lane']:<8} {timing}]  {r['reply']}")
+        for r in results:
+            if r["reply"]:
+                by_lane.setdefault(r["lane"], []).append(r["turn_ms"] if r["turn_ms"] is not None else r["elapsed_ms"])
         gaps = judge(name, results)
         all_gaps.extend(gaps)
+    print("\n== latency per lane, ms to first audio: n  min  median  p90  max")
+    for ln, v in sorted(by_lane.items()):
+        v.sort()
+        print(f"  {ln:<9} {len(v):>3} {v[0]:>6} {v[len(v) // 2]:>6} {v[min(len(v) - 1, int(len(v) * 0.9))]:>6} {v[-1]:>6}")
     print(f"\n== gaps: {len(all_gaps)}")
     for g in all_gaps:
         print("  -", g)

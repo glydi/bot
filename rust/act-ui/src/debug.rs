@@ -186,7 +186,13 @@ fn faces_tab(ui: &mut egui::Ui, panel: &mut Panel, state: &UiState, src: &Source
         );
         for f in &preview.faces {
             let colour = face_colour(f);
-            let stroke = egui::Stroke::new(if f.engaged { 3.0 } else { 1.5 }, colour);
+            let focus_mode = preview.faces.iter().any(|g| g.focused);
+            let (colour, width) = match (focus_mode, f.focused) {
+                (true, true) => (crate::strip::FOCUS, 4.0),
+                (true, false) => (crate::strip::BACKGROUND, 1.0),
+                (false, _) => (colour, if f.engaged { 3.0 } else { 1.5 }),
+            };
+            let stroke = egui::Stroke::new(width, colour);
             let box_rect = egui::Rect::from_min_size(
                 rect.min + egui::vec2(f.x * rect.width(), f.y * rect.height()),
                 egui::vec2(f.w * rect.width(), f.h * rect.height()),
@@ -511,6 +517,8 @@ mod tests {
             score: 0.871,
             track,
             engaged,
+            focused: false,
+            waving: false,
         };
         let preview = Preview {
             width: 1,

@@ -445,6 +445,20 @@ CREATE TABLE IF NOT EXISTS co_presence (
     ended_at    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_co_presence_pair ON co_presence(a, b);
+-- The people graph (see `graph.rs`): `a` is `relation` of `b`, temporal.
+-- valid_to NULL = current; a conflicting relation closes the old row.
+CREATE TABLE IF NOT EXISTS edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    a           TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+    relation    TEXT NOT NULL,
+    b           TEXT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+    source      TEXT NOT NULL DEFAULT '',
+    confidence  REAL NOT NULL DEFAULT 1.0,
+    valid_from  REAL NOT NULL,
+    valid_to    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_edges_a ON edges(a, valid_to);
+CREATE INDEX IF NOT EXISTS idx_edges_b ON edges(b, valid_to);
 ";
 
 /// Columns added since the reference schema, as `(table, column, ddl)`.
@@ -459,6 +473,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Episodes from before the summariser: the count is recoverable from
     // `said` (one line per utterance), which `migrate` does once.
     ("episodes", "turns", "INTEGER NOT NULL DEFAULT 0"),
+    // When they were seen before this visit: the time sense ("haven't
+    // seen you since Monday").
+    ("persons", "prev_seen_at", "REAL"),
 ];
 
 impl Store {
@@ -475,6 +492,10 @@ impl Store {
         // WAL so the sense threads' reads never wait on the worker's writes
         // (same pragmas as store.py / store.go).
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Another process holding the file (a backup, `glydi people`)
+        // makes a write wait this long, then fail with a logged error;
+        // never a hang, never a crash.
+        conn.busy_timeout(std::time::Duration::from_millis(1500))?;
         Self::from_connection(conn)
     }
 
@@ -533,6 +554,7 @@ impl Store {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))?;
             }
         }
+        crate::graph::migrate_edges(conn)?;
         // Rows from before the decay columns existed: last_seen = created_at.
         conn.execute(
             "UPDATE facts SET last_seen = created_at WHERE last_seen IS NULL",
@@ -751,6 +773,24 @@ impl Store {
         self.enrol(name, None, Modality::Face, &[])
     }
 
+    /// A person known only by name, never seen (`last_seen_at` NULL): the
+    /// other end of a relation someone told us about ("my son Rohan").
+    /// An existing person by that name is returned instead.
+    pub fn add_named(&self, name: &str) -> Result<EntityId, Error> {
+        let name = name.trim();
+        if let Some(p) = self.find_by_name(name)? {
+            return Ok(p.id);
+        }
+        let id = self.new_id(name);
+        self.db.lock().execute(
+            "INSERT INTO persons (person_id, name, created_at, last_seen_at, meta)
+             VALUES (?1, ?2, ?3, NULL, '{}')",
+            params![id.as_str(), name, now_secs()],
+        )?;
+        self.names.write().insert(id.clone(), name.to_owned());
+        Ok(id)
+    }
+
     /// 12 hex chars, like `uuid4().hex[:12]` (Python) and 6 random bytes
     /// (Go). Seeded from the name and the clock through a randomly keyed
     /// hasher, and re-drawn on the (astronomically unlikely) collision.
@@ -919,7 +959,13 @@ impl Store {
     /// Mark `id` as seen now.
     pub fn touch(&self, id: &EntityId) -> Result<(), Error> {
         self.db.lock().execute(
-            "UPDATE persons SET last_seen_at = ?1 WHERE person_id = ?2",
+            // A sighting more than ten minutes after the last one is a new
+            // visit: the old time becomes the previous visit.
+            "UPDATE persons SET prev_seen_at = CASE
+                 WHEN last_seen_at IS NOT NULL AND ?1 - last_seen_at > 600 THEN last_seen_at
+                 ELSE prev_seen_at END,
+               last_seen_at = ?1
+             WHERE person_id = ?2",
             params![now_secs(), id.as_str()],
         )?;
         Ok(())

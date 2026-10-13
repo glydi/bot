@@ -119,8 +119,8 @@ pub const SECTIONS: &[Section] = &[
             Field {
                 key: "GLYDI_STT",
                 label: "Transcriber",
-                help: "Parakeet is faster; whisper is the fallback.",
-                kind: Kind::Choice(&["parakeet", "whisper"]),
+                help: "Parakeet is fastest; remote is the Whisper service (services/stt), falling back to Parakeet.",
+                kind: Kind::Choice(&["parakeet", "whisper", "remote"]),
                 default: "whisper",
             },
             Field {
@@ -211,6 +211,13 @@ pub const SECTIONS: &[Section] = &[
                 default: "1",
             },
             Field {
+                key: "GLYDI_SINGLE_FOCUS",
+                label: "Single focus",
+                help: "Talk to one person at a time: the closest, most central face looking at the robot. Others are not greeted or asked anything (attendance still marks everyone).",
+                kind: Kind::Toggle,
+                default: "1",
+            },
+            Field {
                 key: "GLYDI_VISION_GPU",
                 label: "Vision on GPU",
                 help: "Run the face detector, recogniser and object model on the NVIDIA GPU (CUDA, or TensorRT with the switch above).",
@@ -223,6 +230,13 @@ pub const SECTIONS: &[Section] = &[
                 help: "Which camera to open, counting from 0.",
                 kind: Kind::Number,
                 default: "0",
+            },
+            Field {
+                key: "GLYDI_SHOW_VIDEO",
+                label: "Show video",
+                help: "A small live camera picture on the home screen. Off only hides it; recognition keeps running.",
+                kind: Kind::Toggle,
+                default: "1",
             },
             Field {
                 key: "GLYDI_FACE_THRESHOLD",

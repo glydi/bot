@@ -32,7 +32,7 @@ use serde::Deserialize;
 /// size; set it in `.env` rather than here (see the module docs).
 pub const DEFAULT_LOCAL_MODEL: &str = "qwen2.5:3b";
 /// The Ollama `OpenAI`-compatible endpoint.
-pub const DEFAULT_LOCAL_LLM_URL: &str = "http://localhost:11434/v1";
+pub const DEFAULT_LOCAL_LLM_URL: &str = "http://127.0.0.1:11434/v1";
 /// whisper.cpp model name; resolved to `models/whisper/ggml-{name}.bin`.
 pub const DEFAULT_WHISPER_MODEL: &str = "tiny.en";
 /// insightface model pack, under `~/.insightface/models/`.
@@ -221,7 +221,14 @@ impl Config {
             || default_insightface_dir(&root).join(&face_model),
             |d| abs(&root, &d),
         );
-        let local_model = pick("GLYDI_LOCAL_MODEL", file.local_model, DEFAULT_LOCAL_MODEL);
+        // `GLYDI_CHAT_MODEL` names the model that talks (chat lines and the
+        // rephrase) when it should differ from `GLYDI_LOCAL_MODEL`; the
+        // understander has its own `GLYDI_UNDERSTAND_MODEL`.
+        let local_model = env
+            .get("GLYDI_CHAT_MODEL")
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| pick("GLYDI_LOCAL_MODEL", file.local_model, DEFAULT_LOCAL_MODEL));
         let memory_model = pick_opt("GLYDI_MEMORY_MODEL", file.memory_model)
             .unwrap_or_else(|| local_model.clone());
         let tts = env

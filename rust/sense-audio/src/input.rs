@@ -54,6 +54,20 @@ pub(crate) struct Resampler {
     /// callback boundaries.
     last: f32,
     primed: bool,
+    /// Linear gain on the mono signal (`GLYDI_MIC_GAIN`, default 1, at
+    /// most 20), clamped to [-1, 1]: a quiet USB microphone across a room
+    /// arrives near -40 dBFS, where the VAD only catches the loudest
+    /// syllables and sentences reach the transcriber in pieces.
+    gain: f32,
+}
+
+/// `GLYDI_MIC_GAIN` as a linear factor.
+fn mic_gain() -> f32 {
+    std::env::var("GLYDI_MIC_GAIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map_or(1.0, |g| g.min(20.0))
 }
 
 impl Resampler {
@@ -64,6 +78,7 @@ impl Resampler {
             pos: 0.0,
             last: 0.0,
             primed: false,
+            gain: mic_gain(),
         }
     }
 
@@ -75,9 +90,15 @@ impl Resampler {
         if n == 0 {
             return;
         }
+        let gain = self.gain;
         let mono = |i: usize| -> f32 {
             let frame = &interleaved[i * ch..(i + 1) * ch];
-            frame.iter().sum::<f32>() / ch as f32
+            let m = frame.iter().sum::<f32>() / ch as f32;
+            if (gain - 1.0).abs() < f32::EPSILON {
+                m
+            } else {
+                (m * gain).clamp(-1.0, 1.0)
+            }
         };
         if !self.primed {
             // `last` is the sample *before* index 1, so seed it with the
@@ -87,7 +108,7 @@ impl Resampler {
             self.primed = true;
             self.pos = 1.0;
         }
-        if (self.ratio - 1.0).abs() < 1e-9 && ch == 1 {
+        if (self.ratio - 1.0).abs() < 1e-9 && ch == 1 && (gain - 1.0).abs() < f32::EPSILON {
             out.extend_from_slice(interleaved);
             self.last = interleaved[n - 1];
             return;

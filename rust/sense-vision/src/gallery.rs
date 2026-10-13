@@ -29,6 +29,10 @@ pub trait FaceGallery: Send + Sync {
     /// Python config enrols 6, spread across poses); matching takes the
     /// best score per person.
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), Error>;
+    /// The person's name, for the preview label; `None` shows the id.
+    fn name_of(&self, _id: &EntityId) -> Option<String> {
+        None
+    }
 }
 
 /// A gallery held in memory: normalised embeddings grouped by person.

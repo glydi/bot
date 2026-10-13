@@ -594,7 +594,10 @@ fn a_preview_goes_out_every_third_frame_with_the_faces_boxed_and_labelled() {
     );
     assert_eq!(handle.stats().previews.load(Ordering::SeqCst), 3);
     for p in &previews {
-        assert_eq!((p.width, p.height), (PREVIEW_MAX_WIDTH, 240));
+        assert_eq!(
+            (p.width, p.height),
+            (PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH * 3 / 4)
+        );
         assert!(p.is_consistent());
         assert_eq!(p.faces.len(), 1);
         let f = &p.faces[0];
@@ -613,4 +616,64 @@ fn a_preview_goes_out_every_third_frame_with_the_faces_boxed_and_labelled() {
         assert!(f.engaged);
     }
     handle.stop();
+}
+
+/// A camera that gives `n` frames and then fails forever: unplugged.
+struct Unplugged {
+    left: usize,
+}
+
+impl sense_vision::FrameSource for Unplugged {
+    fn next_frame(&mut self, _t: Duration) -> Result<Option<sense_vision::Frame>, Error> {
+        if self.left == 0 {
+            return Err(Error::Camera("device gone".into()));
+        }
+        self.left -= 1;
+        std::thread::sleep(Duration::from_millis(5));
+        MockFrames::new(vec![Rgb::new(640, 480)]).next_frame(Duration::ZERO)
+    }
+}
+
+/// Unplugged mid-run: the loop keeps going, reopens with backoff while
+/// the device is away, and delivers frames again once it is back.
+#[test]
+#[allow(clippy::expect_used)]
+fn lost_camera_is_reopened_with_backoff() {
+    let (tx, _rx) = ObservationRing::bounded(4096);
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+    let tries = Arc::new(AtomicUsize::new(0));
+    let t2 = Arc::clone(&tries);
+    let reopen = Box::new(move || {
+        // Away for the first two attempts, then back.
+        if t2.fetch_add(1, Ordering::SeqCst) < 2 {
+            Err(Error::Camera("busy".into()))
+        } else {
+            Ok(
+                Box::new(MockFrames::new(vec![Rgb::new(640, 480); 50]).looping(true))
+                    as Box<dyn sense_vision::FrameSource>,
+            )
+        }
+    });
+    let mut p = parts(0, Box::new(NoFaces));
+    p.source = Box::new(Unplugged { left: 5 });
+    let h = VisionSense::spawn_with_reopen(
+        config(0),
+        clock,
+        tx,
+        Arc::new(InMemoryFaceGallery::new(0.5, 0.05)),
+        p,
+        reopen,
+    )
+    .expect("spawn");
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && h.stats().frames.load(Ordering::Relaxed) < 20 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(h.is_running());
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        3,
+        "two failed reopens then one good"
+    );
+    assert!(h.stats().frames.load(Ordering::Relaxed) >= 20);
 }

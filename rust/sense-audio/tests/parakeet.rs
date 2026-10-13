@@ -64,6 +64,15 @@ fn parakeet_transcribes_and_beats_whisper() {
     let mut w = Whisper::open(wm, cfg.whisper_threads).unwrap_or_else(|e| panic!("{e}"));
     w.warm_up().unwrap_or_else(|e| panic!("{e}"));
 
+    for name in ["complete.wav", "incomplete.wav", "french.wav"] {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(name);
+        if !p.is_file() {
+            eprintln!("skipping: test clip {} is missing", p.display());
+            return;
+        }
+    }
     let full = clip("complete.wav");
     let tone: Vec<f32> = (0..16_000)
         .map(|i| 0.3 * (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0).sin())

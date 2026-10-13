@@ -87,6 +87,8 @@ impl Rig {
             )),
             backend: Some(llm.clone() as Arc<dyn deliberate::ChatBackend>),
             canned_proactive: true,
+            // These scenarios drive the model path through a mock.
+            legacy_lanes: true,
             ..Parts::default()
         };
         let app = App::build(&config, parts).expect("app builds without hardware");
@@ -684,7 +686,7 @@ fn voice_edge_right_behind_a_level_still_cancels_the_reply() {
 // --------------------------------------------------------- gestures
 
 /// A stranger waves at the camera: the face nods back at once and the
-/// mind says "Hi!", without a model turn. The name question follows on
+/// mind says "Hi there!", without a model turn. The name question follows on
 /// its own schedule and is not part of this.
 #[test]
 fn a_wave_from_a_stranger_gets_a_nod_and_a_hello() {
@@ -697,7 +699,7 @@ fn a_wave_from_a_stranger_gets_a_nod_and_a_hello() {
         wait_for(Duration::from_secs(3), || rig
             .spoken()
             .iter()
-            .any(|s| s == "Hi!")),
+            .any(|s| s == "Hi there!")),
         "no hello for the wave; spoken = {:?}, ui = {:?}",
         rig.spoken(),
         rig.app.ui_commands()

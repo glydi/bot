@@ -22,7 +22,9 @@ cpal = { workspace = true }
 hound = { workspace = true }
 ort = { workspace = true }
 accel = { workspace = true }
+serde_json = { workspace = true }
 whisper-rs = { workspace = true }
+nnnoiseless = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Metal: whisper.cpp pads every call to 30 s, so tiny.en on the CPU costs

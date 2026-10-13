@@ -97,6 +97,9 @@ impl AnswerCache {
     /// the model gets another go.
     pub fn best(&mut self, question: &str) -> Option<String> {
         self.lookups += 1;
+        if crate::templates::is_urgent(question) {
+            return None;
+        }
         if self.lookups % EXPLORE_EVERY == 0 {
             return None;
         }
@@ -108,6 +111,11 @@ impl AnswerCache {
     /// Record that `answer` was given for `question` (by the model or
     /// from the cache). New answers start at zero.
     pub fn observe(&mut self, question: &str, answer: &str) {
+        // An emergency, a lost item or a privacy question has one fixed
+        // answer, said at once; a cached copy could only ever be worse.
+        if crate::templates::is_urgent(question) {
+            return;
+        }
         let key = normalise(question);
         let answer = answer.trim();
         if key.is_empty() || answer.is_empty() {
@@ -226,29 +234,29 @@ mod tests {
     #[test]
     fn an_answer_is_reused_only_after_it_earned_it() {
         let mut c = AnswerCache::default();
-        assert_eq!(c.best("what's the wifi password?"), None);
+        assert_eq!(c.best("what's the library timing?"), None);
         c.observe(
-            "What's the wifi password?",
+            "What's the library timing?",
             "Ask the office; I don't keep it.",
         );
-        assert_eq!(c.best("whats the wifi password"), None);
+        assert_eq!(c.best("whats the library timing"), None);
         assert!(c.feedback(
-            "what's the wifi password?",
+            "what's the library timing?",
             "Ask the office; I don't keep it.",
             Verdict::Good
         ));
         assert_eq!(
-            c.best("what's the wifi password"),
+            c.best("what's the library timing"),
             None,
             "one reward is not enough"
         );
         c.feedback(
-            "what's the wifi password?",
+            "what's the library timing?",
             "Ask the office; I don't keep it.",
             Verdict::Good,
         );
         assert_eq!(
-            c.best("what's the WIFI password?").as_deref(),
+            c.best("what's the LIBRARY timing?").as_deref(),
             Some("Ask the office; I don't keep it.")
         );
         assert_eq!(c.learned(), 1);

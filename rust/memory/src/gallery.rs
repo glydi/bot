@@ -163,6 +163,50 @@ impl FactSource for Store {
             false
         })
     }
+
+    fn relate_people(
+        &self,
+        a: &EntityId,
+        relation: &deliberate::people::Relation,
+        b_name: &str,
+        source: &str,
+        confidence: f32,
+    ) -> Option<EntityId> {
+        let b = match self.add_named(b_name) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, b_name, "relate: no person");
+                return None;
+            }
+        };
+        if let Err(e) = self.relate_edge(a, relation, &b, source, confidence) {
+            tracing::warn!(error = %e, %a, "relate failed");
+        }
+        Some(b)
+    }
+
+    fn edges(&self, entity: &EntityId) -> Vec<deliberate::people::Edge> {
+        self.current_edges(entity).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, %entity, "edges failed");
+            Vec::new()
+        })
+    }
+
+    fn name_of(&self, entity: &EntityId) -> Option<String> {
+        Store::name_of(self, entity)
+    }
+
+    fn last_seen(&self, entity: &EntityId) -> Option<f64> {
+        Store::last_seen(self, entity)
+    }
+
+    fn previous_visit(&self, entity: &EntityId) -> Option<f64> {
+        Store::previous_visit(self, entity)
+    }
+
+    fn forget_fact(&self, entity: &EntityId, fact: &str) -> bool {
+        Store::forget_fact(self, entity, fact).unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

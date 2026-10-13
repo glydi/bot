@@ -6,7 +6,7 @@
 //! `cargo run -p sense-vision --example camera_smoke`
 
 fn main() {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
         // Inside the block with the rest: unused elsewhere, and a warning
         // is an error under `-D warnings`.
@@ -34,6 +34,16 @@ fn main() {
             match cam.next_frame(Duration::from_millis(500)) {
                 Ok(Some(f)) => {
                     n += 1;
+                    if let Ok(path) = std::env::var("CAMERA_SMOKE_PNG")
+                        && n == 10
+                    {
+                        let _ = image::RgbImage::from_raw(
+                            f.image.w as u32,
+                            f.image.h as u32,
+                            f.image.pix.clone(),
+                        )
+                        .map(|i| i.save(&path));
+                    }
                     println!(
                         "frame {n}: {}x{} mean brightness {:.1} at +{:?}",
                         f.image.w,
@@ -50,8 +60,8 @@ fn main() {
             }
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    println!("camera capture is macOS/Linux-only");
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    println!("camera capture is macOS/Linux/Windows-only");
 }
 
 #[cfg(target_os = "macos")]
@@ -62,6 +72,13 @@ fn open(index: usize) -> Result<sense_vision::camera::Camera, sense_vision::Erro
 #[cfg(target_os = "linux")]
 fn open(index: usize) -> Result<sense_vision::camera_v4l2::Camera, sense_vision::Error> {
     let cam = sense_vision::camera_v4l2::Camera::open(index, 1280, 720, 15)?;
+    println!("format: {}", cam.negotiated());
+    Ok(cam)
+}
+
+#[cfg(windows)]
+fn open(index: usize) -> Result<sense_vision::camera_msmf::Camera, sense_vision::Error> {
+    let cam = sense_vision::camera_msmf::Camera::open(index, 1280, 720, 15)?;
     println!("format: {}", cam.negotiated());
     Ok(cam)
 }

@@ -63,6 +63,11 @@ fn utterance_is_answered_and_remembered() {
         )),
         backend: Some(llm.clone() as Arc<dyn deliberate::ChatBackend>),
         canned_proactive: true,
+        // This test checks the plumbing (utterance -> scripted model ->
+        // speaker -> memory) through the model lane. The people-first
+        // pipeline answers "hello, ..." itself with a greeting and never
+        // asks the scripted model; it has its own tests in `deliberate`.
+        legacy_lanes: true,
         ..Parts::default()
     };
     let app = App::build(&config, parts).expect("app builds without hardware");

@@ -34,7 +34,6 @@ use common::EntityId;
 use crossbeam_channel::{Receiver, Sender};
 use deliberate::SchoolLink;
 use parking_lot::Mutex;
-use school::ask::Asker;
 use school::{Date, Erp, ErpConfig, ErpError, Marked, PendingMark, Person, Scope, Snapshot};
 
 /// How often the snapshot is pulled again.
@@ -59,6 +58,8 @@ pub struct SchoolService {
     status: Arc<Mutex<Status>>,
     seen_tx: Sender<(String, String)>,
     offset_secs: i64,
+    /// The last speaker and what they asked, for follow-ups.
+    ctx: Mutex<(Option<String>, school::AskContext)>,
 }
 
 impl SchoolService {
@@ -101,6 +102,7 @@ impl SchoolService {
             status: Arc::clone(&status),
             seen_tx,
             offset_secs,
+            ctx: Mutex::new((None, school::AskContext::default())),
         });
         let worker = Worker {
             cfg,
@@ -153,66 +155,40 @@ impl SchoolLink for SchoolService {
     }
 
     fn answer(&self, text: &str, speaker: Option<&str>) -> Option<String> {
+        // One pure entry point (school::converse): follow-ups first, then
+        // lookups, spans, "when is X" forward searches and day questions.
+        // The context it returns carries "what about tomorrow?" and
+        // "where is she?" to the next turn; a new speaker starts afresh.
         let today = self.today();
+        let secs = self.local_secs();
+        let now = format!(
+            "{:02}:{:02}",
+            secs.rem_euclid(86_400) / 3600,
+            (secs.rem_euclid(86_400) % 3600) / 60
+        );
         let snap = self.snap.lock();
-        // A lookup first: who teaches what, where someone is, what period
-        // it is. A fact from the tables, with a caveat when the copy is
-        // old.
-        if let Some(query) = school::lookup::classify(text) {
-            let secs = self.local_secs();
-            let now = format!(
-                "{:02}:{:02}",
-                secs.rem_euclid(86_400) / 3600,
-                (secs.rem_euclid(86_400) % 3600) / 60
-            );
-            return Some(match school::lookup::answer(&query, &snap, today, &now) {
-                Some(fact) => {
-                    tracing::info!(source = fact.source, "school lookup");
-                    school::lookup::speak(&fact, secs - self.offset_secs, STALE_AFTER_SECS)
-                }
-                None => "I don't have that in today's timetable.".to_owned(),
-            });
+        let mut ctx = self.ctx.lock();
+        if ctx.0.as_deref() != speaker {
+            *ctx = (speaker.map(str::to_owned), school::AskContext::default());
         }
-        // A span: "any exams this week", "is there a PTM next week".
-        if let Some((question, from, to)) = school::ask::classify_span(text, today) {
-            let days: Vec<school::Day> = (0..=from.until(to))
-                .filter_map(|n| snap.day(from.plus(n), &Scope::School).cloned())
-                .collect();
-            let label = if from == today {
-                "this week"
-            } else {
-                "next week"
-            };
-            if days.is_empty() {
-                return Some(format!(
-                    "I don't have the school's calendar for {label} loaded yet."
-                ));
-            }
-            return Some(school::ask::answer_span(question, &days, today, label));
-        }
-        let (question, date) = school::classify(text, today)?;
-        let Some(school_day) = snap.day(date, &Scope::School) else {
-            // Recognised but not loaded: better a plain "not yet" than a
-            // model inventing a timetable.
-            let when = date.spoken(today);
-            let when = when.strip_prefix("on ").unwrap_or(&when).to_owned();
-            return Some(format!(
-                "I don't have the school's calendar for {when} loaded yet."
-            ));
+        let env = school::Env {
+            snap: &snap,
+            today,
+            now: &now,
+            speaker,
         };
-        let person = speaker.and_then(|n| snap.people.get(&n.to_ascii_lowercase()));
-        let asker = Asker {
-            name: person.map(|p| p.name.clone()),
-            group: person.and_then(|p| p.group.clone()),
-        };
-        let scoped = person
-            .and_then(|p| match (p.kind.as_str(), &p.section_id) {
-                ("student", Some(section)) => snap.day(date, &Scope::Section(section.clone())),
-                ("staff", _) => snap.day(date, &Scope::Teacher(p.id.clone())),
-                _ => None,
-            })
-            .unwrap_or(school_day);
-        Some(school::answer(question, scoped, school_day, today, &asker))
+        let (fact, next) = school::respond(text, &env, &ctx.1)?;
+        ctx.1 = next;
+        tracing::info!(source = fact.source, "school answered");
+        Some(school::lookup::speak(
+            &fact,
+            secs - self.offset_secs,
+            STALE_AFTER_SECS,
+        ))
+    }
+
+    fn forget(&self) {
+        *self.ctx.lock() = (None, school::AskContext::default());
     }
 }
 

@@ -24,7 +24,7 @@ mock = [
 ]
 # The camera sense. Off by default while sense-vision settles; the binary
 # compiles and runs voice-only without it.
-vision = ["dep:sense-vision"]
+vision = ["dep:sense-vision", "dep:image"]
 # Kokoro TTS in-process (see act-speaker).
 kokoro = ["act-speaker/kokoro"]
 
@@ -41,6 +41,8 @@ act-ui = { path = "../act-ui" }
 school = { workspace = true }
 bench = { path = "../bench" }
 anyhow = { workspace = true }
+# Photos for `people --enrol` (vision builds only).
+image = { workspace = true, features = ["jpeg", "png"], optional = true }
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 serde = { workspace = true }

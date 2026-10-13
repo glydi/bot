@@ -1,0 +1,19 @@
+# GLYDI self-improvement, nightly (train/selfimprove.py nightly).
+# Installed by deploy/selfimprove/install.sh, which fills __REPO__ and __USER__.
+# On the Jetson it only reports, folds the answer cache and curates the
+# dataset (no training on aarch64); on an x86 PC with a GPU it also trains
+# and gates. Logs: journalctl -u glydi-selfimprove and train/logs/selfimprove-*.log
+[Unit]
+Description=GLYDI nightly self-improvement (report, cache, curate, train, gate)
+After=network-online.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__REPO__
+EnvironmentFile=__REPO__/.env
+ExecStart=/usr/bin/python3 __REPO__/train/selfimprove.py nightly
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h

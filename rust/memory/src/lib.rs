@@ -26,6 +26,7 @@
 
 pub mod extract;
 pub mod gallery;
+pub mod graph;
 pub mod social;
 pub mod store;
 pub mod worker;

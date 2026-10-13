@@ -59,14 +59,19 @@ pub mod arcface;
 pub mod attention;
 #[cfg(target_os = "macos")]
 pub mod camera;
+#[cfg(windows)]
+pub mod camera_msmf;
 #[cfg(target_os = "linux")]
 pub mod camera_v4l2;
 pub mod coco;
+pub mod focus;
 pub mod gallery;
 pub mod gesture;
 pub mod image;
+pub mod lips;
 pub mod objects;
 pub mod pipeline;
+pub mod pose;
 pub mod scene;
 pub mod scrfd;
 pub mod source;
@@ -110,8 +115,10 @@ pub enum Error {
     /// Opening or reading the camera.
     #[error("camera: {0}")]
     Camera(String),
-    /// Camera capture is only implemented for macOS and Linux.
-    #[error("camera capture is only implemented for macOS (AVFoundation) and Linux (V4L2)")]
+    /// Camera capture is only implemented for macOS, Linux and Windows.
+    #[error(
+        "camera capture is only implemented for macOS (AVFoundation), Linux (V4L2) and Windows (Media Foundation)"
+    )]
     Unsupported,
     /// Five consecutive all-black frames: on macOS the signature of a TCC
     /// denial (an unbundled binary has no `NSCameraUsageDescription`), not
@@ -290,6 +297,17 @@ pub struct VisionConfig {
     /// and lighting heuristics: 160 px. A hand beside a face is still tens
     /// of pixels wide at that size and the whole frame costs ~0.3 ms.
     pub gray_width: usize,
+    /// Single focus (`GLYDI_SINGLE_FOCUS`): pick one face to attend to
+    /// and name it on the `focus` modality (see [`focus`]). Off by
+    /// default here; the binary turns it on from the environment.
+    pub single_focus: bool,
+    /// The body-pose model for the focused person's wave (see [`pose`]);
+    /// `None` runs without it. Used only with `single_focus`.
+    pub pose: Option<pose::PoseConfig>,
+    /// Where the focus and the focused mouth's opening go for the audio
+    /// lip gate (see [`lips`]); `None` runs without. Used only with
+    /// `single_focus`.
+    pub speaking: Option<std::sync::Arc<common::SpeakingBoard>>,
 }
 
 impl Default for VisionConfig {
@@ -321,6 +339,9 @@ impl Default for VisionConfig {
             max_embeds_per_frame: tracker::MAX_EMBEDS_PER_FRAME,
             reverify_frames: tracker::REVERIFY_FRAMES,
             gray_width: 160,
+            single_focus: false,
+            pose: None,
+            speaking: None,
         }
     }
 }
@@ -485,7 +506,19 @@ fn open_camera(
     )?))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn open_camera(
+    index: usize,
+    width: usize,
+    height: usize,
+    fps: u32,
+) -> Result<Box<dyn FrameSource>, Error> {
+    Ok(Box::new(camera_msmf::Camera::open(
+        index, width, height, fps,
+    )?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn open_camera(
     _index: usize,
     _width: usize,
@@ -509,7 +542,11 @@ pub fn camera_devices() -> Result<Vec<String>, Error> {
     {
         camera_v4l2::devices()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        camera_msmf::devices()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         Err(Error::Unsupported)
     }
@@ -529,7 +566,7 @@ impl VisionSense {
         tx: RingSender,
         gallery: Arc<dyn FaceGallery>,
     ) -> Result<VisionSenseHandle, Error> {
-        Self::spawn_inner(config, clock, tx, gallery, None)
+        Self::spawn_inner(config, clock, tx, gallery, None, None)
     }
 
     /// Like [`spawn`](Self::spawn) but with the stages supplied, so tests
@@ -542,7 +579,22 @@ impl VisionSense {
         gallery: Arc<dyn FaceGallery>,
         parts: Parts,
     ) -> Result<VisionSenseHandle, Error> {
-        Self::spawn_inner(config, clock, tx, gallery, Some(parts))
+        Self::spawn_inner(config, clock, tx, gallery, Some(parts), None)
+    }
+
+    /// Like [`spawn_with`](Self::spawn_with), and when the source is lost
+    /// (errors in a row, or no frame for a while) `reopen` is called with
+    /// backoff until it gives a new one. The camera path does this with
+    /// the camera itself.
+    pub fn spawn_with_reopen(
+        config: VisionConfig,
+        clock: Arc<dyn Clock>,
+        tx: RingSender,
+        gallery: Arc<dyn FaceGallery>,
+        parts: Parts,
+        reopen: Box<pipeline::Reopen<'static>>,
+    ) -> Result<VisionSenseHandle, Error> {
+        Self::spawn_inner(config, clock, tx, gallery, Some(parts), Some(reopen))
     }
 
     fn spawn_inner(
@@ -551,6 +603,7 @@ impl VisionSense {
         tx: RingSender,
         gallery: Arc<dyn FaceGallery>,
         parts: Option<Parts>,
+        reopen: Option<Box<pipeline::Reopen<'static>>>,
     ) -> Result<VisionSenseHandle, Error> {
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), Error>>(1);
@@ -565,6 +618,9 @@ impl VisionSense {
         let join = std::thread::Builder::new()
             .name("sense-vision".into())
             .spawn(move || {
+                // The camera itself reopens when it is lost; injected
+                // sources only when the caller gave a way.
+                let camera = parts.is_none() && matches!(config.source, Source::Camera { .. });
                 let parts = match parts.map_or_else(|| config.build_parts(), Ok) {
                     Ok(p) => p,
                     Err(e) => {
@@ -574,6 +630,9 @@ impl VisionSense {
                 };
                 let _ = ready_tx.send(Ok(()));
                 info!(source = %config.source_name, det_size = config.det_size, "vision sense running");
+                let mut reopen = reopen;
+                let cam_cfg = config.clone();
+                let mut camera_reopen = move || cam_cfg.open_source();
                 pipeline::run(
                     &config,
                     &clock,
@@ -583,6 +642,11 @@ impl VisionSense {
                     &ctrl_rx,
                     &thread_stop,
                     &thread_stats,
+                    match reopen.as_deref_mut() {
+                        Some(r) => Some(r),
+                        None if camera => Some(&mut camera_reopen),
+                        None => None,
+                    },
                 );
                 info!("vision sense stopped");
             })

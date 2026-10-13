@@ -247,12 +247,45 @@ pub struct World {
     last_voice_at: Option<Instant>,
     /// Names given by `set_name` for entities that do not exist yet.
     pending_names: HashMap<EntityId, SmolStr>,
+    /// Single-focus mode: the one face the camera says to attend to, and
+    /// when it last said so (see [`World::focus`]). `focus_mode` turns on
+    /// with the first [`FOCUS_MODALITY`] observation and stays on.
+    focus: Option<(EntityId, Instant)>,
+    focus_mode: bool,
 }
+
+/// `Observation.modality` naming the single focused face (single-focus
+/// mode). The camera sends it with the focused track's hint; with no
+/// entity it means "nobody in focus".
+pub const FOCUS_MODALITY: &str = "focus";
+
+/// How long a focus report stays good without being renewed.
+pub const FOCUS_TTL: Duration = Duration::from_secs(3);
 
 impl World {
     /// An empty room.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the camera runs single-focus mode (a [`FOCUS_MODALITY`]
+    /// observation has arrived). When on, the planner and the deliberate
+    /// path address only [`World::focus`].
+    pub fn focus_mode(&self) -> bool {
+        self.focus_mode
+    }
+
+    /// The focused person, if the camera named one within [`FOCUS_TTL`]
+    /// and they are present.
+    pub fn focus(&self, now: Instant) -> Option<&EntityId> {
+        let (id, at) = self.focus.as_ref()?;
+        (now.saturating_duration_since(*at) < FOCUS_TTL)
+            .then_some(id)
+            .filter(|id| {
+                self.entities
+                    .get(*id)
+                    .is_some_and(|e| e.status == Status::Present)
+            })
     }
 
     /// Whether the speaker actuator is currently producing audio.
@@ -538,13 +571,23 @@ impl World {
                 // only when it has met them; with several faces in a
                 // school foyer the lips settle it, which is what a person
                 // does when two people are in front of them.
-                let who = id.or_else(|| self.lip_speaker(now));
+                // Single focus: the words are the focused person's.
+                let focused = self.focus(now).cloned();
+                let who = if self.focus_mode {
+                    focused.or(id).or_else(|| self.lip_speaker(now))
+                } else {
+                    id.or_else(|| self.lip_speaker(now))
+                };
                 if let (Some(id), Some(text)) = (who, o.payload.as_text()) {
                     if let Some(e) = self.entities.get_mut(&id) {
                         e.last_spoke = Some(now);
                     }
                     out.push(Event::new(now, id, EventKind::Said(text.to_owned())));
                 }
+            }
+            FOCUS_MODALITY => {
+                self.focus_mode = true;
+                self.focus = id.map(|id| (id, now));
             }
             "self_speaking" => {
                 if let Some(b) = o.payload.as_bool() {

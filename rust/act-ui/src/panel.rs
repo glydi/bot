@@ -57,10 +57,13 @@ pub struct Panel {
     preview: PreviewTexture,
     /// Whether the touch-sized style has been installed.
     styled: bool,
+    /// Whether the small live video is shown (`GLYDI_SHOW_VIDEO`, default
+    /// on). Only hides the picture; recognition keeps running.
+    pub show_video: bool,
 }
 
 /// Camera width on the home screen, logical pixels.
-const CAMERA_WIDTH: f32 = 300.0;
+const CAMERA_WIDTH: f32 = 480.0;
 
 /// Ink on the page.
 const INK: egui::Color32 = egui::Color32::from_gray(0x22);
@@ -90,6 +93,10 @@ impl Panel {
             notice: None,
             preview: PreviewTexture::default(),
             styled: false,
+            show_video: !matches!(
+                std::env::var("GLYDI_SHOW_VIDEO").as_deref().map(str::trim),
+                Ok("0" | "false" | "off" | "no")
+            ),
         }
     }
 
@@ -167,6 +174,16 @@ impl Panel {
                     self.screen = Screen::Settings;
                     self.notice = None;
                 }
+                let (label, tint) = if self.show_video {
+                    ("Video: on", GOOD)
+                } else {
+                    ("Video: off", QUIET)
+                };
+                let toggle = egui::Button::new(egui::RichText::new(label).size(16.0).color(tint))
+                    .min_size(egui::vec2(44.0, 36.0));
+                if ui.add(toggle).clicked() {
+                    self.show_video = !self.show_video;
+                }
             });
         });
 
@@ -174,7 +191,12 @@ impl Panel {
         let welcome = Welcome::from_faces(&state.faces, now);
         let heard = (sources.heard)();
         let school_view = (sources.school)();
-        let camera = self.preview.ensure(ui.ctx(), &state.faces);
+        // Off: no texture upload at all, the picture is simply not drawn.
+        let camera = if self.show_video {
+            self.preview.ensure(ui.ctx(), &state.faces)
+        } else {
+            None
+        };
         let body = ui.available_height() - 16.0;
         ui.allocate_ui(egui::vec2(ui.available_width(), body), |ui| {
             ui.horizontal_top(|ui| {
@@ -426,7 +448,16 @@ fn camera_view(ui: &mut egui::Ui, id: egui::TextureId, state: &UiState) {
         painter.rect_stroke(
             boxed,
             3,
-            egui::Stroke::new(if r.engaged { 3.0 } else { 1.5 }, r.colour()),
+            egui::Stroke::new(
+                if r.focus_mode {
+                    r.stroke() + 1.0
+                } else if r.engaged {
+                    3.0
+                } else {
+                    1.5
+                },
+                r.colour(),
+            ),
             egui::StrokeKind::Outside,
         );
         painter.text(

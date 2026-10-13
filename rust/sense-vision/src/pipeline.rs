@@ -76,6 +76,100 @@ pub fn crowded_interval(emit_interval: Duration) -> Duration {
 #[derive(Debug, Default)]
 pub(crate) struct CrowdClock {
     last: Option<(Instant, usize)>,
+    /// Single focus: the selector, and the last `focus` sent (track,
+    /// when).
+    focus: crate::focus::FocusSelector,
+    focus_sent: Option<(Option<u32>, Instant)>,
+}
+
+/// `Observation.modality` of the single focus: the focused face's entity
+/// hint, or no entity when nobody is in focus. Sent on every change and
+/// at least every [`FOCUS_EVERY`] while someone is.
+pub const MODALITY_FOCUS: &str = "focus";
+
+/// Refresh of an unchanged focus (the mind lets it lapse after 3 s).
+pub const FOCUS_EVERY: Duration = Duration::from_millis(500);
+
+/// Opens the frame source again after it was lost (unplugged, taken by
+/// another program).
+pub type Reopen<'a> = dyn FnMut() -> Result<Box<dyn FrameSource>, Error> + Send + 'a;
+
+/// Errors in a row after which the source counts as lost (~1 s).
+const LOST_AFTER_ERRORS: u32 = 10;
+/// No frame for this long and the source counts as lost.
+const LOST_AFTER_QUIET: Duration = Duration::from_secs(10);
+/// The longest wait between reopen attempts.
+const REOPEN_MAX: Duration = Duration::from_secs(30);
+
+/// Whether the source is still delivering, and the reopen backoff when not.
+struct SourceHealth {
+    fails: u32,
+    last_frame: std::time::Instant,
+    lost: bool,
+    backoff: Duration,
+    next_try: std::time::Instant,
+    attempts: u32,
+}
+
+impl SourceHealth {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            fails: 0,
+            last_frame: now,
+            lost: false,
+            backoff: Duration::from_millis(500),
+            next_try: now,
+            attempts: 0,
+        }
+    }
+
+    fn saw(&mut self, r: &Result<Option<crate::source::Frame>, Error>) {
+        match r {
+            Ok(Some(_)) => {
+                self.fails = 0;
+                self.last_frame = std::time::Instant::now();
+            }
+            Ok(None) => {}
+            Err(_) => self.fails += 1,
+        }
+        if !self.lost
+            && (self.fails >= LOST_AFTER_ERRORS || self.last_frame.elapsed() >= LOST_AFTER_QUIET)
+        {
+            warn!(
+                errors = self.fails,
+                "camera lost; reopening with backoff (voice keeps going)"
+            );
+            self.lost = true;
+            self.backoff = Duration::from_millis(500);
+            self.next_try = std::time::Instant::now();
+            self.attempts = 0;
+        }
+    }
+
+    fn try_reopen(&mut self, reopen: &mut Reopen<'_>) -> Option<Box<dyn FrameSource>> {
+        if std::time::Instant::now() < self.next_try {
+            return None;
+        }
+        self.attempts += 1;
+        match reopen() {
+            Ok(src) => {
+                info!(attempts = self.attempts, "camera back");
+                self.lost = false;
+                self.fails = 0;
+                self.last_frame = std::time::Instant::now();
+                Some(src)
+            }
+            Err(e) => {
+                if self.attempts == 1 {
+                    info!("camera not back yet: {e}");
+                }
+                self.next_try = std::time::Instant::now() + self.backoff;
+                self.backoff = (self.backoff * 2).min(REOPEN_MAX);
+                None
+            }
+        }
+    }
 }
 
 /// The replaceable stages, so tests can run the loop with fakes and the
@@ -149,7 +243,7 @@ fn bump(c: &AtomicU64, by: u64) {
 
 /// The loop body. Returns when `stop` is set, the source ends, or the source
 /// fails in a way that will not recover (black frames from a TCC denial).
-#[allow(clippy::too_many_arguments)] // one call site, in `VisionSense::spawn`
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one call site, in `VisionSense::spawn`
 pub(crate) fn run(
     cfg: &VisionConfig,
     clock: &Arc<dyn Clock>,
@@ -159,10 +253,14 @@ pub(crate) fn run(
     ctrl: &Receiver<Control>,
     stop: &AtomicBool,
     stats: &Stats,
+    mut reopen: Option<&mut Reopen<'_>>,
 ) {
     let mut tracker = Tracker::new(cfg.track_iou_threshold, cfg.track_max_age_frames);
     let mut crowd = CrowdClock::default();
     let mut side = Side {
+        pose: open_pose(cfg),
+        wave: (None, crate::pose::WaveDetector::new()),
+        waved: std::collections::HashMap::new(),
         gestures: cfg.gestures.map(GestureBank::new),
         scene: cfg.scene.map(SceneState::new),
         objects: parts.objects.take().and_then(|det| {
@@ -182,12 +280,29 @@ pub(crate) fn run(
     // Short poll so a stop request is honoured promptly even when the
     // camera has gone quiet.
     let poll = Duration::from_millis(50);
+    let mut lips = open_lips(cfg);
+    let mut health = SourceHealth::new();
 
     while !stop.load(Ordering::Acquire) {
         while let Ok(c) = ctrl.try_recv() {
             handle_control(c, &mut tracker, gallery, cfg.enrol_samples);
         }
-        match parts.source.next_frame(poll) {
+        if health.lost
+            && let Some(r) = reopen.as_deref_mut()
+        {
+            if let Some(src) = health.try_reopen(r) {
+                parts.source = src;
+                tracker = Tracker::new(cfg.track_iou_threshold, cfg.track_max_age_frames);
+            } else {
+                std::thread::sleep(poll);
+            }
+            continue;
+        }
+        let polled = parts.source.next_frame(poll);
+        if reopen.is_some() {
+            health.saw(&polled);
+        }
+        match polled {
             Ok(Some(frame)) => {
                 bump(&stats.frames, 1);
                 let frames = stats.frames.load(Ordering::Relaxed);
@@ -203,10 +318,39 @@ pub(crate) fn run(
                     &frame,
                 );
                 heuristics(cfg, clock.as_ref(), tx, &tracker, stats, &mut side, &frame);
+                if let Some(l) = lips.as_mut() {
+                    let focus = crowd
+                        .focus
+                        .current()
+                        .and_then(|id| tracker.get(id))
+                        .map(|t| (t.id, t.bbox));
+                    l.step(focus, &frame.image, frame.captured_at);
+                }
+                pose_step(
+                    cfg,
+                    clock.as_ref(),
+                    tx,
+                    &tracker,
+                    crowd.focus.current().filter(|_| cfg.single_focus),
+                    stats,
+                    &mut side,
+                    &frame,
+                );
                 // After the faces and the heuristics: the preview is the
                 // least urgent thing the frame produces.
                 if frames % PREVIEW_EVERY == 1 {
-                    let preview = build_preview(&frame.image, &tracker);
+                    let mut preview = build_preview(&frame.image, &tracker, gallery);
+                    if let Some(t) = crowd.focus.current().filter(|_| cfg.single_focus) {
+                        for f in &mut preview.faces {
+                            f.focused = f.track == t;
+                        }
+                    }
+                    for f in &mut preview.faces {
+                        f.waving = side.waved.get(&f.track).is_some_and(|at| {
+                            frame.captured_at.saturating_duration_since(*at)
+                                < Duration::from_secs(3)
+                        });
+                    }
                     let obs = Observation::new(
                         cfg.source_name.clone(),
                         MODALITY_CAMERA_PREVIEW,
@@ -231,7 +375,12 @@ pub(crate) fn run(
                 break;
             }
             Err(e) => {
-                warn!("frame source: {e}");
+                // Logged once per run of errors, not every 100 ms.
+                if health.fails <= 1 {
+                    warn!("frame source: {e}");
+                } else {
+                    tracing::debug!("frame source: {e}");
+                }
                 bump(&stats.errors, 1);
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -251,7 +400,7 @@ pub(crate) fn run(
 /// Cost: one bilinear resize of a 1280x720 frame to 320x180 is ~0.4 ms on
 /// an M-series core (`image::resize_bilinear` computes the column taps
 /// once), and the face list is a dozen small allocations at most.
-pub fn build_preview(image: &Rgb, tracker: &Tracker) -> Preview {
+pub fn build_preview(image: &Rgb, tracker: &Tracker, gallery: &dyn FaceGallery) -> Preview {
     let (fw, fh) = (image.w.max(1) as f32, image.h.max(1) as f32);
     let (pw, ph) = if image.w > PREVIEW_MAX_WIDTH {
         let ph = (image.h * PREVIEW_MAX_WIDTH / image.w.max(1)).max(1);
@@ -267,7 +416,10 @@ pub fn build_preview(image: &Rgb, tracker: &Tracker) -> Preview {
         .map(|t| {
             let [x1, y1, x2, y2] = t.bbox;
             let (label, score) = match &t.person {
-                Some(id) => (id.to_string(), t.confidence),
+                Some(id) => (
+                    gallery.name_of(id).unwrap_or_else(|| id.to_string()),
+                    t.confidence,
+                ),
                 None => (format!("unknown_{}", t.id), t.score),
             };
             PreviewFace {
@@ -279,6 +431,8 @@ pub fn build_preview(image: &Rgb, tracker: &Tracker) -> Preview {
                 score,
                 track: t.id,
                 engaged: t.attention.scores().facing >= PREVIEW_ENGAGED_FACING,
+                focused: false,
+                waving: false,
             }
         })
         .collect();
@@ -294,6 +448,11 @@ pub fn build_preview(image: &Rgb, tracker: &Tracker) -> Preview {
 /// object thread. All optional, all fed after the face stages so they
 /// never delay a `face` observation.
 struct Side {
+    /// The focused person's body pose and wave (single focus only).
+    pose: Option<crate::pose::PoseWorker>,
+    wave: (Option<u32>, crate::pose::WaveDetector),
+    /// When each track last waved, for the preview's hand label.
+    waved: std::collections::HashMap<u32, Instant>,
     gestures: Option<GestureBank>,
     scene: Option<SceneState>,
     objects: Option<ObjectWorker>,
@@ -627,6 +786,9 @@ fn emit(
             bump(&stats.observations, 1);
         }
     }
+    if cfg.single_focus {
+        emit_focus(cfg, now, tx, tracker, crowd, stats, frame_w);
+    }
     // The head-count, after the faces it counts: a consumer reading the
     // stream in order sees who before how many.
     let due = match crowd.last {
@@ -642,4 +804,127 @@ fn emit(
         bump(&stats.evicted, tx.send(obs) as u64);
         bump(&stats.observations, 1);
     }
+}
+
+/// Single focus: fold this frame's faces into the selector and send the
+/// focus on a change, or every [`FOCUS_EVERY`] while it holds.
+fn emit_focus(
+    cfg: &VisionConfig,
+    now: Instant,
+    tx: &RingSender,
+    tracker: &Tracker,
+    crowd: &mut CrowdClock,
+    stats: &Stats,
+    frame_w: usize,
+) {
+    let faces: Vec<crate::focus::Candidate> = tracker
+        .tracks()
+        .into_iter()
+        .filter(|t| t.is_live() && t.bbox[2] - t.bbox[0] >= MIN_EMIT_FACE_PX)
+        .map(|t| crate::focus::Candidate {
+            track: t.id,
+            bbox: t.bbox,
+            facing: t.attention.scores().facing,
+        })
+        .collect();
+    let was = crowd.focus.current();
+    let focus = crowd.focus.update(&faces, frame_w as f32, now);
+    let due = match crowd.focus_sent {
+        None => true,
+        Some((sent, at)) => {
+            sent != focus || (focus.is_some() && now.saturating_duration_since(at) >= FOCUS_EVERY)
+        }
+    };
+    if !due {
+        return;
+    }
+    if was != focus {
+        info!(from = ?was, to = ?focus, "focus");
+    }
+    crowd.focus_sent = Some((focus, now));
+    let mut obs = Observation::new(cfg.source_name.clone(), MODALITY_FOCUS, now);
+    if let Some(t) = focus.and_then(|id| tracker.get(id)) {
+        let hint = match &t.person {
+            Some(id) => EntityHint::KnownOnTrack(id.clone(), t.id),
+            None => EntityHint::Track(t.id),
+        };
+        obs = obs.with_entity(hint);
+    }
+    bump(&stats.evicted, tx.send(obs) as u64);
+    bump(&stats.observations, 1);
+}
+
+/// The lip meter for the audio lip gate, when single focus is on and a
+/// board was given. A missing model still publishes the focus.
+fn open_lips(cfg: &VisionConfig) -> Option<crate::lips::LipStep> {
+    let board = cfg.speaking.clone().filter(|_| cfg.single_focus)?;
+    let path = cfg.models_dir.join(crate::lips::MODEL_FILE);
+    let model = crate::lips::Landmark106::open(&path, &cfg.ort_lib)
+        .map(|m| Box::new(m) as Box<dyn crate::lips::Landmarker>)
+        .map_err(|e| warn!("lip landmarks off (the lip gate will not drop anything): {e}"))
+        .ok();
+    if model.is_some() {
+        info!("lip gate: 106-point landmarks on the focused face");
+    }
+    Some(crate::lips::LipStep::new(board, model))
+}
+
+/// The pose thread, when single focus is on and the model is there.
+fn open_pose(cfg: &VisionConfig) -> Option<crate::pose::PoseWorker> {
+    let pc = cfg.pose.as_ref().filter(|_| cfg.single_focus)?;
+    if !pc.model.is_file() {
+        warn!(model = %pc.model.display(), "no pose model; skeleton waves off (scripts/fetch-models.sh)");
+        return None;
+    }
+    crate::pose::PoseModel::open(&pc.model, &cfg.ort_lib, cfg.intra_threads)
+        .and_then(|m| crate::pose::PoseWorker::spawn(m, pc.interval))
+        .map_err(|e| warn!("pose model failed to load; skeleton waves off: {e}"))
+        .ok()
+}
+
+/// Single focus: hand the focused face to the pose thread, and turn what
+/// comes back into a `gesture` `wave` for that person.
+#[allow(clippy::too_many_arguments)] // the loop's state, one call site
+fn pose_step(
+    cfg: &VisionConfig,
+    clock: &dyn Clock,
+    tx: &RingSender,
+    tracker: &Tracker,
+    focus: Option<u32>,
+    stats: &Stats,
+    side: &mut Side,
+    frame: &Frame,
+) {
+    let Some(worker) = side.pose.as_mut() else {
+        return;
+    };
+    if let Some(t) = focus.and_then(|id| tracker.get(id)) {
+        worker.offer(frame.captured_at, &frame.image, t.id, t.bbox);
+    }
+    for r in worker.results() {
+        if side.wave.0 != Some(r.track) {
+            side.wave = (Some(r.track), crate::pose::WaveDetector::new());
+        }
+        let Some(k) = r.keypoints else {
+            continue;
+        };
+        if !side.wave.1.push(&k, r.captured_at) {
+            continue;
+        }
+        side.waved.insert(r.track, r.captured_at);
+        let entity = match tracker.get(r.track).and_then(|t| t.person.clone()) {
+            Some(id) => EntityHint::KnownOnTrack(id, r.track),
+            None => EntityHint::Track(r.track),
+        };
+        info!(track = r.track, "gesture: skeleton wave");
+        let obs = Observation::new(cfg.source_name.clone(), MODALITY_GESTURE, clock.now())
+            .with_confidence(0.9)
+            .with_entity(entity)
+            .with_payload(Payload::Text(crate::gesture::WAVE.to_string()));
+        bump(&stats.evicted, tx.send(obs) as u64);
+        bump(&stats.observations, 1);
+        bump(&stats.gestures, 1);
+    }
+    side.waved
+        .retain(|_, at| frame.captured_at.saturating_duration_since(*at) < Duration::from_secs(10));
 }

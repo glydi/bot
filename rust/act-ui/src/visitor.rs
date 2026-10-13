@@ -52,9 +52,13 @@ pub enum Welcome {
 impl Welcome {
     /// Read the room from the latest preview.
     pub fn from_faces(faces: &Faces, now: Instant) -> Self {
-        let rows = strip_rows(faces.preview.as_deref());
+        let mut rows = strip_rows(faces.preview.as_deref());
         if rows.is_empty() {
             return Self::Empty;
+        }
+        // Single focus: the headline is the focused person's alone.
+        if rows.iter().any(|r| r.focused) {
+            rows.retain(|r| r.focused);
         }
         let mut known: Vec<(Duration, String)> = rows
             .iter()
@@ -288,6 +292,50 @@ mod tests {
             join_names(&n(&["Priya", "Dev", "Kai"])),
             "Priya, Dev and Kai"
         );
+    }
+
+    #[test]
+    fn single_focus_welcomes_only_the_focused_person() {
+        let face = |track: u32, label: &str, focused: bool| common::PreviewFace {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+            label: label.to_owned(),
+            score: 0.8,
+            track,
+            engaged: true,
+            focused,
+            waving: false,
+        };
+        let faces = |fs: Vec<common::PreviewFace>| Faces {
+            preview: Some(std::sync::Arc::new(common::Preview {
+                width: 2,
+                height: 1,
+                rgb: vec![0; 6],
+                faces: fs,
+            })),
+            ..Faces::default()
+        };
+        let c = Clock::at(0, 0);
+        let now = Instant::now();
+        let w = Welcome::from_faces(
+            &faces(vec![face(1, "Kalyan", true), face(2, "Priya", false)]),
+            now,
+        );
+        assert_eq!(w.headline(&c), "Welcome, Kalyan");
+        // Focused on a stranger: no names from the background.
+        let w = Welcome::from_faces(
+            &faces(vec![face(1, "unknown_1", true), face(2, "Priya", false)]),
+            now,
+        );
+        assert_eq!(w, Welcome::Stranger);
+        // No focus flag (mode off): everyone, as before.
+        let w = Welcome::from_faces(
+            &faces(vec![face(1, "Kalyan", false), face(2, "Priya", false)]),
+            now,
+        );
+        assert!(w.headline(&c).contains("Priya"));
     }
 
     #[test]

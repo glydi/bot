@@ -175,6 +175,41 @@ impl GoalStack {
         self.stack.is_empty()
     }
 
+    /// Single focus: only `focus` is addressed. A group or pair hello
+    /// that includes them becomes a plain hello to them (never "hi
+    /// everyone"), a group or pair without them is dropped, and the
+    /// topmost goal about them moves to the top. Goals about other
+    /// people stay below, for when they are in focus themselves.
+    pub fn focus_on(&mut self, focus: &EntityId) {
+        for g in &mut self.stack {
+            let member = match g {
+                Goal::GreetPair(a, b) => Some(a == focus || b == focus),
+                Goal::GreetGroup(ids) => Some(ids.contains(focus)),
+                _ => None,
+            };
+            if member == Some(true) {
+                *g = Goal::Greet(focus.clone());
+            }
+        }
+        self.stack
+            .retain(|g| !matches!(g, Goal::GreetPair(..) | Goal::GreetGroup(_)));
+        // Two `Greet(focus)` after the rewrite: keep one.
+        let mut seen = false;
+        self.stack.retain(|g| {
+            if *g == Goal::Greet(focus.clone()) {
+                if seen {
+                    return false;
+                }
+                seen = true;
+            }
+            true
+        });
+        if let Some(i) = self.stack.iter().rposition(|g| g.is_about(focus)) {
+            let g = self.stack.remove(i);
+            self.stack.push(g);
+        }
+    }
+
     /// Drop every goal about `entity` (they left). A pair greeting loses
     /// the one who left and becomes a plain greeting of the other.
     pub fn retire(&mut self, entity: &EntityId) {

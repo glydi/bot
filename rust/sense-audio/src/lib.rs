@@ -35,15 +35,26 @@
 
 pub mod aec;
 pub mod affect;
+pub mod denoise;
+
+/// Default for [`AudioConfig::turn_early_ms`] in the binary.
+pub const DEFAULT_TURN_EARLY_MS: u32 = 220;
+/// After a turn the judge deferred, the most silence (from the last
+/// voiced frame) before it is answered anyway.
+pub const MAX_TURN_WAIT_MS: u32 = 1200;
+/// Default for [`AudioConfig::turn_early_prob`].
+pub const DEFAULT_TURN_EARLY_PROB: f32 = 0.8;
 pub mod events;
 pub mod features;
 pub mod fft;
+pub mod gate;
 pub mod input;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod onnx;
 pub mod parakeet;
 pub mod pipeline;
+pub mod remote;
 pub mod stt;
 pub mod turn;
 pub mod vad;
@@ -158,7 +169,7 @@ impl Default for VadConfig {
 }
 
 /// Which speech-to-text engine the utterance worker runs. The binary maps
-/// `GLYDI_STT=whisper|parakeet|moonshine` onto this with [`SttKind::parse`].
+/// `GLYDI_STT=whisper|parakeet|remote|moonshine` onto this with [`SttKind::parse`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SttKind {
     /// whisper.cpp on Metal ([`stt::Whisper`], [`AudioConfig::whisper_model`]).
@@ -168,6 +179,10 @@ pub enum SttKind {
     /// NVIDIA Parakeet TDT 0.6B, ONNX on the CPU ([`parakeet::Parakeet`],
     /// [`AudioConfig::parakeet_model`]). English only.
     Parakeet,
+    /// The Whisper service in `services/stt/` over HTTP
+    /// ([`remote::RemoteStt`], [`AudioConfig::stt_url`]), with Parakeet
+    /// loaded beside it as the fallback while the service is down.
+    Remote,
     /// Moonshine (usefulsensors). Reserved: selecting it is an error until
     /// a port lands.
     Moonshine,
@@ -181,6 +196,7 @@ impl SttKind {
             "whisper" => Some(Self::Whisper),
             "parakeet" => Some(Self::Parakeet),
             "moonshine" => Some(Self::Moonshine),
+            "remote" => Some(Self::Remote),
             _ => None,
         }
     }
@@ -208,6 +224,13 @@ pub struct AudioConfig {
     /// Parakeet model *directory* (see [`parakeet`] for its files); `None`
     /// disables transcription (with [`SttKind::Parakeet`]).
     pub parakeet_model: Option<PathBuf>,
+    /// The STT service for [`SttKind::Remote`] (`GLYDI_STT_URL`).
+    pub stt_url: String,
+    /// Names sent to the remote transcriber as spelling hints.
+    pub stt_hints: Option<remote::Hints>,
+    /// Write each utterance's audio and transcript here
+    /// (`GLYDI_SAVE_UTTERANCES`); `None` saves nothing.
+    pub save_utterances: Option<PathBuf>,
     /// ECAPA ONNX model; `None` disables speaker id.
     pub voiceid_model: Option<PathBuf>,
     /// Silero VAD ONNX model. When set and loadable, voice activity means
@@ -257,6 +280,21 @@ pub struct AudioConfig {
     pub audio_events: bool,
     /// Whether to emit `voice_affect` / `arousal` with each utterance.
     pub affect: bool,
+    /// Noise suppression before the VAD and the recogniser
+    /// (`GLYDI_DENOISE`, see [`denoise`]).
+    pub denoise: denoise::DenoiseKind,
+    /// The camera's view of who is talking, for the lip gate (see
+    /// [`gate`]); `None` without a camera or with `GLYDI_LIP_GATE=0`.
+    pub speaking: Option<Arc<common::SpeakingBoard>>,
+    /// dB under the visit's speech level baseline a turn may be and still
+    /// count (`GLYDI_LEVEL_GATE_DB`); `0` turns the level gate off.
+    pub level_gate_db: f32,
+    /// Dynamic end of turn: ms of quiet after which the turn judge is
+    /// asked early (`GLYDI_TURN_EARLY_MS`); `0` waits for the hangover.
+    /// Needs a turn model.
+    pub turn_early_ms: u32,
+    /// Judge probability needed to end early (`GLYDI_TURN_EARLY_PROB`).
+    pub turn_early_prob: f32,
 }
 
 impl std::fmt::Debug for AudioConfig {
@@ -269,6 +307,9 @@ impl std::fmt::Debug for AudioConfig {
             .field("stt", &self.stt)
             .field("whisper_model", &self.whisper_model)
             .field("parakeet_model", &self.parakeet_model)
+            .field("stt_url", &self.stt_url)
+            .field("stt_hints", &self.stt_hints.as_ref().map(|_| "set"))
+            .field("save_utterances", &self.save_utterances)
             .field("voiceid_model", &self.voiceid_model)
             .field("vad_model", &self.vad_model)
             .field("ort_lib", &self.ort_lib)
@@ -286,6 +327,11 @@ impl std::fmt::Debug for AudioConfig {
             .field("sound_model", &self.sound_model)
             .field("audio_events", &self.audio_events)
             .field("affect", &self.affect)
+            .field("denoise", &self.denoise)
+            .field("speaking", &self.speaking.is_some())
+            .field("level_gate_db", &self.level_gate_db)
+            .field("turn_early_ms", &self.turn_early_ms)
+            .field("turn_early_prob", &self.turn_early_prob)
             .finish()
     }
 }
@@ -308,6 +354,9 @@ impl AudioConfig {
             stt: SttKind::default(),
             whisper_model: Some(dir.join("whisper/ggml-tiny.en.bin")),
             parakeet_model: Some(dir.join("parakeet")),
+            stt_url: remote::DEFAULT_URL.to_owned(),
+            stt_hints: None,
+            save_utterances: None,
             voiceid_model: Some(dir.join("voiceid/ecapa.onnx")),
             vad_model: Some(dir.join(vad_model_relative())),
             ort_lib: PathBuf::from(onnx::DEFAULT_ORT_LIBRARY),
@@ -327,6 +376,11 @@ impl AudioConfig {
             sound_model: Some(dir.join("yamnet/yamnet.onnx")),
             audio_events: true,
             affect: true,
+            denoise: denoise::DenoiseKind::Off,
+            speaking: None,
+            level_gate_db: 0.0,
+            turn_early_ms: 0,
+            turn_early_prob: DEFAULT_TURN_EARLY_PROB,
         }
     }
 
@@ -465,6 +519,68 @@ impl AudioSenseHandle {
     /// spawn) and the pipeline thread is on it.
     pub fn is_listening(&self) -> bool {
         self.is_running() && self.slot.is_listening()
+    }
+
+    /// Keep a microphone attached for the life of the sense: once the
+    /// first one has been listening (or after `grace`, if it never came),
+    /// whenever nothing is listening `open` is called again, with backoff
+    /// from 1 s to 30 s, and what it opens is attached. Logged once per
+    /// outage and once on recovery.
+    pub fn keep_attached(
+        &self,
+        grace: Duration,
+        mut open: Box<dyn FnMut() -> Result<Box<dyn FrameSource>, Error> + Send>,
+    ) {
+        let slot = self.slot();
+        let spawned = std::thread::Builder::new()
+            .name("audio-keep".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let mut seen = false;
+                let mut down_for = 0u32;
+                let mut backoff = Duration::from_secs(1);
+                let mut next_try = std::time::Instant::now();
+                let mut outage_logged = false;
+                while !slot.stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if slot.is_listening() {
+                        if outage_logged {
+                            tracing::warn!("microphone back");
+                        }
+                        seen = true;
+                        down_for = 0;
+                        backoff = Duration::from_secs(1);
+                        outage_logged = false;
+                        continue;
+                    }
+                    if !seen && started.elapsed() < grace {
+                        continue;
+                    }
+                    down_for += 1;
+                    if down_for < 3 || std::time::Instant::now() < next_try {
+                        continue;
+                    }
+                    match open() {
+                        Ok(s) => {
+                            if slot.attach(s).is_ok() {
+                                // Give it a moment to start listening.
+                                down_for = 0;
+                            }
+                        }
+                        Err(e) => {
+                            if !outage_logged {
+                                tracing::warn!(error = %e, "microphone gone; retrying with backoff");
+                                outage_logged = true;
+                            }
+                        }
+                    }
+                    next_try = std::time::Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "microphone keeper not started");
+        }
     }
 
     /// Open a source on a helper thread and attach it whenever it arrives,
@@ -651,6 +767,7 @@ impl AudioSense {
     /// missing model is a `Result`, not a log line from a thread that then
     /// dies. Kept apart from [`start`](Self::start) so the microphone can
     /// be opened between the two.
+    #[allow(clippy::too_many_lines)]
     fn prepare(config: &AudioConfig) -> Result<Prepared, Error> {
         if config.sample_rate != input::TARGET_RATE {
             return Err(Error::Model(format!(
@@ -696,6 +813,37 @@ impl AudioSense {
                         p.warm_up()?;
                     }
                     Some(Box::new(p))
+                }
+                (SttKind::Remote, _, dir) => {
+                    let mut r = remote::RemoteStt::new(config.stt_url.clone(), Vec::new());
+                    if let Some(h) = &config.stt_hints {
+                        r = r.with_hints(h.clone());
+                    }
+                    // Parakeet stands by; a failure to load it costs only
+                    // the fallback.
+                    match dir.as_ref().map(|d| {
+                        Parakeet::open(d, &config.ort_lib, config.whisper_threads).and_then(
+                            |mut p| {
+                                if config.warm_up {
+                                    p.warm_up()?;
+                                }
+                                Ok(p)
+                            },
+                        )
+                    }) {
+                        Some(Ok(p)) => r = r.with_fallback(Box::new(p)),
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "remote stt: parakeet fallback not loaded");
+                        }
+                        None => tracing::warn!("remote stt: no parakeet fallback configured"),
+                    }
+                    tracing::info!(
+                        url = %config.stt_url,
+                        up = r.healthy(),
+                        fallback = r.has_fallback(),
+                        "remote transcriber"
+                    );
+                    Some(Box::new(r))
                 }
                 (SttKind::Moonshine, _, _) => {
                     return Err(Error::Model(
@@ -817,6 +965,17 @@ impl AudioSense {
             stop: stop.clone(),
             jobs: jobs_tx,
             stats: stats.clone(),
+            denoise: config.denoise.build(),
+            early_end_frames: (config.turn_early_ms as usize).div_ceil(32),
+            early_prob: config.turn_early_prob,
+            // The longest a turn waits in all: hangover plus this.
+            defer_cap_frames: (MAX_TURN_WAIT_MS as usize / 32)
+                .saturating_sub(config.vad.hangover_frames)
+                .max(6),
+            crowd: gate::CrowdGate::new(
+                config.speaking.clone(),
+                gate::LevelGate::new(config.level_gate_db),
+            ),
         };
         let worker = Worker {
             jobs: jobs_rx,
@@ -827,6 +986,7 @@ impl AudioSense {
             encoder,
             gallery,
             affect: config.affect.then(affect::Calibrator::new),
+            save_dir: config.save_utterances,
             source_name: config.source_name,
             clock,
             tx,

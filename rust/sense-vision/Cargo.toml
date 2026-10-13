@@ -39,6 +39,9 @@ block2 = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+nokhwa = { workspace = true }
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 
