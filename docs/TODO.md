@@ -15,7 +15,10 @@
 1. Done: think-while-speaking (first sentence said while the model streams; test passes).
    Off: the "Mm," acknowledgement when the model is slow, `GLYDI_THINK_ACK=1` (in simulate.py it became the whole first line).
 2. Done: model failure/garbage mid-turn gives a short line; mic reconnect and camera reopen with backoff (tests).
-   Still open: soak test on the robot (`scripts/soak.py`); stronger model comparison (qwen2.5:7b, qwen3:4b-instruct) within 1.5 s.
+   Done: model server outages bounded and retried (backend.rs, fake-server tests); panic exit + stall/memory watchdog
+   (health.rs), restart loop in rust/run.ps1; `scripts/soak.py` with Ollama kill/pause (runbook: deploy/jetson/kiosk.md "Recovery").
+   Still open: soak on the robot itself; heartbeats inside the sense threads (only panics are caught there today);
+   stronger model comparison (qwen2.5:7b, qwen3:4b-instruct) within 1.5 s.
 3. Written, OFF by default: noise suppression `GLYDI_DENOISE=rnnoise`; lip gate `GLYDI_LIP_GATE=1`
    (2d106det mouth movement of the focused face); distance/level gate `GLYDI_LEVEL_GATE_DB=12`.
    Measured offline 2026-10-13 (`sense-audio/examples/crowd_eval.rs`), all stay OFF: RNNoise mixed for WER and makes Silero

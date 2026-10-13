@@ -649,6 +649,23 @@ impl App {
             .map_or_else(Vec::new, |t| t.lock().clone())
     }
 
+    /// What the process watchdog watches (`health::Watchdog`): the
+    /// deliberate loop, stuck when one turn runs past `GLYDI_STALL_S`.
+    pub fn watch_probes(&self) -> Vec<crate::health::Probe> {
+        let limit = std::env::var("GLYDI_STALL_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .map_or(crate::health::DEFAULT_STALL, Duration::from_secs);
+        self.deliberator
+            .iter()
+            .map(|d| crate::health::Probe {
+                name: "deliberate loop",
+                stuck: Box::new(d.busy_probe()),
+                limit,
+            })
+            .collect()
+    }
+
     /// One log line of counters, for the headless heartbeat.
     pub fn log_stats(&self) {
         if let Some(r) = &self.reflex {
@@ -1552,6 +1569,31 @@ impl DeferredVision {
     }
 }
 
+#[cfg(any(feature = "vision", test))]
+/// Backoff for opening a device that is missing at start: 0.5 s,
+/// doubling to 30 s (the camera's mid-run reopen uses the same ladder).
+#[derive(Debug, Default)]
+struct StartRetry {
+    failures: u32,
+}
+
+#[cfg(any(feature = "vision", test))]
+impl StartRetry {
+    const FIRST: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(30);
+
+    /// Count one failure; how long to wait before the next try.
+    fn failed(&mut self) -> Duration {
+        self.failures += 1;
+        let shift = (self.failures - 1).min(16);
+        (Self::FIRST * (1u32 << shift)).min(Self::MAX)
+    }
+
+    fn failures(&self) -> u32 {
+        self.failures
+    }
+}
+
 #[cfg(feature = "vision")]
 fn spawn_vision(
     config: &Config,
@@ -1605,21 +1647,55 @@ fn spawn_vision(
     let opener = spawn_named("glydi-camera-open", {
         let slot = Arc::clone(&slot);
         move || {
-            let result = VisionSense::spawn(cfg, clock, tx, gallery);
-            let _ = done_tx.send(());
-            match result {
-                Ok(h) => {
-                    let mut guard = slot.lock();
-                    match *guard {
-                        VisionSlot::Pending => *guard = VisionSlot::Ready(h),
-                        // The app stopped while we were in the prompt.
-                        VisionSlot::Ready(_) | VisionSlot::Closed => {
-                            drop(guard);
-                            h.stop();
+            // A camera missing at start (not plugged in yet, Media
+            // Foundation not ready after boot) is retried with the same
+            // backoff as one lost mid-run: logged once, then quietly
+            // until it opens or the app stops.
+            let mut retry = StartRetry::default();
+            loop {
+                let result = VisionSense::spawn(
+                    cfg.clone(),
+                    Arc::clone(&clock),
+                    tx.clone(),
+                    Arc::clone(&gallery),
+                );
+                match result {
+                    Ok(h) => {
+                        let _ = done_tx.try_send(());
+                        let mut guard = slot.lock();
+                        match *guard {
+                            VisionSlot::Pending => *guard = VisionSlot::Ready(h),
+                            // The app stopped while we were in the prompt.
+                            VisionSlot::Ready(_) | VisionSlot::Closed => {
+                                drop(guard);
+                                h.stop();
+                            }
+                        }
+                        if retry.failures() > 0 {
+                            tracing::info!(tries = retry.failures() + 1, "camera open after all");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        let wait = retry.failed();
+                        if retry.failures() == 1 {
+                            tracing::warn!(
+                                error = %e,
+                                "camera unavailable; voice-only until it opens (retrying with backoff)"
+                            );
+                        } else {
+                            tracing::debug!(error = %e, ?wait, "camera still unavailable");
+                        }
+                        // Sleep in small steps so a stopping app is noticed.
+                        let until = std::time::Instant::now() + wait;
+                        while std::time::Instant::now() < until {
+                            if !matches!(*slot.lock(), VisionSlot::Pending) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "camera unavailable; running voice-only"),
             }
         }
     });
@@ -1977,5 +2053,28 @@ fn apply_crowd(cfg: &mut AudioConfig, speaking: Option<Arc<common::SpeakingBoard
         .and_then(|v| v.trim().parse::<f32>().ok())
     {
         cfg.turn_early_prob = p.clamp(0.5, 0.99);
+    }
+}
+
+#[cfg(test)]
+mod start_retry_tests {
+    use super::StartRetry;
+    use std::time::Duration;
+
+    #[test]
+    fn a_missing_device_is_retried_with_backoff_for_ever() {
+        let mut r = StartRetry::default();
+        let waits: Vec<Duration> = (0..10).map(|_| r.failed()).collect();
+        assert_eq!(waits[0], Duration::from_millis(500));
+        assert_eq!(waits[1], Duration::from_secs(1));
+        assert_eq!(waits[2], Duration::from_secs(2));
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(waits[9], Duration::from_secs(30));
+        // No give-up point: the hundredth try still waits the maximum.
+        for _ in 0..100 {
+            r.failed();
+        }
+        assert_eq!(r.failed(), Duration::from_secs(30));
+        assert_eq!(r.failures(), 111);
     }
 }

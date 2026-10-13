@@ -4144,6 +4144,13 @@ impl DeliberatorHandle {
         self.current.lock().is_some()
     }
 
+    /// [`Self::is_busy`] as a closure another thread can keep (the
+    /// process watchdog).
+    pub fn busy_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let current = Arc::clone(&self.current);
+        move || current.lock().is_some()
+    }
+
     /// Stop the loop and wait for the thread.
     pub fn shutdown(mut self) {
         self.shutdown.cancel();

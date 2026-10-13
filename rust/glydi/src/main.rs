@@ -361,11 +361,31 @@ fn env_flag(key: &str, default: bool) -> bool {
 fn run(config: &Config, parts: Parts, window: &Window) -> anyhow::Result<()> {
     let headless = parts.headless;
     let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Any panic, in any part, ends the process with a status the
+    // supervisor (systemd Restart=always, rust/run.ps1) restarts on.
+    glydi::health::install_panic_exit();
     let mut app = App::build(config, parts)?;
     exit::install_fast_exit();
 
     let (ctrlc_tx, ctrlc_rx) = crossbeam_channel::bounded::<()>(1);
     let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A stall or runaway memory: stop gracefully, then exit with
+    // EXIT_RESTART so the supervisor starts a fresh process.
+    let watchdog_restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    glydi::health::Watchdog::spawn(
+        app.watch_probes(),
+        glydi::health::MemoryLimits::from_env(),
+        Box::new({
+            let tx = ctrlc_tx.clone();
+            let quit = quit.clone();
+            let flag = watchdog_restart.clone();
+            move || {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = tx.try_send(());
+            }
+        }),
+    );
     ctrlc::set_handler({
         let quit = quit.clone();
         move || {
@@ -401,6 +421,13 @@ fn run(config: &Config, parts: Parts, window: &Window) -> anyhow::Result<()> {
         }
     }
     app.stop();
+    if watchdog_restart.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            code = glydi::health::EXIT_RESTART,
+            "stopped for a watchdog restart"
+        );
+        std::process::exit(glydi::health::EXIT_RESTART);
+    }
     if restart.load(std::sync::atomic::Ordering::Relaxed) {
         relaunch()?;
     }

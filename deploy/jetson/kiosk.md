@@ -159,6 +159,29 @@ Every decision says why (`proactive line held: ...`, `second greeting
 dropped`, `no match candidates=...`). `RUST_LOG=debug` in `.env` for more,
 then `sudo systemctl restart glydi`.
 
+## Recovery: what restarts itself
+
+The robot is meant to never need a person to bring it back.
+
+| Failure | What happens | In the log |
+|---|---|---|
+| Ollama not running / killed | each turn fails in < 2 s with a short spoken line; once known down, a turn costs one 1 s probe | `model server down` once, `model server back` once |
+| Ollama hung or very slow | no reply headers in 10 s (`GLYDI_LLM_FIRST_BYTE_MS`) or 5 s silence mid-reply (`GLYDI_LLM_IDLE_MS`) ends the turn | `model server slow to answer` |
+| Ollama answers 500 (restarting, load failed) | retried twice with backoff (250, 500 ms), then a short line | debug `model request retried` |
+| Garbage instead of a stream | an error, not silence | the turn's error |
+| A thread panics | process exits 70; systemd restarts it in 5 s | `a part panicked` with the thread name |
+| One turn runs over 120 s (`GLYDI_STALL_S`) | graceful stop, exit 75, restart | `watchdog: restarting the robot` |
+| Process memory over `GLYDI_RSS_MAX_MB` (4608) for 30 s | warning at `GLYDI_RSS_WARN_MB` (3072); graceful stop, exit 75, restart | `process memory high`, then the watchdog line |
+
+`systemctl status glydi` shows the restart count; `journalctl -u glydi | grep -E "panicked|watchdog"`
+says why. `GLYDI_PANIC_EXIT=0` keeps a panicked thread from taking the
+process down (debugging only). On Windows `rust\run.ps1` loops the same way
+(non-zero exit: restart after 5 s; `GLYDI_NO_RESTART=1` runs once).
+
+Soak before shipping a change: `python scripts/soak.py --minutes 60` with
+Ollama running (kills and pauses Ollama once each; reports memory, handles,
+p50/p90 drift, recovery times; `data/soak.log`).
+
 ## Swapping 1.5b ↔ 3b
 
 `.env`:

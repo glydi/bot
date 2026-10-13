@@ -69,6 +69,18 @@ pub enum LlmError {
     /// The reply was not the JSON we asked for (condense).
     #[error("model reply was not the JSON asked for: {0}")]
     BadJson(String),
+    /// The server took longer than a bound (see [`Limits`]).
+    #[error("model server {what} after {after:?}")]
+    Timeout {
+        /// What did not arrive in time.
+        what: &'static str,
+        /// The bound that was hit.
+        after: Duration,
+    },
+    /// The server is known to be down; the turn failed fast instead of
+    /// waiting out a connect per attempt.
+    #[error("model server unavailable: {0}")]
+    Unavailable(String),
     /// The turn was cancelled (barge-in or shutdown).
     #[error("cancelled")]
     Cancelled,
@@ -129,6 +141,84 @@ pub struct OpenAiBackend {
     /// pre-fill (~12 s cold on qwen2.5:3b) and looks like a stall; a turn
     /// waits for the warm-up instead (bounded by `WARM_WAIT`).
     warming: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+    limits: Limits,
+    /// The whole-request bound the client was built with.
+    timeout: Duration,
+    /// Whether the server answered the last attempt; shared by clones.
+    up: std::sync::Arc<Up>,
+}
+
+/// Every bound on one request, and the retry policy. A local model server
+/// fails in a handful of ways -- not running, killed mid-reply, loading
+/// for ever, answering 500 while it restarts, streaming junk -- and each
+/// must end the turn within a few seconds with an [`LlmError`] the
+/// conversation layer turns into a short line, never hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// TCP connect.
+    pub connect: Duration,
+    /// From sending the request to the response headers (Ollama sends
+    /// them with the first token, so this bounds load + prefill).
+    /// `GLYDI_LLM_FIRST_BYTE_MS`.
+    pub first_byte: Duration,
+    /// Longest silence between two body chunks once streaming.
+    /// `GLYDI_LLM_IDLE_MS`.
+    pub idle: Duration,
+    /// Extra attempts after a refused connect or a 5xx, before any text.
+    pub retries: u32,
+    /// First backoff; doubles per retry.
+    pub backoff: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        let ms = |k: &str, d: u64| {
+            Duration::from_millis(
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(d),
+            )
+        };
+        Self {
+            connect: Duration::from_secs(2),
+            first_byte: ms("GLYDI_LLM_FIRST_BYTE_MS", 10_000),
+            idle: ms("GLYDI_LLM_IDLE_MS", 5_000),
+            retries: 2,
+            backoff: Duration::from_millis(250),
+        }
+    }
+}
+
+/// The server's health as the last request saw it. Transitions are
+/// logged once each way; the steady state logs nothing.
+#[derive(Debug, Default)]
+struct Up {
+    down_since: parking_lot::Mutex<Option<std::time::Instant>>,
+}
+
+impl Up {
+    fn is_down(&self) -> bool {
+        self.down_since.lock().is_some()
+    }
+
+    fn down(&self, url: &str, why: &str) {
+        let mut d = self.down_since.lock();
+        if d.is_none() {
+            *d = Some(std::time::Instant::now());
+            tracing::warn!(
+                url,
+                why,
+                "model server down; turns get a short line until it is back"
+            );
+        }
+    }
+
+    fn up(&self, url: &str) {
+        if let Some(since) = self.down_since.lock().take() {
+            tracing::info!(url, down_s = since.elapsed().as_secs(), "model server back");
+        }
+    }
 }
 
 /// How long a turn waits for an in-flight warm-up before sending anyway.
@@ -338,8 +428,10 @@ impl OpenAiBackend {
         api_key: Option<String>,
         timeout: Duration,
     ) -> Result<Self, LlmError> {
+        let limits = Limits::default();
         let http = reqwest::Client::builder()
             .timeout(timeout)
+            .connect_timeout(limits.connect)
             .build()
             .map_err(|source| LlmError::Transport {
                 url: base_url.to_owned(),
@@ -351,7 +443,102 @@ impl OpenAiBackend {
             model: model.to_owned(),
             http,
             warming: std::sync::Arc::new(tokio::sync::watch::Sender::new(false)),
+            limits,
+            timeout,
+            up: std::sync::Arc::new(Up::default()),
         })
+    }
+
+    /// The same client with other bounds (tests, or a slower server).
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        if let Ok(http) = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(limits.connect)
+            .build()
+        {
+            self.http = http;
+        }
+        self
+    }
+
+    /// Whether the last attempt reached the server.
+    pub fn is_up(&self) -> bool {
+        !self.up.is_down()
+    }
+
+    /// A one-second `GET /models`: while the server is known down, each
+    /// turn asks this before trying for real, so an outage costs a turn
+    /// milliseconds (connection refused) instead of the full retry ladder.
+    async fn probe(&self) -> bool {
+        let ok = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if ok {
+            self.up.up(&self.base_url);
+        }
+        ok
+    }
+
+    /// Send a streaming request: bounded to the response headers, retried
+    /// with backoff on a refused connect or a 5xx, failing fast while the
+    /// server is known to be down.
+    async fn open(&self, req: &ChatRequest) -> Result<reqwest::Response, LlmError> {
+        if self.up.is_down() && !self.probe().await {
+            return Err(LlmError::Unavailable(self.base_url.clone()));
+        }
+        let mut delay = self.limits.backoff;
+        let mut attempt = 0;
+        loop {
+            let sent =
+                tokio::time::timeout(self.limits.first_byte, self.build(req, true).send()).await;
+            let err = match sent {
+                Err(_) => {
+                    // A hung load or a very slow prefill: retrying would
+                    // only queue behind it.
+                    tracing::warn!(after = ?self.limits.first_byte, "model server slow to answer");
+                    return Err(LlmError::Timeout {
+                        what: "sent no reply",
+                        after: self.limits.first_byte,
+                    });
+                }
+                Ok(Ok(resp)) if resp.status().is_success() => {
+                    self.up.up(&self.base_url);
+                    return Ok(resp);
+                }
+                Ok(Ok(resp)) => {
+                    let status = resp.status().as_u16();
+                    let body = tokio::time::timeout(Duration::from_secs(1), resp.text())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    let body: String = body.trim().chars().take(300).collect();
+                    let e = LlmError::Server { status, body };
+                    if status < 500 {
+                        return Err(e);
+                    }
+                    e
+                }
+                Ok(Err(e)) => {
+                    let e = self.transport(e);
+                    self.up.down(&self.base_url, &e.to_string());
+                    e
+                }
+            };
+            if attempt >= self.limits.retries {
+                return Err(err);
+            }
+            attempt += 1;
+            tracing::debug!(attempt, error = %err, ?delay, "model request retried");
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
     }
 
     /// Wait for an in-flight [`Self::warm`] to finish, up to `WARM_WAIT`.
@@ -573,6 +760,11 @@ struct Streaming {
     queued: VecDeque<Result<ChatEvent, LlmError>>,
     /// The body has ended and the calls have been queued.
     finished: bool,
+    /// Longest wait for the next chunk.
+    idle: Duration,
+    /// Chunks that parsed, and lines that did not.
+    good: usize,
+    junk: usize,
 }
 
 impl Streaming {
@@ -583,8 +775,10 @@ impl Streaming {
             // A line that is not JSON is a keep-alive or a comment; skip it
             // like the Go client.
             let Ok(chunk) = serde_json::from_str::<Chunk>(&data) else {
+                self.junk += 1;
                 continue;
             };
+            self.good += 1;
             match fold_chunk(chunk, &mut self.calls) {
                 Ok(Some(text)) => self.queued.push_back(Ok(ChatEvent::Text(text))),
                 Ok(None) => {}
@@ -605,7 +799,14 @@ impl Streaming {
             if self.finished {
                 return None;
             }
-            match self.body.next().await {
+            let Ok(next) = tokio::time::timeout(self.idle, self.body.next()).await else {
+                self.finished = true;
+                return Some(Err(LlmError::Timeout {
+                    what: "stalled mid-reply",
+                    after: self.idle,
+                }));
+            };
+            match next {
                 Some(Ok(bytes)) => self.ingest(&bytes),
                 Some(Err(source)) => {
                     self.finished = true;
@@ -617,6 +818,14 @@ impl Streaming {
                 None => {
                     // End of body: emit the assembled calls.
                     self.finished = true;
+                    if self.good == 0 {
+                        // 200 with nothing usable: a proxy page, a
+                        // half-started server, junk. Not an empty reply.
+                        return Some(Err(LlmError::BadJson(format!(
+                            "no reply in the stream ({} unreadable lines)",
+                            self.junk
+                        ))));
+                    }
                     match finish_calls(std::mem::take(&mut self.calls)) {
                         Ok(cs) => self
                             .queued
@@ -651,19 +860,10 @@ fn stream_events(
             State::Start(start) => {
                 let (this, req) = *start;
                 this.await_warm().await;
-                let resp = match this.build(&req, true).send().await {
+                let resp = match this.open(&req).await {
                     Ok(r) => r,
-                    Err(e) => return Some((Err(this.transport(e)), State::Done)),
+                    Err(e) => return Some((Err(e), State::Done)),
                 };
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    let err = LlmError::Server {
-                        status: status.as_u16(),
-                        body: body.trim().to_owned(),
-                    };
-                    return Some((Err(err), State::Done));
-                }
                 Streaming {
                     body: resp.bytes_stream().map(|r| r.map(|b| b.to_vec())).boxed(),
                     url: this.base_url.clone(),
@@ -671,6 +871,9 @@ fn stream_events(
                     calls: Vec::new(),
                     queued: VecDeque::new(),
                     finished: false,
+                    idle: this.limits.idle,
+                    good: 0,
+                    junk: 0,
                 }
             }
         };
@@ -685,6 +888,7 @@ fn stream_events(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -776,5 +980,296 @@ mod tests {
         assert_eq!(v["tools"][0]["function"]["name"], "recall_person");
         assert_eq!(v["reasoning_effort"], "none");
         assert_eq!(v["response_format"]["type"], "json_object");
+    }
+
+    /// A model server made of a `std` listener: each POST gets the next
+    /// scripted behaviour, every GET (the health probe) a model list.
+    mod fake {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        #[derive(Clone)]
+        pub enum Act {
+            /// Status line + body, then close.
+            Reply(&'static str, &'static str),
+            /// SSE headers, these chunks, then hang for the duration.
+            StreamThenHang(Vec<&'static str>, Duration),
+            /// SSE headers, these chunks, then drop the connection.
+            StreamThenDrop(Vec<&'static str>),
+            /// Read the request, say nothing for the duration.
+            Silent(Duration),
+        }
+
+        const SSE: &str =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+
+        fn chunk(text: &str) -> String {
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\r\n\r\n")
+        }
+
+        fn read_request(s: &mut TcpStream) -> String {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut b = [0u8; 4096];
+            while let Ok(n) = s.read(&mut b) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&b[..n]);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        return text;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        fn write_chunks(s: &mut TcpStream, chunks: Vec<&'static str>) {
+            let _ = s.write_all(SSE.as_bytes());
+            for c in chunks {
+                let _ = s.write_all(chunk(c).as_bytes());
+            }
+            let _ = s.flush();
+        }
+
+        pub fn serve_on(listener: TcpListener, acts: Vec<Act>) {
+            std::thread::spawn(move || {
+                let mut acts = acts.into_iter();
+                for conn in listener.incoming() {
+                    let Ok(mut s) = conn else { continue };
+                    let req = read_request(&mut s);
+                    if req.starts_with("GET") {
+                        let body = "{\"data\":[{\"id\":\"m\"}]}";
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        continue;
+                    }
+                    let Some(act) = acts.next() else { return };
+                    std::thread::spawn(move || match act {
+                        Act::Reply(status, body) => {
+                            let _ = write!(
+                                s,
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                        }
+                        Act::StreamThenHang(chunks, d) => {
+                            write_chunks(&mut s, chunks);
+                            std::thread::sleep(d);
+                        }
+                        Act::StreamThenDrop(chunks) => {
+                            write_chunks(&mut s, chunks);
+                            let _ = s.shutdown(std::net::Shutdown::Both);
+                        }
+                        Act::Silent(d) => std::thread::sleep(d),
+                    });
+                }
+            });
+        }
+
+        pub fn serve(acts: Vec<Act>) -> String {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}/v1", l.local_addr().expect("addr"));
+            serve_on(l, acts);
+            url
+        }
+    }
+
+    use fake::Act;
+
+    fn quick() -> Limits {
+        Limits {
+            connect: Duration::from_millis(200),
+            first_byte: Duration::from_millis(800),
+            idle: Duration::from_millis(500),
+            retries: 2,
+            backoff: Duration::from_millis(20),
+        }
+    }
+
+    fn client(url: &str) -> OpenAiBackend {
+        OpenAiBackend::new(url, "m", None, Duration::from_secs(10))
+            .expect("client")
+            .with_limits(quick())
+    }
+
+    fn hi() -> ChatRequest {
+        ChatRequest {
+            messages: vec![Message::user("hi")],
+            tools: Vec::new(),
+            max_tokens: 8,
+            temperature: 0.0,
+            json_object: false,
+        }
+    }
+
+    /// Run one turn to the end: the text, the error, and how long it took.
+    fn turn(b: &OpenAiBackend) -> (String, Option<LlmError>, Duration) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        let (text, err) = rt.block_on(async {
+            let mut s = b.chat(hi());
+            let mut text = String::new();
+            while let Some(ev) = s.next().await {
+                match ev {
+                    Ok(ChatEvent::Text(t)) => text.push_str(&t),
+                    Ok(ChatEvent::Call(_)) => {}
+                    Err(e) => return (text, Some(e)),
+                }
+            }
+            (text, None)
+        });
+        (text, err, started.elapsed())
+    }
+
+    fn free_port() -> (String, std::net::SocketAddr) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let a = l.local_addr().expect("addr");
+        drop(l);
+        (format!("http://{a}/v1"), a)
+    }
+
+    #[test]
+    fn a_healthy_stream_reads_through() {
+        let url = fake::serve(vec![Act::StreamThenDrop(vec!["Hel", "lo"])]);
+        let (text, err, _) = turn(&client(&url));
+        assert_eq!(text, "Hello");
+        assert!(err.is_none(), "{err:?}");
+    }
+
+    #[test]
+    fn not_running_fails_fast_then_faster() {
+        let (url, _) = free_port();
+        let b = client(&url);
+        let (_, err, took) = turn(&b);
+        assert!(matches!(err, Some(LlmError::Transport { .. })), "{err:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert!(!b.is_up());
+        // Known down: one probe, no retry ladder.
+        let (_, err, took) = turn(&b);
+        assert!(matches!(err, Some(LlmError::Unavailable(_))), "{err:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_restarted_server_is_noticed() {
+        let (url, addr) = free_port();
+        let b = client(&url);
+        let _ = turn(&b);
+        assert!(!b.is_up());
+        let l = std::net::TcpListener::bind(addr).expect("rebind");
+        fake::serve_on(l, vec![Act::StreamThenDrop(vec!["back"])]);
+        let (text, err, _) = turn(&b);
+        assert_eq!(text, "back", "{err:?}");
+        assert!(b.is_up());
+    }
+
+    #[test]
+    fn killed_mid_turn_keeps_the_text_and_ends() {
+        let url = fake::serve(vec![Act::StreamThenDrop(vec!["Half a"])]);
+        let (text, _, took) = turn(&client(&url));
+        assert_eq!(text, "Half a");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn stalled_mid_reply_times_out() {
+        let url = fake::serve(vec![Act::StreamThenHang(
+            vec!["Wait"],
+            Duration::from_secs(5),
+        )]);
+        let (text, err, took) = turn(&client(&url));
+        assert_eq!(text, "Wait");
+        assert!(
+            matches!(
+                err,
+                Some(LlmError::Timeout {
+                    what: "stalled mid-reply",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_slow_or_hung_load_is_bounded_and_not_retried() {
+        let url = fake::serve(vec![
+            Act::Silent(Duration::from_secs(5)),
+            Act::Silent(Duration::from_secs(5)),
+        ]);
+        let (_, err, took) = turn(&client(&url));
+        assert!(
+            matches!(
+                err,
+                Some(LlmError::Timeout {
+                    what: "sent no reply",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+    }
+
+    #[test]
+    fn a_500_is_retried_then_succeeds() {
+        let url = fake::serve(vec![
+            Act::Reply("500 Internal Server Error", "{\"error\":\"loading\"}"),
+            Act::StreamThenDrop(vec!["ok"]),
+        ]);
+        let (text, err, _) = turn(&client(&url));
+        assert_eq!(text, "ok", "{err:?}");
+    }
+
+    #[test]
+    fn a_500_every_time_is_a_clean_error() {
+        let e = Act::Reply("500 Internal Server Error", "boom");
+        let url = fake::serve(vec![e.clone(), e.clone(), e]);
+        let (_, err, took) = turn(&client(&url));
+        assert!(
+            matches!(err, Some(LlmError::Server { status: 500, .. })),
+            "{err:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_400_is_not_retried() {
+        let url = fake::serve(vec![Act::Reply("400 Bad Request", "no")]);
+        let (_, err, _) = turn(&client(&url));
+        assert!(
+            matches!(err, Some(LlmError::Server { status: 400, .. })),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn garbage_is_an_error_not_silence() {
+        let url = fake::serve(vec![Act::Reply(
+            "200 OK",
+            "<html>proxy error</html>\r\ndata: nonsense\r\n",
+        )]);
+        let (text, err, _) = turn(&client(&url));
+        assert!(text.is_empty());
+        assert!(matches!(err, Some(LlmError::BadJson(_))), "{err:?}");
     }
 }

@@ -301,6 +301,253 @@ pub fn hottest_zone_c() -> Option<u8> {
     hottest
 }
 
+// --- supervision ---------------------------------------------------------
+//
+// The robot never sits there broken. Three ways a part can fail, and what
+// happens:
+//
+// * **A thread panics.** A panicked sense or turn thread would leave a
+//   robot that looks alive and never answers. [`install_panic_exit`] logs
+//   the panic with the thread's name and exits with [`EXIT_PANIC`];
+//   systemd (`Restart=always`) or `rust/run.ps1` starts it again in a few
+//   seconds.
+// * **A part stalls.** A [`Probe`] says whether a part is stuck right
+//   now (the deliberate loop: a turn running); stuck continuously for its
+//   limit, the [`Watchdog`] logs it and asks for a graceful restart
+//   ([`EXIT_RESTART`]).
+// * **Memory grows.** The process's resident memory is sampled; above
+//   `GLYDI_RSS_WARN_MB` a warning is logged once, above
+//   `GLYDI_RSS_MAX_MB` for three samples in a row a graceful restart.
+
+/// Exit status after a panic: the supervisor restarts the process.
+pub const EXIT_PANIC: i32 = 70;
+/// Exit status of a watchdog restart (stall or memory).
+pub const EXIT_RESTART: i32 = 75;
+/// How long a graceful restart may take before the watchdog exits anyway.
+pub const RESTART_GRACE: Duration = Duration::from_secs(30);
+
+/// Exit the process on any panic, after the default report and one log
+/// line naming the thread. `GLYDI_PANIC_EXIT=0` keeps the old behaviour
+/// (the thread dies, the rest runs on) for debugging.
+pub fn install_panic_exit() {
+    if std::env::var("GLYDI_PANIC_EXIT").is_ok_and(|v| v.trim() == "0") {
+        return;
+    }
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
+        tracing::error!(
+            thread,
+            panic = %info,
+            code = EXIT_PANIC,
+            "a part panicked; exiting so the supervisor restarts the robot"
+        );
+        std::process::exit(EXIT_PANIC);
+    }));
+}
+
+/// A part the watchdog watches: stuck now, and for how long stuck is fine.
+pub struct Probe {
+    /// For the log.
+    pub name: &'static str,
+    /// `true` while the part is in a state that must not last (a turn in
+    /// flight). Sampled every [`WATCH_INTERVAL`].
+    pub stuck: Box<dyn Fn() -> bool + Send>,
+    /// Stuck continuously this long is a stall.
+    pub limit: Duration,
+}
+
+/// Watchdog sampling interval.
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// Default `GLYDI_STALL_S`: a turn is bounded by the model timeouts
+/// (10 s to the first token, 5 s between tokens, the request timeout over
+/// all), so two minutes of one turn is a stall, not a slow answer.
+pub const DEFAULT_STALL: Duration = Duration::from_secs(120);
+
+/// Memory thresholds for the process, megabytes; `0` turns one off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryLimits {
+    /// `GLYDI_RSS_WARN_MB`: log once.
+    pub warn_mb: u64,
+    /// `GLYDI_RSS_MAX_MB`: restart.
+    pub max_mb: u64,
+}
+
+impl MemoryLimits {
+    /// From the environment. Defaults sized for the 8 GB Jetson, where the
+    /// bot (voice, ear, vision; the LLM is Ollama's process) settles near
+    /// 1.5-2.5 GB.
+    pub fn from_env() -> Self {
+        let mb = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d)
+        };
+        Self {
+            warn_mb: mb("GLYDI_RSS_WARN_MB", 3072),
+            max_mb: mb("GLYDI_RSS_MAX_MB", 4608),
+        }
+    }
+}
+
+/// What one memory sample means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryVerdict {
+    /// Nothing to say.
+    Fine,
+    /// First crossing of the warning line.
+    Warn,
+    /// Over the maximum for three samples in a row.
+    Restart,
+}
+
+/// The memory watchdog's state, separate from the thread so it is tested.
+#[derive(Debug, Default)]
+pub struct MemoryWatch {
+    warned: bool,
+    over: u32,
+}
+
+impl MemoryWatch {
+    /// Fold one sample in.
+    pub fn sample(&mut self, rss_mb: u64, limits: MemoryLimits) -> MemoryVerdict {
+        if limits.max_mb > 0 && rss_mb >= limits.max_mb {
+            self.over += 1;
+            if self.over >= 3 {
+                return MemoryVerdict::Restart;
+            }
+        } else {
+            self.over = 0;
+        }
+        if limits.warn_mb > 0 && rss_mb >= limits.warn_mb && !self.warned {
+            self.warned = true;
+            return MemoryVerdict::Warn;
+        }
+        if rss_mb < limits.warn_mb * 9 / 10 {
+            self.warned = false;
+        }
+        MemoryVerdict::Fine
+    }
+}
+
+/// Continuous-stuck tracking for one probe.
+#[derive(Debug, Default)]
+pub struct StallWatch {
+    since: Option<Instant>,
+}
+
+impl StallWatch {
+    /// Fold one observation in; `true` once stuck for `limit`.
+    pub fn sample(&mut self, stuck: bool, now: Instant, limit: Duration) -> bool {
+        if !stuck {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= limit
+    }
+}
+
+/// The watchdog thread.
+pub struct Watchdog;
+
+impl Watchdog {
+    /// Start watching. `restart` is called once, on the first stall or
+    /// memory breach, to ask the main loop for a graceful stop; it should
+    /// make `run` return [`EXIT_RESTART`]. If the process is still alive
+    /// [`RESTART_GRACE`] later, the watchdog exits it.
+    pub fn spawn(probes: Vec<Probe>, memory: MemoryLimits, restart: Box<dyn Fn() + Send>) {
+        let spawned = std::thread::Builder::new()
+            .name("glydi-watchdog".into())
+            .spawn(move || {
+                let mut stalls: Vec<StallWatch> =
+                    probes.iter().map(|_| StallWatch::default()).collect();
+                let mut mem = MemoryWatch::default();
+                let mut last_mem: Option<Instant> = None;
+                let mut asked: Option<Instant> = None;
+                loop {
+                    std::thread::sleep(WATCH_INTERVAL);
+                    let now = Instant::now();
+                    if let Some(at) = asked {
+                        if now.duration_since(at) >= RESTART_GRACE {
+                            tracing::error!("graceful restart did not finish; exiting");
+                            std::process::exit(EXIT_RESTART);
+                        }
+                        continue;
+                    }
+                    let mut why: Option<String> = None;
+                    for (p, w) in probes.iter().zip(stalls.iter_mut()) {
+                        if w.sample((p.stuck)(), now, p.limit) {
+                            why = Some(format!("{} stalled for {:?}", p.name, p.limit));
+                        }
+                    }
+                    if last_mem.is_none_or(|t| now.duration_since(t) >= INTERVAL) {
+                        last_mem = Some(now);
+                        if let Some(rss) = process_rss_mb() {
+                            match mem.sample(rss, memory) {
+                                MemoryVerdict::Fine => {}
+                                MemoryVerdict::Warn => tracing::warn!(
+                                    rss_mb = rss,
+                                    limit_mb = memory.max_mb,
+                                    "process memory high"
+                                ),
+                                MemoryVerdict::Restart => {
+                                    why = Some(format!("memory {rss} MB over {} MB", memory.max_mb));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(why) = why {
+                        tracing::error!(%why, code = EXIT_RESTART, "watchdog: restarting the robot");
+                        asked = Some(now);
+                        restart();
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "watchdog not started");
+        }
+    }
+}
+
+/// This process's memory, megabytes: resident on Linux, private (committed)
+/// on Windows, where the working set is trimmed by the OS and hides growth.
+pub fn process_rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        text.lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "[int64]((Get-Process -Id {}).PrivateMemorySize64/1MB)",
+                    std::process::id()
+                ),
+            ])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +576,49 @@ mod tests {
     #[test]
     fn an_unroutable_host_is_not_reachable() {
         assert!(!reachable("nonexistent.invalid:443"));
+    }
+    #[test]
+    fn memory_warns_once_and_restarts_after_three_over() {
+        let l = MemoryLimits {
+            warn_mb: 100,
+            max_mb: 200,
+        };
+        let mut w = MemoryWatch::default();
+        assert_eq!(w.sample(50, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(120, l), MemoryVerdict::Warn);
+        assert_eq!(w.sample(130, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(210, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(210, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(150, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(210, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(210, l), MemoryVerdict::Fine);
+        assert_eq!(w.sample(210, l), MemoryVerdict::Restart);
+        let off = MemoryLimits {
+            warn_mb: 0,
+            max_mb: 0,
+        };
+        assert_eq!(
+            MemoryWatch::default().sample(99_999, off),
+            MemoryVerdict::Fine
+        );
+    }
+
+    #[test]
+    fn a_stall_is_continuous_stuck_for_the_limit() {
+        let t0 = Instant::now();
+        let lim = Duration::from_secs(10);
+        let mut w = StallWatch::default();
+        assert!(!w.sample(true, t0, lim));
+        assert!(!w.sample(true, t0 + Duration::from_secs(9), lim));
+        assert!(!w.sample(false, t0 + Duration::from_secs(9), lim));
+        assert!(!w.sample(true, t0 + Duration::from_secs(12), lim));
+        assert!(w.sample(true, t0 + Duration::from_secs(22), lim));
+    }
+
+    #[test]
+    fn this_process_has_a_size() {
+        if cfg!(any(target_os = "linux", windows)) {
+            assert!(process_rss_mb().is_some_and(|m| m > 0));
+        }
     }
 }
