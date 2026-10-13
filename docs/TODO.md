@@ -39,3 +39,10 @@
 10. erp.xulo.in straight-to-login: built on branch `erp-root-login` (worktree C:\Users\user\erp-root-login); not shipped. erp.xulo.in is Pages project `school-erp-d1`.
 11. xulo.in website: remove xulo.in/www from Cloudflare Pages project `xulo-site`, add the GitHub Pages DNS records, then enforce HTTPS. New screenshots still pending.
 13. Jetson: build the CUDA/TensorRT onnxruntime on the board; `deploy/jetson/install.sh`.
+
+## Found live 2026-10-14 (fix when testing resumes)
+- Speed: qwen2.5:7b (GLYDI_DEEP_MODEL default) fills the 8 GB GPU and pushes qwen2.5:3b to 95% CPU; fast path slows to ~2 s and the understand call can time out. .env now has GLYDI_DEEP_MODEL=off. Decide: load the deep model on demand, a smaller deep model, or keep off. The default in code is still the 7B.
+- Unprompted lines still spoken in people mode: "So, what's been keeping you busy, Sony?", "What's Kalyan got you looking for today?", "Found ya, Sony!". Find which path bypasses the people-mode gate.
+- Test campaign (cd4b3c8) was stopped while running the e2e eval on the extra cases; resume: run scripts/scenarios_more.py, the fuzz suites and the eval, collect the bug list.
+- Known failing: deliberate voice guards `leaks_are_caught`, `voice_guards_are_total_and_bounded` (from the new fuzz tests).
+- Slow-path reasoning can be backwards ("pick up Imran first" though Aisha finishes earlier); add reasoning-correctness checks to the eval.
