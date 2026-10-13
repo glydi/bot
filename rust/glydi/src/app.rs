@@ -242,8 +242,13 @@ impl App {
         let db = parts.db.clone().unwrap_or_else(|| config.db.clone());
         // The zone: "first sighting of the day" for check-ins turns over
         // at local midnight, and reminder times are parsed in local time.
-        let store = Store::open(&db)
-            .with_context(|| format!("opening {}", db.display()))?
+        // Never refuses to start: a corrupt file is moved aside and a read-
+        // only one gives a memory-only gallery (a run.ps1 crash loop
+        // otherwise); the problem goes to the log and the health line.
+        let (store, gallery_problem) = Store::open_or_recover(&db);
+        let face_model = crate::config::face_model_tag(&config.face_models_dir);
+        let store = store
+            .with_face_model(&face_model)
             .with_utc_offset(deliberate::tools::local_utc_offset())
             .with_gates(
                 Gates {
@@ -255,9 +260,41 @@ impl App {
                     margin: config.voice_gates.1,
                 },
             );
+        // Same-name duplicates (a face on one row, facts on the other)
+        // fold together, after a backup; see `memory::hygiene`.
+        if gallery_problem.is_none() {
+            for m in store.tidy_on_start(&db) {
+                tracing::warn!(name = %m.name, kept = %m.kept, dropped = %m.dropped, "gallery: merged duplicate");
+            }
+        }
+        // Samples made by another recogniser do not match under this one.
+        if let Ok(report) = store.face_model_report() {
+            let crops: usize = report.iter().map(|r| r.2).sum();
+            let reenrol: Vec<&str> = report
+                .iter()
+                .filter(|r| r.3 > 0 && r.4 == 0)
+                .map(|r| r.1.as_str())
+                .collect();
+            if crops > 0 {
+                tracing::warn!(
+                    face_model,
+                    samples = crops,
+                    "face samples from another recogniser: run `glydi people --reembed`"
+                );
+            }
+            if !reenrol.is_empty() {
+                tracing::warn!(
+                    face_model,
+                    people = reenrol.join(", "),
+                    "not recognisable under this recogniser until re-enrolled \
+                     (`glydi people --enrol NAME --from-camera 8` or --image)"
+                );
+            }
+        }
         let store = Arc::new(store);
         tracing::info!(
             db = %db.display(),
+            face_model,
             faces = store.embedding_count(memory::Modality::Face),
             voices = store.embedding_count(memory::Modality::Voice),
             "gallery open"
@@ -266,6 +303,7 @@ impl App {
         // -- health -----------------------------------------------------
         // First: the mind's fallback and the screen read it.
         let health = crate::health::Health::spawn(crate::health::Hosts {
+            gallery_problem,
             cloud: std::env::var(deliberate::claude::API_KEY_ENV)
                 .ok()
                 .filter(|k| !k.trim().is_empty())
@@ -1125,6 +1163,16 @@ fn poll_commitments(store: &Store, view: &WorldView, tx: &RingSender, now: Insta
 /// the memory worker drops it when the track leaves.
 fn stash_strangers(from: &RingReceiver, store: &Store, view: &ArcSwap<WorldView>) {
     while let Some(o) = from.recv() {
+        // The aligned crop that follows a stranger's sample, kept with it
+        // so the sample can be re-embedded under another recogniser.
+        if let (Payload::Opaque(any), "face_crop", Some(EntityHint::Track(t))) =
+            (&o.payload, o.modality.as_str(), &o.entity)
+        {
+            if let Some(crop) = any.downcast_ref::<Vec<u8>>() {
+                store.stash_crop(*t, crop);
+            }
+            continue;
+        }
         let Payload::Embedding(emb) = &o.payload else {
             continue;
         };
@@ -1635,6 +1683,8 @@ fn spawn_vision(
         ort_lib: config.ort_lib.clone(),
         single_focus: common::single_focus(),
         speaking,
+        // A template update needs a match well clear of the floor.
+        template_update_score: config.face_gates.0 + 0.15,
         ..VisionConfig::default()
     };
     // The object detector lives beside the other models
@@ -1889,6 +1939,10 @@ impl sense_vision::FaceGallery for StoreFaces {
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), sense_vision::Error> {
         memory::FaceGallery::enrol(&*self.0, id.clone(), emb)
             .map_err(|e| sense_vision::Error::Model(e.to_string()))
+    }
+
+    fn update(&self, id: &EntityId, emb: &[f32], crop: Option<&[u8]>) -> bool {
+        memory::FaceGallery::update(&*self.0, id, emb, crop)
     }
 
     fn name_of(&self, id: &EntityId) -> Option<String> {

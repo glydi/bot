@@ -223,6 +223,34 @@ pub fn sample_quality(facing: f32, width_px: f32, sharpness: f32) -> f32 {
 /// still fine for *recognising* someone -- only for remembering them.
 pub const KEEP_SAMPLE: f32 = 0.55;
 
+/// Detector confidence under which a face is not used to remember
+/// anyone, however it scores otherwise: SCRFD at 0.5-0.6 is often a
+/// half-occluded face or a face-like patch.
+pub const KEEP_DET_SCORE: f32 = 0.65;
+
+/// Grey (BT.601-ish, integer) of an RGB buffer.
+pub fn grey(pix: &[u8]) -> Vec<u8> {
+    pix.chunks_exact(3)
+        .map(|p| ((u16::from(p[0]) * 77 + u16::from(p[1]) * 150 + u16::from(p[2]) * 29) >> 8) as u8)
+        .collect()
+}
+
+/// [`sample_quality`] straight from one detection and its aligned crop:
+/// pose from the five landmarks, size from the box, blur from the crop;
+/// 0 for a detector score under [`KEEP_DET_SCORE`]. For enrolment paths
+/// that have no track (photos, `--from-camera`).
+pub fn crop_quality(det: &crate::scrfd::Detection, crop: &crate::image::Rgb) -> f32 {
+    if det.score < KEEP_DET_SCORE {
+        return 0.0;
+    }
+    let facing = geometry(&det.landmarks).map_or(0.0, |g| facing_from_offset(g.yaw_offset));
+    sample_quality(
+        facing,
+        det.width(),
+        sharpness(&grey(&crop.pix), crop.w, crop.h),
+    )
+}
+
 /// Variance of the Laplacian of a grey crop: the usual blur measure.
 /// Higher is sharper.
 pub fn sharpness(grey: &[u8], width: usize, height: usize) -> f32 {

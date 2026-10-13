@@ -18,8 +18,8 @@ use sense_vision::scrfd::FaceDetector;
 use sense_vision::tracker::MAX_LIVE_TRACKS;
 use sense_vision::{
     Detection, Error, FaceAttention, InMemoryFaceGallery, MODALITY_FACE, MODALITY_FACE_ATTENTION,
-    MODALITY_FACE_EMBEDDING, MODALITY_FACING, MODALITY_LIP_MOTION, MockFrames, Parts, Rgb,
-    VisionConfig, VisionSense,
+    MODALITY_FACE_CROP, MODALITY_FACE_EMBEDDING, MODALITY_FACING, MODALITY_LIP_MOTION, MockFrames,
+    Parts, Rgb, VisionConfig, VisionSense,
 };
 
 /// Everything a live track emits per tick besides its `face_embedding`:
@@ -281,15 +281,16 @@ fn a_stranger_is_reported_as_a_track_with_a_direction_and_an_embedding() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 
     let obs = drain(&rx);
-    // Each frame: the four per-tick observations and one `face_embedding`
-    // (unknown person).
-    assert_eq!(obs.len(), 3 * (PER_TICK + 1), "{obs:#?}");
+    // Each frame: the four per-tick observations; and the stranger's one
+    // distinct good sample, offered once as a `face_embedding` and its
+    // `face_crop` (the mock embeds every frame the same).
+    assert_eq!(obs.len(), 3 * PER_TICK + 2, "{obs:#?}");
     let faces: Vec<&Observation> = obs.iter().filter(|o| o.modality == MODALITY_FACE).collect();
     let embs: Vec<&Observation> = obs
         .iter()
         .filter(|o| o.modality == MODALITY_FACE_EMBEDDING)
         .collect();
-    assert_eq!((faces.len(), embs.len()), (3, 3));
+    assert_eq!((faces.len(), embs.len()), (3, 1));
     for o in &faces {
         assert_eq!(o.source, "cam0");
         assert_eq!(o.entity, Some(EntityHint::Track(1)));
@@ -332,7 +333,7 @@ fn emission_is_rate_limited_per_track() {
         .unwrap_or_else(|e| panic!("spawn: {e}"));
     wait_finished(&handle);
     let obs = drain(&rx);
-    assert_eq!(obs.len(), PER_TICK + 1, "{obs:#?}"); // one tick + one embedding
+    assert_eq!(obs.len(), PER_TICK + 2, "{obs:#?}"); // one tick + one embedding and its crop
     // The attention modalities share the face's cadence exactly.
     for m in [
         MODALITY_FACE_ATTENTION,
@@ -506,7 +507,10 @@ fn a_frontal_talking_face_scores_facing_one_and_lips_high() {
     let obs = drain(&rx);
     let (facing, lips, opaque) = attention_of(&obs);
     assert_eq!((facing.len(), lips.len(), opaque.len()), (12, 12, 12));
-    for o in obs.iter().filter(|o| o.modality != MODALITY_FACE_EMBEDDING) {
+    for o in obs
+        .iter()
+        .filter(|o| o.modality != MODALITY_FACE_EMBEDDING && o.modality != MODALITY_FACE_CROP)
+    {
         assert_eq!(o.source, "cam0");
         assert_eq!(o.entity, Some(EntityHint::Track(1)));
         assert!((o.confidence - 0.9).abs() < 1e-6);

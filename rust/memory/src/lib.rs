@@ -27,6 +27,7 @@
 pub mod extract;
 pub mod gallery;
 pub mod graph;
+pub mod hygiene;
 pub mod social;
 pub mod store;
 pub mod worker;
@@ -36,14 +37,15 @@ use common::EntityId;
 pub use deliberate::tools::Reminder;
 pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, is_small_talk, parse};
 pub use gallery::FaceGallery;
+pub use hygiene::{Merged, canon_name, plausible_name};
 pub use social::{
     CHECK_IN_WORDS, OFTEN_WITH, OFTEN_WITH_MIN_OVERLAP, OFTEN_WITH_MIN_VISITS, event_in,
     relation_sentence,
 };
 pub use store::{
-    CONTEXT_MAX_CHARS, Episode, FACE_DIM, FACE_MARGIN, FACE_THRESHOLD, Fact, Gates, Modality,
-    Person, PersonSummary, RECALL_LIMIT, Store, VOICE_DIM, VOICE_MARGIN, VOICE_THRESHOLD,
-    ago_words,
+    CONTEXT_MAX_CHARS, Episode, FACE_DIM, FACE_MARGIN, FACE_MARGIN_R50, FACE_THRESHOLD,
+    FACE_THRESHOLD_R50, Fact, Gates, LEGACY_FACE_MODEL, Modality, Person, PersonSummary,
+    RECALL_LIMIT, Store, VOICE_DIM, VOICE_MARGIN, VOICE_THRESHOLD, ago_words,
 };
 pub use worker::{MemoryWorker, Stats, WorkerHandle};
 

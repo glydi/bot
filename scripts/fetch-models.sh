@@ -81,28 +81,35 @@ manifest | while IFS='|' read -r name dest url; do
     esac
 done
 
-# The face models ship as one zip from the InsightFace release, and
+# The face models ship as zips from the InsightFace release, and
 # insightface (and our Rust loader) expect them unpacked at
-# ~/.insightface/models/buffalo_s/.
-if [ "$want" = all ] || [ "$want" = faces ]; then
-    if [ -s "$insight/buffalo_s/w600k_mbf.onnx" ]; then
-        echo "have    $insight/buffalo_s/w600k_mbf.onnx"
-    else
-        mkdir -p "$insight"
-        echo "fetch   $insight/buffalo_s (zip)"
-        if curl -fL --retry 3 --progress-bar -o "$insight/buffalo_s.zip" \
-            https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip; then
-            unzip -oq "$insight/buffalo_s.zip" -d "$insight/buffalo_s"
-            # The zip has no top folder in some releases and one in
-            # others; flatten either shape.
-            if [ -d "$insight/buffalo_s/buffalo_s" ]; then
-                mv "$insight/buffalo_s/buffalo_s"/* "$insight/buffalo_s/"
-                rmdir "$insight/buffalo_s/buffalo_s"
-            fi
-        else
-            echo "FAILED  buffalo_s.zip" >&2
-        fi
+# ~/.insightface/models/<pack>/. buffalo_s (SCRFD-500M + MobileFaceNet,
+# 15 MB) is the Jetson's until its GPU runtime is built; buffalo_l
+# (SCRFD-10G + ArcFace ResNet50, 280 MB zip) is the default where it is
+# installed (docs/face-recognition.md has the comparison).
+fetch_pack() {
+    pack=$1 rec=$2
+    if [ -s "$insight/$pack/$rec" ]; then
+        echo "have    $insight/$pack/$rec"
+        return
     fi
+    mkdir -p "$insight"
+    echo "fetch   $insight/$pack (zip)"
+    if curl -fL --retry 3 --progress-bar -o "$insight/$pack.zip"         "https://github.com/deepinsight/insightface/releases/download/v0.7/$pack.zip"; then
+        unzip -oq "$insight/$pack.zip" -d "$insight/$pack"
+        # The zip has no top folder in some releases and one in
+        # others; flatten either shape.
+        if [ -d "$insight/$pack/$pack" ]; then
+            mv "$insight/$pack/$pack"/* "$insight/$pack/"
+            rmdir "$insight/$pack/$pack"
+        fi
+    else
+        echo "FAILED  $pack.zip" >&2
+    fi
+}
+if [ "$want" = all ] || [ "$want" = faces ]; then
+    fetch_pack buffalo_s w600k_mbf.onnx
+    fetch_pack buffalo_l w600k_r50.onnx
 fi
 
 # ECAPA has no published ONNX: it is exported from SpeechBrain once.

@@ -38,6 +38,19 @@ pub const DEFAULT_NMS_THRESHOLD: f32 = 0.4;
 pub const DEFAULT_INPUT_SIZE: usize = 320;
 /// The `buffalo_s` detector file.
 pub const MODEL_FILE: &str = "det_500m.onnx";
+/// Detectors in order of preference when a pack holds more than one:
+/// `buffalo_s` ships SCRFD-500M, `buffalo_m` 2.5G, `buffalo_l` 10G.
+pub const DETECTORS: &[&str] = &[MODEL_FILE, "det_2.5g.onnx", "det_10g.onnx"];
+
+/// The detector in `dir`: the first of [`DETECTORS`] present, else the
+/// `buffalo_s` name.
+pub fn detector_in(dir: &std::path::Path) -> std::path::PathBuf {
+    DETECTORS
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| dir.join(MODEL_FILE))
+}
 
 /// One detection, in *original* frame pixel coordinates.
 #[derive(Clone, Debug, PartialEq)]

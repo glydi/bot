@@ -20,6 +20,9 @@ pub const DEFAULT_MATCH_THRESHOLD: f32 = 0.36;
 /// name is worse than admitting you are unsure.
 pub const DEFAULT_MATCH_MARGIN: f32 = 0.06;
 
+/// Samples per person the in-memory gallery keeps (as the store's 16).
+pub const MAX_SAMPLES: usize = 16;
+
 /// Open-set face gallery.
 pub trait FaceGallery: Send + Sync {
     /// The person this embedding belongs to, with the similarity score, or
@@ -29,6 +32,14 @@ pub trait FaceGallery: Send + Sync {
     /// Python config enrols 6, spread across poses); matching takes the
     /// best score per person.
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), Error>;
+    /// Template update: a confidently matched, good sample of `id` from
+    /// the live camera, with its aligned crop when there is one. The
+    /// gallery decides whether it adds anything (a near-duplicate of a
+    /// sample it holds does not) and which sample it displaces when full.
+    /// `true` when it was kept. Default: never.
+    fn update(&self, _id: &EntityId, _emb: &[f32], _crop: Option<&[u8]>) -> bool {
+        false
+    }
     /// The person's name, for the preview label; `None` shows the id.
     fn name_of(&self, _id: &EntityId) -> Option<String> {
         None
@@ -110,6 +121,28 @@ impl FaceGallery for InMemoryFaceGallery {
         self.rows.write().entry(id.clone()).or_default().push(n);
         Ok(())
     }
+
+    fn update(&self, id: &EntityId, emb: &[f32], _crop: Option<&[u8]>) -> bool {
+        let Some(n) = normalize(emb) else {
+            return false;
+        };
+        let mut rows = self.rows.write();
+        let Some(samples) = rows.get_mut(id) else {
+            return false;
+        };
+        let dot = |a: &[f32]| a.iter().zip(&n).map(|(x, y)| x * y).sum::<f32>();
+        if samples
+            .iter()
+            .any(|s| dot(s) >= crate::tracker::KEEP_DISTINCT)
+        {
+            return false;
+        }
+        if samples.len() >= MAX_SAMPLES {
+            samples.remove(0);
+        }
+        samples.push(n);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +173,15 @@ mod tests {
         ambiguous[1] = 1.0;
         assert!(g.best_match(&ambiguous).is_none());
         assert!(g.best_match(&unit(5)).is_none());
+    }
+
+    #[test]
+    fn update_adds_distinct_samples_only() {
+        let g = InMemoryFaceGallery::default();
+        assert!(!g.update(&id("a"), &unit(0), None), "unknown person");
+        g.enrol(&id("a"), &unit(0)).ok();
+        assert!(!g.update(&id("a"), &unit(0), None), "duplicate");
+        assert!(g.update(&id("a"), &unit(1), None));
     }
 
     #[test]

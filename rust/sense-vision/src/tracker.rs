@@ -239,12 +239,37 @@ pub enum EmbedPriority {
     Background,
 }
 
+/// Spacing of template updates from one track.
+pub const TEMPLATE_UPDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How many distinct good samples a track keeps for enrolment.
+pub const KEPT_SAMPLES: usize = 6;
+/// Two samples at this cosine or above are the same view of the face.
+pub const KEEP_DISTINCT: f32 = 0.9;
+
+/// A sample worth remembering someone by (see [`Track::keep_sample`]).
+#[derive(Clone, Debug)]
+pub struct KeptSample {
+    /// Unit-length embedding.
+    pub emb: Arc<[f32]>,
+    /// `crate::attention::sample_quality`.
+    pub quality: f32,
+    /// The aligned 112x112 RGB crop it came from, so the gallery can
+    /// re-embed it under another recogniser.
+    pub crop: Option<Arc<[u8]>>,
+    /// Already offered.
+    pub sent: bool,
+}
+
 /// One face followed across frames.
 #[derive(Clone, Debug)]
 pub struct Track {
     /// The best-quality sample so far, and its score; see
     /// [`Track::push_embedding_scored`].
     best: Option<(Arc<[f32]>, f32)>,
+    /// Good, mutually different samples worth remembering the person by,
+    /// each offered for enrolment once; see [`Track::keep_sample`].
+    kept: Vec<KeptSample>,
     /// Stable id for the life of the track; never reused within a process.
     pub id: u32,
     /// Last matched detection box, frame coordinates.
@@ -275,6 +300,9 @@ pub struct Track {
     /// When this track last produced an observation; the pipeline uses it
     /// to rate-limit emission.
     pub last_emitted: Option<Instant>,
+    /// When this track last added a sample to a known person's gallery
+    /// (template update); one a [`TEMPLATE_UPDATE_EVERY`] at most.
+    pub last_template_update: Option<Instant>,
     /// Rolling facing / lip-motion windows, fed from the landmarks of every
     /// matched frame and cleared on a miss.
     pub attention: AttentionState,
@@ -323,11 +351,13 @@ impl Track {
             misses: 0,
             embeddings: VecDeque::with_capacity(EMBEDDING_HISTORY),
             best: None,
+            kept: Vec::new(),
             votes: VecDeque::with_capacity(VOTE_WINDOW),
             scores: HashMap::new(),
             person: None,
             confidence: 0.0,
             last_emitted: None,
+            last_template_update: None,
             attention: AttentionState::default(),
             frames_since_embed: 0,
             embeds: 0,
@@ -511,6 +541,81 @@ impl Track {
             self.embeddings.pop_front();
         }
         self.embeddings.push_back(emb);
+    }
+
+    /// Offer a sample for remembering the person by. Kept when it is good
+    /// ([`crate::attention::KEEP_SAMPLE`]) and *different*: a sample at
+    /// cosine [`KEEP_DISTINCT`] or more to one already kept only replaces
+    /// it when better. Up to [`KEPT_SAMPLES`]; when full, a new distinct
+    /// sample replaces the worst. The live gallery once held six copies of
+    /// one embedding for a person, because the same best frame was
+    /// offered every emit tick.
+    pub fn keep_sample(&mut self, emb: Arc<[f32]>, quality: f32, crop: Option<Arc<[u8]>>) {
+        if quality < crate::attention::KEEP_SAMPLE {
+            return;
+        }
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let nearest = self
+            .kept
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (i, dot(&k.emb, &emb)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        let new = KeptSample {
+            emb,
+            quality,
+            crop,
+            sent: false,
+        };
+        match nearest {
+            Some((i, c)) if c >= KEEP_DISTINCT => {
+                if quality > self.kept[i].quality + 0.05 {
+                    self.kept[i] = new;
+                }
+            }
+            _ if self.kept.len() < KEPT_SAMPLES => self.kept.push(new),
+            _ => {
+                if let Some((i, worst)) = self
+                    .kept
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| a.1.quality.total_cmp(&b.1.quality))
+                    && quality > worst.quality
+                {
+                    self.kept[i] = new;
+                }
+            }
+        }
+    }
+
+    /// The kept samples not yet offered for enrolment, marked offered.
+    pub fn take_unsent(&mut self) -> Vec<KeptSample> {
+        self.kept
+            .iter_mut()
+            .filter(|k| !k.sent)
+            .map(|k| {
+                k.sent = true;
+                k.clone()
+            })
+            .collect()
+    }
+
+    /// The mean of the last `k` embeddings, unit length: one frame is
+    /// noisy (blur, a blink, a half-turned head), the average of a few is
+    /// a steadier probe. `None` with fewer than two.
+    pub fn mean_embedding(&self, k: usize) -> Option<Vec<f32>> {
+        let n = self.embeddings.len().min(k);
+        if n < 2 {
+            return None;
+        }
+        let dim = self.embeddings.back()?.len();
+        let mut acc = vec![0.0f32; dim];
+        for e in self.embeddings.iter().rev().take(n) {
+            for (a, x) in acc.iter_mut().zip(e.iter()) {
+                *a += x;
+            }
+        }
+        crate::arcface::normalize(&acc)
     }
 
     /// The best sample this track has offered, and its quality.
@@ -743,6 +848,59 @@ impl Tracker {
     /// Whether nothing is tracked.
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod kept_tests {
+    use super::*;
+
+    fn unit(i: usize, j: usize, w: f32) -> Arc<[f32]> {
+        let mut v = vec![0.0f32; 8];
+        v[i] = 1.0;
+        v[j] += w;
+        Arc::from(crate::arcface::normalize(&v).unwrap_or_default())
+    }
+
+    fn track() -> Track {
+        let det = crate::scrfd::Detection {
+            bbox: [0.0, 0.0, 100.0, 100.0],
+            score: 0.9,
+            landmarks: [[0.0; 2]; 5],
+        };
+        let mut t = Tracker::new(0.3, 15);
+        let a = t.update(&[det]);
+        t.get(a[0].track).cloned().unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn keeps_distinct_good_samples_once() {
+        let mut t = track();
+        t.keep_sample(unit(0, 1, 0.0), 0.9, None);
+        // Same view again: not a new sample.
+        t.keep_sample(unit(0, 1, 0.01), 0.9, None);
+        // Poor: ignored.
+        t.keep_sample(unit(2, 3, 0.0), 0.1, None);
+        t.keep_sample(unit(4, 5, 0.0), 0.8, None);
+        let sent = t.take_unsent();
+        assert_eq!(sent.len(), 2);
+        assert!(t.take_unsent().is_empty(), "each offered once");
+        for i in 0..8 {
+            t.keep_sample(unit(i, (i + 1) % 8, 0.5), 0.6 + i as f32 * 0.01, None);
+        }
+        assert!(t.kept.len() <= KEPT_SAMPLES);
+    }
+
+    #[test]
+    fn mean_of_recent_embeddings() {
+        let mut t = track();
+        assert!(t.mean_embedding(5).is_none());
+        t.push_embedding(unit(0, 1, 0.0));
+        t.push_embedding(unit(1, 0, 0.0));
+        let m = t.mean_embedding(5).unwrap_or_default();
+        assert!(
+            (m[0] - m[1]).abs() < 1e-5 && (m[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3
+        );
     }
 }
 

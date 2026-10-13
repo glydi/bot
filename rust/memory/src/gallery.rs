@@ -24,6 +24,10 @@ pub trait FaceGallery: Send + Sync {
     /// Add an embedding for a person. Several per person are expected (the
     /// Python config enrols 6); matching takes the best score per person.
     fn enrol(&self, id: EntityId, emb: &[f32]) -> Result<(), Error>;
+    /// Template update (see [`Store::update_face`]); `true` when kept.
+    fn update(&self, _id: &EntityId, _emb: &[f32], _crop: Option<&[u8]>) -> bool {
+        false
+    }
 }
 
 impl Store {
@@ -49,6 +53,13 @@ impl FaceGallery for Store {
 
     fn enrol(&self, id: EntityId, emb: &[f32]) -> Result<(), Error> {
         self.enrol_for(&id, Modality::Face, emb)
+    }
+
+    fn update(&self, id: &EntityId, emb: &[f32], crop: Option<&[u8]>) -> bool {
+        self.update_face(id, emb, crop).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, %id, "face template update failed");
+            false
+        })
     }
 }
 
@@ -142,7 +153,7 @@ impl FactSource for Store {
     }
 
     fn resolve_name(&self, name: &str) -> Option<EntityId> {
-        self.find_by_name(name).ok().flatten().map(|p| p.id)
+        Store::resolve_name(self, name).ok().flatten()
     }
 
     fn everyone(&self) -> Vec<(EntityId, String)> {

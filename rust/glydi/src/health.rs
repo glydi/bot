@@ -60,6 +60,9 @@ pub struct Hosts {
     pub cloud: Option<String>,
     /// `host:port` of the school ERP, if one is configured.
     pub erp: Option<String>,
+    /// What was wrong with the gallery at start (`Store::open_or_recover`),
+    /// shown in the summary for as long as the run lasts.
+    pub gallery_problem: Option<String>,
 }
 
 impl Health {
@@ -111,7 +114,7 @@ impl Health {
 
     /// One line for the log and the panel.
     pub fn summary(&self) -> String {
-        format!(
+        let s = format!(
             "cloud {} · erp {} · memory {}% · {}",
             if self.online() { "up" } else { "down" },
             if self.erp_online() { "up" } else { "down" },
@@ -120,7 +123,16 @@ impl Health {
                 0 => "temp n/a".to_owned(),
                 t => format!("{t} °C"),
             }
-        )
+        );
+        match &self.hosts.gallery_problem {
+            Some(p) => format!("{s} · GALLERY: {p}"),
+            None => s,
+        }
+    }
+
+    /// The gallery problem found at start, if any.
+    pub fn gallery_problem(&self) -> Option<&str> {
+        self.hosts.gallery_problem.as_deref()
     }
 
     fn run(&self) {

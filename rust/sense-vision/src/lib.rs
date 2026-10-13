@@ -97,8 +97,9 @@ pub use crate::objects::{
     ObjectDetector, ObjectSeen, ObjectStats,
 };
 pub use crate::pipeline::{
-    MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_EMBEDDING, MODALITY_FACING,
-    MODALITY_LIP_MOTION, PREVIEW_ENGAGED_FACING, PREVIEW_EVERY, Parts, Stats, build_preview,
+    MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_CROP, MODALITY_FACE_EMBEDDING,
+    MODALITY_FACING, MODALITY_LIP_MOTION, PREVIEW_ENGAGED_FACING, PREVIEW_EVERY, Parts, Stats,
+    build_preview,
 };
 // The preview type is `common`'s (so the UI can draw it without this
 // crate's model dependencies); re-exported for readers of this crate.
@@ -262,6 +263,14 @@ pub struct VisionConfig {
     pub votes_to_confirm: usize,
     /// Embeddings pushed to the gallery per enrolment (6).
     pub enrol_samples: usize,
+    /// Template update: a frame matched to a known person at this cosine
+    /// or above (and past the gallery's margin) may add itself to their
+    /// samples, so the gallery follows haircuts, glasses and the robot's
+    /// own camera. The binary sets it to the match threshold + 0.15.
+    pub template_update_score: f32,
+    /// Temporal smoothing: when a single frame matches nobody, the mean
+    /// of the track's last this-many embeddings is tried (5).
+    pub smooth_frames: usize,
     /// Camera frame rate to request. 15 fps: the Python worker ran at 8 to
     /// keep a core free for audio, and on an M-series the whole per-frame
     /// path here is under 15 ms, so there is room to double it and still
@@ -329,6 +338,8 @@ impl Default for VisionConfig {
             track_max_age_frames: tracker::DEFAULT_MAX_AGE_FRAMES,
             votes_to_confirm: tracker::DEFAULT_VOTES_TO_CONFIRM,
             enrol_samples: 6,
+            template_update_score: 0.51,
+            smooth_frames: 5,
             capture_fps: 15,
             emit_interval: Duration::from_millis(100),
             horizontal_fov_deg: 60.0,
@@ -383,12 +394,17 @@ pub fn default_models_dir() -> PathBuf {
 impl VisionConfig {
     /// Path of the detector model.
     pub fn detector_path(&self) -> PathBuf {
-        self.models_dir.join(scrfd::MODEL_FILE)
+        scrfd::detector_in(&self.models_dir)
     }
 
     /// Path of the recogniser model.
     pub fn recogniser_path(&self) -> PathBuf {
-        self.models_dir.join(arcface::MODEL_FILE)
+        arcface::recogniser_in(&self.models_dir)
+    }
+
+    /// The tag face samples are stored under (see [`arcface::model_tag`]).
+    pub fn recogniser_tag(&self) -> String {
+        arcface::model_tag(&self.recogniser_path())
     }
 
     /// Whether both model files exist; tests skip when they do not.
@@ -485,7 +501,9 @@ impl VisionConfig {
 }
 
 #[cfg(target_os = "macos")]
-fn open_camera(
+/// Open camera `index` directly, outside a running sense (`glydi people
+/// --enrol NAME --from-camera N`).
+pub fn open_camera(
     index: usize,
     width: usize,
     height: usize,
@@ -495,7 +513,9 @@ fn open_camera(
 }
 
 #[cfg(target_os = "linux")]
-fn open_camera(
+/// Open camera `index` directly, outside a running sense (`glydi people
+/// --enrol NAME --from-camera N`).
+pub fn open_camera(
     index: usize,
     width: usize,
     height: usize,
@@ -507,7 +527,9 @@ fn open_camera(
 }
 
 #[cfg(windows)]
-fn open_camera(
+/// Open camera `index` directly, outside a running sense (`glydi people
+/// --enrol NAME --from-camera N`).
+pub fn open_camera(
     index: usize,
     width: usize,
     height: usize,
@@ -519,7 +541,9 @@ fn open_camera(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn open_camera(
+/// Open camera `index` directly, outside a running sense (`glydi people
+/// --enrol NAME --from-camera N`).
+pub fn open_camera(
     _index: usize,
     _width: usize,
     _height: usize,

@@ -35,8 +35,46 @@ pub const DEFAULT_LOCAL_MODEL: &str = "qwen2.5:3b";
 pub const DEFAULT_LOCAL_LLM_URL: &str = "http://127.0.0.1:11434/v1";
 /// whisper.cpp model name; resolved to `models/whisper/ggml-{name}.bin`.
 pub const DEFAULT_WHISPER_MODEL: &str = "tiny.en";
-/// insightface model pack, under `~/.insightface/models/`.
-pub const DEFAULT_FACE_MODEL: &str = "buffalo_s";
+/// insightface model pack, under `~/.insightface/models/`: `buffalo_l`
+/// (SCRFD-10G + `ArcFace` `ResNet50`), which separates people clearly
+/// better than `buffalo_s` on LFW (`docs/face-recognition.md`). Falls back
+/// to [`FALLBACK_FACE_MODEL`] when the pack is not installed. The Jetson
+/// pins `buffalo_s` in `env.jetson` until its GPU runtime is built.
+pub const DEFAULT_FACE_MODEL: &str = "buffalo_l";
+/// The small pack: SCRFD-500M + `MobileFaceNet`.
+pub const FALLBACK_FACE_MODEL: &str = "buffalo_s";
+
+/// Detector files in an insightface pack, in order of preference (same
+/// list as `sense_vision::scrfd::DETECTORS`, spelled here so this compiles
+/// without the vision feature).
+pub const FACE_DETECTORS: &[&str] = &["det_500m.onnx", "det_2.5g.onnx", "det_10g.onnx"];
+/// Recogniser files, in order of preference (`sense_vision::arcface::RECOGNISERS`).
+pub const FACE_RECOGNISERS: &[&str] = &["w600k_r50.onnx", "w600k_mbf.onnx"];
+
+/// `(detector, recogniser)` in the pack at `dir`: the first of each list
+/// present, else the `buffalo_s` names (so a missing file is reported).
+pub fn face_model_files(dir: &Path) -> (PathBuf, PathBuf) {
+    let first = |names: &[&str], fallback: &str| {
+        names
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| dir.join(fallback))
+    };
+    (
+        first(FACE_DETECTORS, "det_500m.onnx"),
+        first(FACE_RECOGNISERS, "w600k_mbf.onnx"),
+    )
+}
+
+/// The tag face samples are stored under for the pack at `dir`
+/// (`w600k_r50`, `w600k_mbf`): the recogniser's file stem.
+pub fn face_model_tag(dir: &Path) -> String {
+    face_model_files(dir).1.file_stem().map_or_else(
+        || memory::LEGACY_FACE_MODEL.to_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    )
+}
 /// ECAPA speaker-id ONNX, relative to the repository root.
 pub const DEFAULT_VOICE_MODEL: &str = "models/voiceid/ecapa.onnx";
 /// The gallery + episodic memory database, relative to the repository root.
@@ -218,9 +256,23 @@ impl Config {
         );
         let face_model = pick("GLYDI_FACE_MODEL", file.face_model, DEFAULT_FACE_MODEL);
         let insightface = pick_opt("GLYDI_INSIGHTFACE_DIR", file.insightface_dir).map_or_else(
-            || default_insightface_dir(&root).join(&face_model),
+            || {
+                let dir = default_insightface_dir(&root).join(&face_model);
+                // The default pack not downloaded yet: the small one.
+                if face_model == DEFAULT_FACE_MODEL && !face_model_files(&dir).1.is_file() {
+                    default_insightface_dir(&root).join(FALLBACK_FACE_MODEL)
+                } else {
+                    dir
+                }
+            },
             |d| abs(&root, &d),
         );
+        // Gates measured per recogniser (memory::FACE_THRESHOLD_R50).
+        let (face_t, face_m) = if face_model_tag(&insightface).contains("r50") {
+            (memory::FACE_THRESHOLD_R50, memory::FACE_MARGIN_R50)
+        } else {
+            (memory::FACE_THRESHOLD, memory::FACE_MARGIN)
+        };
         // `GLYDI_CHAT_MODEL` names the model that talks (chat lines and the
         // rephrase) when it should differ from `GLYDI_LOCAL_MODEL`; the
         // understander has its own `GLYDI_UNDERSTAND_MODEL`.
@@ -294,12 +346,8 @@ impl Config {
             mic_device: pick_opt("GLYDI_MIC_DEVICE", file.mic_device),
             camera_index,
             face_gates: (
-                pick_num(
-                    "GLYDI_FACE_THRESHOLD",
-                    file.face_threshold,
-                    memory::FACE_THRESHOLD,
-                ),
-                pick_num("GLYDI_FACE_MARGIN", file.face_margin, memory::FACE_MARGIN),
+                pick_num("GLYDI_FACE_THRESHOLD", file.face_threshold, face_t),
+                pick_num("GLYDI_FACE_MARGIN", file.face_margin, face_m),
             ),
             voice_gates: (
                 pick_num(
@@ -488,7 +536,12 @@ mod tests {
         assert!(c.whisper_model.ends_with("models/whisper/ggml-tiny.en.bin"));
         assert!(c.db.ends_with("data/glydi.db"));
         assert!(c.db.is_absolute());
-        assert!(c.face_models_dir.ends_with("buffalo_s"));
+        // buffalo_l when installed, else buffalo_s.
+        assert!(
+            c.face_models_dir.ends_with("buffalo_l") || c.face_models_dir.ends_with("buffalo_s"),
+            "{}",
+            c.face_models_dir.display()
+        );
         assert_eq!(c.tts, Tts::default());
         assert!(c.identity);
     }

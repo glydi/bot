@@ -49,7 +49,7 @@ pub struct Line {
 
 /// Every check, as a list; the CLI prints it.
 pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
-    let (det, rec) = sense_vision_model_names();
+    let (det, rec) = crate::config::face_model_files(&config.face_models_dir);
     vec![
         file("whisper model", &config.whisper_model, true),
         file(
@@ -64,8 +64,8 @@ pub fn run(config: &Config, tts: Option<Tts>) -> Vec<Line> {
             false,
         ),
         file("voice-id model", &config.voice_model, false),
-        file("face detector", &config.face_models_dir.join(det), false),
-        file("face recogniser", &config.face_models_dir.join(rec), false),
+        file("face detector", &det, false),
+        file("face recogniser", &rec, false),
         object_model(&config.models_dir.join("vision")),
         ort(&config.ort_lib),
         db(&config.db),
@@ -100,12 +100,6 @@ fn file(what: &'static str, path: &Path, required: bool) -> Line {
         required,
         detail: path.display().to_string(),
     }
-}
-
-/// The insightface pack's file names, without depending on `sense-vision`
-/// when the feature is off.
-fn sense_vision_model_names() -> (&'static str, &'static str) {
-    ("det_500m.onnx", "w600k_mbf.onnx")
 }
 
 /// The object detector, either export `sense_vision::objects::MODEL_FILES`

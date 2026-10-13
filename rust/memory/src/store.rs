@@ -32,6 +32,21 @@ pub const VOICE_DIM: usize = sense_audio::voiceid::EMBEDDING_DIM;
 pub const FACE_THRESHOLD: f32 = 0.36;
 /// Required gap to the runner-up for a face (`GLYDI_FACE_MARGIN`, 0.06).
 pub const FACE_MARGIN: f32 = 0.06;
+/// The face gates for `w600k_r50` (`buffalo_l`): measured on LFW, it puts
+/// different people lower (impostor p99 0.14 against 0.17) and the same
+/// person higher (genuine p05 0.50 against 0.41), so a lower floor and a
+/// wider margin (see `docs/face-recognition.md`).
+pub const FACE_THRESHOLD_R50: f32 = 0.30;
+/// See [`FACE_THRESHOLD_R50`].
+pub const FACE_MARGIN_R50: f32 = 0.08;
+/// The recogniser face samples were made with when nothing says otherwise:
+/// every sample before tagging was `buffalo_s`'s `MobileFaceNet`.
+pub const LEGACY_FACE_MODEL: &str = "w600k_mbf";
+/// A new sample this close (cosine) to one the person already has adds
+/// nothing and is not stored: a live gallery held six copies of one frame.
+pub const DUPLICATE_SAMPLE: f32 = 0.998;
+/// A template update this close to a held sample is the same view.
+pub const DISTINCT_SAMPLE: f32 = 0.9;
 /// Cosine floor for a voice match (`GLYDI_VOICE_THRESHOLD`, 0.55).
 pub const VOICE_THRESHOLD: f32 = sense_audio::voiceid::DEFAULT_MATCH_THRESHOLD;
 /// Required gap to the runner-up for a voice (`GLYDI_VOICE_MARGIN`, 0.08).
@@ -203,6 +218,19 @@ fn normalise(v: &[f32]) -> Result<Vec<f32>, Error> {
 }
 
 /// Little-endian `f32`, byte for byte what numpy `tobytes()` produced.
+/// A row of [`Store::face_model_report`]: `(id, name, re-embeddable,
+/// need re-enrolment, samples under the active recogniser)`.
+pub type FaceModelRow = (EntityId, String, usize, usize, usize);
+
+/// The recogniser [`Store::reembed_faces`] runs: aligned crop in,
+/// embedding out.
+pub type Reembed<'a> = dyn FnMut(&[u8]) -> Result<Vec<f32>, String> + 'a;
+
+/// Dot product; the cosine for unit vectors.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
 fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -284,6 +312,8 @@ pub const MAX_STASH_TRACKS: usize = 32;
 #[derive(Debug, Default)]
 struct Stash {
     face: VecDeque<Vec<f32>>,
+    /// The aligned crop of each `face` sample, when the sense sent one.
+    face_crops: VecDeque<Option<Vec<u8>>>,
     voice: VecDeque<Vec<f32>>,
     /// Sequence number of the last sample fed, for LRU eviction.
     touched: u64,
@@ -328,6 +358,9 @@ pub struct Store {
     voice: RwLock<Index>,
     names: RwLock<HashMap<EntityId, String>>,
     face_gates: Gates,
+    /// The recogniser whose samples the face index holds (see
+    /// [`Store::with_face_model`]).
+    face_model: String,
     voice_gates: Gates,
     stash: Mutex<Stashes>,
     /// Ids forgotten in this process. A person deleted mid-conversation
@@ -343,6 +376,21 @@ pub struct Store {
     /// When the last "no match" line went out, per modality (face,
     /// voice); see `Store::log_due`.
     last_miss_log: Mutex<(Option<std::time::Instant>, Option<std::time::Instant>)>,
+}
+
+/// Whether an open failure is "cannot write here" rather than "the file
+/// is broken": moving a readable-but-locked-down gallery aside would lose
+/// it for nothing.
+fn is_unwritable(e: &Error) -> bool {
+    use rusqlite::ErrorCode;
+    match e {
+        Error::Sqlite(rusqlite::Error::SqliteFailure(f, _)) => matches!(
+            f.code,
+            ErrorCode::ReadOnly | ErrorCode::CannotOpen | ErrorCode::PermissionDenied
+        ),
+        Error::Io(io) => io.kind() == std::io::ErrorKind::PermissionDenied,
+        _ => false,
+    }
 }
 
 /// How many samples of one modality to keep per person. Enough poses to
@@ -476,6 +524,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // When they were seen before this visit: the time sense ("haven't
     // seen you since Monday").
     ("persons", "prev_seen_at", "REAL"),
+    // Which recogniser made a face sample ('' = before tagging, which was
+    // always w600k_mbf), and its aligned 112x112 RGB crop so it can be
+    // re-embedded when the recogniser changes.
+    ("embeddings", "model", "TEXT NOT NULL DEFAULT ''"),
+    ("embeddings", "crop", "BLOB"),
 ];
 
 impl Store {
@@ -505,6 +558,90 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
+    /// [`Store::open`] for the running robot, which must start whatever
+    /// state the file is in. Returns the store and, when something was
+    /// wrong, one line saying what (for the log, the panel and health):
+    ///
+    /// - corrupt (not a database, truncated, a directory where the file
+    ///   should be): the file is moved aside to `<db>.corrupt-<unix secs>`
+    ///   (with its `-wal`/`-shm`; never deleted) and a fresh gallery is
+    ///   started in its place;
+    /// - unwritable (read-only file or directory) or the fresh start also
+    ///   failing: an in-memory gallery, so the bot runs and talks but
+    ///   remembers nothing past this run.
+    pub fn open_or_recover(path: impl AsRef<Path>) -> (Self, Option<String>) {
+        let path = path.as_ref();
+        let first = if path.is_dir() {
+            Err(Error::Invalid(
+                "a directory is where the file should be".into(),
+            ))
+        } else {
+            Self::open_checked(path)
+        };
+        let err = match first {
+            Ok(s) => return (s, None),
+            Err(e) => e,
+        };
+        tracing::error!(db = %path.display(), error = %err, "gallery will not open");
+        let in_memory = |why: String| {
+            tracing::error!(db = %path.display(), "{why}");
+            match Self::open_in_memory() {
+                Ok(s) => (s, Some(why)),
+                // An in-memory SQLite failing is out of memory; nothing
+                // sensible is left to do but say so.
+                Err(e) => panic!("in-memory gallery: {e}"),
+            }
+        };
+        if !path.is_dir() && is_unwritable(&err) {
+            return in_memory(format!(
+                "gallery {} is read-only ({err}); running on a memory-only gallery, nothing is saved",
+                path.display()
+            ));
+        }
+        let stamp = now_secs() as u64;
+        let aside = std::path::PathBuf::from(format!("{}.corrupt-{stamp}", path.display()));
+        if let Err(e) = std::fs::rename(path, &aside) {
+            return in_memory(format!(
+                "gallery {} is unusable ({err}) and could not be moved aside ({e}); running on a memory-only gallery",
+                path.display()
+            ));
+        }
+        for suf in ["-wal", "-shm"] {
+            let side = std::path::PathBuf::from(format!("{}{suf}", path.display()));
+            if side.exists() {
+                let _ = std::fs::rename(&side, format!("{}{suf}", aside.display()));
+            }
+        }
+        match Self::open_checked(path) {
+            Ok(s) => {
+                let why = format!(
+                    "gallery {} was unusable ({err}); moved to {} and started a fresh one",
+                    path.display(),
+                    aside.display()
+                );
+                tracing::error!("{why}");
+                (s, Some(why))
+            }
+            Err(e) => in_memory(format!(
+                "gallery {} unusable ({err}), fresh one failed too ({e}); running on a memory-only gallery",
+                path.display()
+            )),
+        }
+    }
+
+    /// [`Store::open`] plus a quick integrity check, so a truncated file
+    /// fails here rather than on the first write mid-conversation.
+    fn open_checked(path: &Path) -> Result<Self, Error> {
+        let s = Self::open(path)?;
+        let ok: String =
+            s.db.lock()
+                .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if ok != "ok" {
+            return Err(Error::Invalid(format!("integrity check: {ok}")));
+        }
+        Ok(s)
+    }
+
     fn from_connection(conn: Connection) -> Result<Self, Error> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
@@ -515,6 +652,7 @@ impl Store {
             voice: RwLock::new(Index::default()),
             names: RwLock::new(HashMap::new()),
             face_gates: Gates::FACE,
+            face_model: LEGACY_FACE_MODEL.to_owned(),
             voice_gates: Gates::VOICE,
             stash: Mutex::new(Stashes::default()),
             last_miss_log: Mutex::new((None, None)),
@@ -531,6 +669,25 @@ impl Store {
         self.face_gates = face;
         self.voice_gates = voice;
         self
+    }
+
+    /// Match and enrol faces under recogniser `tag` (`w600k_mbf`,
+    /// `w600k_r50`). Samples made by another recogniser stay in the db but
+    /// out of the index: both are 512-d, and comparing across them is
+    /// noise. `glydi people --reembed` brings samples with a stored crop
+    /// across; the rest need re-enrolment ([`Store::face_model_report`]).
+    #[must_use]
+    pub fn with_face_model(mut self, tag: &str) -> Self {
+        tag.clone_into(&mut self.face_model);
+        if let Err(e) = self.reload() {
+            tracing::warn!(error = %e, "face index not rebuilt for the recogniser");
+        }
+        self
+    }
+
+    /// The recogniser tag the face index is built for.
+    pub fn face_model(&self) -> &str {
+        &self.face_model
     }
 
     /// Set the local time zone's offset from UTC, in seconds, so that
@@ -582,13 +739,21 @@ impl Store {
             .collect::<Result<_, _>>()?;
         let load = |m: Modality| -> Result<Index, Error> {
             let rows = conn
-                .prepare("SELECT person_id, vec FROM embeddings WHERE modality = ? ORDER BY id")?
-                .query_map([m.as_str()], |r| {
-                    Ok((
-                        EntityId::new(r.get::<_, String>(0)?),
-                        from_blob(&r.get::<_, Vec<u8>>(1)?),
-                    ))
-                })?
+                .prepare(
+                    "SELECT person_id, vec FROM embeddings
+                      WHERE modality = ?1
+                        AND (?1 = 'voice' OR model = ?2 OR (model = '' AND ?2 = ?3))
+                   ORDER BY id",
+                )?
+                .query_map(
+                    params![m.as_str(), self.face_model, LEGACY_FACE_MODEL],
+                    |r| {
+                        Ok((
+                            EntityId::new(r.get::<_, String>(0)?),
+                            from_blob(&r.get::<_, Vec<u8>>(1)?),
+                        ))
+                    },
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Index::rebuild(rows))
         };
@@ -688,6 +853,25 @@ impl Store {
         m: Modality,
         embeddings: &[&[f32]],
     ) -> Result<EntityId, Error> {
+        self.enrol_with_crops(name, person_id, m, embeddings, &[])
+    }
+
+    /// [`Store::enrol`] keeping each face sample's aligned crop (`crops[i]`
+    /// for `embeddings[i]`; shorter or empty means no crop), so the sample
+    /// survives a change of recogniser.
+    ///
+    /// A sample nearly identical ([`DUPLICATE_SAMPLE`]) to one the person
+    /// has, or to an earlier one in the batch, is skipped. Past
+    /// [`MAX_SAMPLES`] the *least useful* go: the most redundant (highest
+    /// cosine to another of theirs), oldest first among equals.
+    pub fn enrol_with_crops(
+        &self,
+        name: &str,
+        person_id: Option<&EntityId>,
+        m: Modality,
+        embeddings: &[&[f32]],
+        crops: &[Option<&[u8]>],
+    ) -> Result<EntityId, Error> {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::Invalid("enrol requires a name".into()));
@@ -715,6 +899,10 @@ impl Store {
             },
         };
         let now = now_secs();
+        let tag = match m {
+            Modality::Face => self.face_model.as_str(),
+            Modality::Voice => "",
+        };
         {
             let mut conn = self.db.lock();
             let tx = conn.transaction()?;
@@ -725,35 +913,35 @@ impl Store {
                                                       last_seen_at = excluded.last_seen_at",
                 params![id.as_str(), name, now],
             )?;
-            for n in &prepared {
+            let mut held = Self::samples_of(&tx, &id, m, tag)?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect::<Vec<_>>();
+            for (i, n) in prepared.iter().enumerate() {
+                if held.iter().any(|h| dot(h, n) >= DUPLICATE_SAMPLE) {
+                    continue;
+                }
+                let crop = crops.get(i).copied().flatten();
                 tx.execute(
-                    "INSERT INTO embeddings (person_id, modality, dim, vec, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO embeddings (person_id, modality, dim, vec, created_at, model, crop)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         id.as_str(),
                         m.as_str(),
                         i64::try_from(n.len()).unwrap_or(i64::MAX),
                         to_blob(n),
-                        now
+                        now,
+                        tag,
+                        crop
                     ],
                 )?;
+                held.push(n.clone());
             }
-            // Keep the newest MAX_SAMPLES per person per modality. An
-            // unbounded gallery is slower to search and, worse, fills
-            // with whatever the camera happened to catch: the samples
-            // that made this bot's owner score 0.24 against himself were
-            // old ones taken mid-conversation. Newest wins because the
-            // sense now only offers samples it judged worth keeping
-            // (`sense_vision::attention::sample_quality`).
-            tx.execute(
-                "DELETE FROM embeddings
-                  WHERE person_id = ?1 AND modality = ?2 AND id NOT IN (
-                        SELECT id FROM embeddings
-                         WHERE person_id = ?1 AND modality = ?2
-                      ORDER BY created_at DESC, id DESC
-                         LIMIT ?3)",
-                params![id.as_str(), m.as_str(), MAX_SAMPLES],
-            )?;
+            // At most MAX_SAMPLES per person per modality (and recogniser).
+            // An unbounded gallery is slower to search and fills with
+            // whatever the camera caught; dropping the most redundant
+            // keeps the spread of poses that recognition needs.
+            Self::trim_samples(&tx, &id, m, tag)?;
             // A name mentioned earlier in a relation is now a person.
             tx.execute(
                 "UPDATE relations SET other_id = ?1
@@ -764,6 +952,145 @@ impl Store {
         }
         self.reload()?;
         Ok(id)
+    }
+
+    /// `(row id, unit vector)` of `id`'s samples of `m` under recogniser
+    /// `tag` (voice: all), oldest first.
+    fn samples_of(
+        conn: &Connection,
+        id: &EntityId,
+        m: Modality,
+        tag: &str,
+    ) -> Result<Vec<(i64, Vec<f32>)>, Error> {
+        Ok(conn
+            .prepare(
+                "SELECT id, vec FROM embeddings
+                  WHERE person_id = ?1 AND modality = ?2
+                    AND (?2 = 'voice' OR model = ?3 OR (model = '' AND ?3 = ?4))
+               ORDER BY created_at, id",
+            )?
+            .query_map(
+                params![id.as_str(), m.as_str(), tag, LEGACY_FACE_MODEL],
+                |r| Ok((r.get::<_, i64>(0)?, from_blob(&r.get::<_, Vec<u8>>(1)?))),
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Drop the least useful samples past [`MAX_SAMPLES`]: repeatedly the
+    /// one most similar to another (oldest first among equals), so what is
+    /// left is the widest spread of views.
+    fn trim_samples(conn: &Connection, id: &EntityId, m: Modality, tag: &str) -> Result<(), Error> {
+        let mut rows = Self::samples_of(conn, id, m, tag)?;
+        let cap = usize::try_from(MAX_SAMPLES).unwrap_or(16);
+        while rows.len() > cap {
+            let redundancy = |i: usize| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, (_, v))| dot(v, &rows[i].1))
+                    .fold(f32::MIN, f32::max)
+            };
+            let worst = (0..rows.len())
+                .max_by(|&a, &b| redundancy(a).total_cmp(&redundancy(b)).then(b.cmp(&a)))
+                .unwrap_or(0);
+            conn.execute("DELETE FROM embeddings WHERE id = ?", [rows[worst].0])?;
+            rows.remove(worst);
+        }
+        Ok(())
+    }
+
+    /// Template update from the live camera: add `emb` (with its crop) to
+    /// `id`'s face samples if it shows something they do not have yet
+    /// (under [`DISTINCT_SAMPLE`] to every held sample). Displaces the
+    /// least useful sample when full. `Ok(false)` when it added nothing.
+    pub fn update_face(
+        &self,
+        id: &EntityId,
+        emb: &[f32],
+        crop: Option<&[u8]>,
+    ) -> Result<bool, Error> {
+        if self.is_forgotten(id) {
+            return Ok(false);
+        }
+        let Some(name) = self.name_of(id) else {
+            return Ok(false);
+        };
+        let n = normalise(emb)?;
+        let held = Self::samples_of(&self.db.lock(), id, Modality::Face, &self.face_model)?;
+        if held.is_empty() || held.iter().any(|(_, h)| dot(h, &n) >= DISTINCT_SAMPLE) {
+            return Ok(false);
+        }
+        self.enrol_with_crops(&name, Some(id), Modality::Face, &[&n], &[crop])?;
+        Ok(true)
+    }
+
+    /// Per person with face samples from another recogniser than the
+    /// active one: `(id, name, re-embeddable (have a crop), without a crop
+    /// (need re-enrolment), samples under the active recogniser)`.
+    pub fn face_model_report(&self) -> Result<Vec<FaceModelRow>, Error> {
+        let conn = self.db.lock();
+        let rows = conn
+            .prepare(
+                "SELECT p.person_id, p.name,
+                        SUM(CASE WHEN NOT (e.model = ?1 OR (e.model = '' AND ?1 = ?2))
+                                  AND e.crop IS NOT NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN NOT (e.model = ?1 OR (e.model = '' AND ?1 = ?2))
+                                  AND e.crop IS NULL THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN (e.model = ?1 OR (e.model = '' AND ?1 = ?2))
+                                 THEN 1 ELSE 0 END)
+                   FROM embeddings e JOIN persons p USING (person_id)
+                  WHERE e.modality = 'face'
+               GROUP BY p.person_id ORDER BY p.name",
+            )?
+            .query_map(params![self.face_model, LEGACY_FACE_MODEL], |r| {
+                Ok((
+                    EntityId::new(r.get::<_, String>(0)?),
+                    r.get::<_, String>(1)?,
+                    count(r.get(2)?),
+                    count(r.get(3)?),
+                    count(r.get(4)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().filter(|r| r.2 + r.3 > 0).collect())
+    }
+
+    /// Bring face samples made by another recogniser across to the active
+    /// one: every such sample with a stored crop is embedded again by
+    /// `embed` and added (the old row stays, so switching back works).
+    /// Idempotent. Returns `(re-embedded, left without a crop)`.
+    pub fn reembed_faces(&self, embed: &mut Reembed<'_>) -> Result<(usize, usize), Error> {
+        let todo: Vec<(EntityId, Vec<u8>)> = self
+            .db
+            .lock()
+            .prepare(
+                "SELECT e.person_id, e.crop FROM embeddings e
+                  WHERE e.modality = 'face' AND e.crop IS NOT NULL
+                    AND NOT (e.model = ?1 OR (e.model = '' AND ?1 = ?2))
+                    AND NOT EXISTS (SELECT 1 FROM embeddings x
+                                     WHERE x.person_id = e.person_id AND x.modality = 'face'
+                                       AND x.model = ?1 AND x.crop = e.crop)
+               ORDER BY e.id",
+            )?
+            .query_map(params![self.face_model, LEGACY_FACE_MODEL], |r| {
+                Ok((EntityId::new(r.get::<_, String>(0)?), r.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut done = 0;
+        for (id, crop) in &todo {
+            let Some(name) = self.name_of(id) else {
+                continue;
+            };
+            match embed(crop) {
+                Ok(e) => {
+                    self.enrol_with_crops(&name, Some(id), Modality::Face, &[&e], &[Some(crop)])?;
+                    done += 1;
+                }
+                Err(e) => tracing::warn!(%id, error = %e, "re-embed failed"),
+            }
+        }
+        let left = self.face_model_report()?.iter().map(|r| r.3).sum::<usize>();
+        Ok((done, left))
     }
 
     /// A person with no biometrics at all: no camera, no usable face, or
@@ -860,19 +1187,11 @@ impl Store {
         }))
     }
 
-    /// The person with this name (case-insensitive, trimmed).
+    /// The person with this name (case and spacing aside); with several,
+    /// the one with face samples (see [`Store::resolve_name`]).
     pub fn find_by_name(&self, name: &str) -> Result<Option<Person>, Error> {
-        let id = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT person_id FROM persons WHERE lower(name) = lower(?)",
-                [name.trim()],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        match id {
-            Some(id) => self.get(&EntityId::new(id)),
+        match self.resolve_name(name)? {
+            Some(id) => self.get(&id),
             None => Ok(None),
         }
     }
@@ -1264,8 +1583,24 @@ impl Store {
         };
         if q.len() == cap {
             q.pop_front();
+            if m == Modality::Face {
+                s.face_crops.pop_front();
+            }
         }
         q.push_back(emb.to_vec());
+        if m == Modality::Face {
+            s.face_crops.push_back(None);
+        }
+    }
+
+    /// Attach the aligned crop to the newest face sample stashed for
+    /// `track` (the sense sends it right after the embedding).
+    pub fn stash_crop(&self, track: u32, crop: &[u8]) {
+        if let Some(s) = self.stash.lock().by_track.get_mut(&track)
+            && let Some(slot @ None) = s.face_crops.back_mut()
+        {
+            *slot = Some(crop.to_vec());
+        }
     }
 
     /// How many samples are stashed for `track`, as `(faces, voices)`.
@@ -1329,6 +1664,7 @@ impl Store {
             return self.enrol_name_only(name);
         };
         let faces: Vec<&[f32]> = s.face.iter().map(Vec::as_slice).collect();
+        let crops: Vec<Option<&[u8]>> = s.face_crops.iter().map(Option::as_deref).collect();
         let voices: Vec<&[f32]> = s.voice.iter().map(Vec::as_slice).collect();
         // Who the samples say this is, if anyone: the same gates the
         // senses use, so a match here is one the gallery would have made
@@ -1339,8 +1675,18 @@ impl Store {
             .chain(voices.iter().map(|e| (*e, Modality::Voice)))
             .find_map(|(e, m)| self.identify(e, m).ok().flatten())
             .map(|(id, _)| id);
-        let id = known.unwrap_or_else(|| self.new_id(name));
-        self.enrol(name, Some(&id), Modality::Face, &faces)?;
+        // Nobody by the biometrics: a name-only person already called
+        // this (met by name, never seen) takes the samples rather than a
+        // second row of the same name. One that has samples of their own
+        // that these did not match is someone else who shares the name.
+        let id = match known {
+            Some(id) => id,
+            None => match self.name_only_called(name)? {
+                Some(id) => id,
+                None => self.new_id(name),
+            },
+        };
+        self.enrol_with_crops(name, Some(&id), Modality::Face, &faces, &crops)?;
         if !voices.is_empty() {
             self.enrol(name, Some(&id), Modality::Voice, &voices)?;
         }

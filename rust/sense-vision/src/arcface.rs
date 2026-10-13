@@ -21,6 +21,46 @@ pub const INPUT_STD: f32 = 127.5;
 pub const EMBEDDING_DIM: usize = 512;
 /// The `buffalo_s` recogniser file.
 pub const MODEL_FILE: &str = "w600k_mbf.onnx";
+/// The `buffalo_l` / `buffalo_m` recogniser (`ArcFace` `ResNet50`, 166 MB).
+pub const MODEL_FILE_R50: &str = "w600k_r50.onnx";
+/// Recognisers in order of preference when a pack holds more than one.
+pub const RECOGNISERS: &[&str] = &[MODEL_FILE_R50, MODEL_FILE];
+
+/// The recogniser in `dir`: the first of [`RECOGNISERS`] present, else
+/// the `buffalo_s` name (so a missing model is reported by that name).
+pub fn recogniser_in(dir: &Path) -> PathBuf {
+    RECOGNISERS
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| dir.join(MODEL_FILE))
+}
+
+/// The tag a gallery keeps with each face sample: the recogniser's file
+/// stem (`w600k_mbf`, `w600k_r50`). Embeddings from different recognisers
+/// are both 512-d but not comparable; the tag keeps them apart.
+pub fn model_tag(path: &Path) -> String {
+    path.file_stem().map_or_else(
+        || "w600k_mbf".to_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    )
+}
+
+/// Open-set gates `(threshold, margin)` measured for each recogniser.
+///
+/// LFW, 6000 verification pairs, SCRFD 5-point alignment (2026-10-13,
+/// `docs/face-recognition.md`): `w600k_mbf` impostor p99 0.166, max 0.32,
+/// genuine p05 0.41, identification margin p10 0.26; `w600k_r50`
+/// impostor p99 0.14, max 0.24, genuine p05 0.50, margin p10 0.37. The
+/// thresholds sit above every impostor pair measured; r50 has room for a
+/// lower floor and a wider margin.
+pub fn gates_for(tag: &str) -> (f32, f32) {
+    if tag.contains("r50") {
+        (0.30, 0.08)
+    } else {
+        (0.36, 0.06)
+    }
+}
 
 /// Anything that turns an aligned crop into an embedding. The ONNX model
 /// implements it; tests use a fake.

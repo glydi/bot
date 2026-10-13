@@ -71,14 +71,35 @@ enum Cmd {
         /// goes: faces, voices, facts, episodes.
         #[arg(long = "forget", value_name = "NAME|ID")]
         forget: Vec<String>,
-        /// Enrol a person's face from photos: `--enrol Kalyan --image a.jpg
-        /// --image b.jpg`. The largest face in each photo is used; a photo
-        /// with no clear face is skipped and said so.
-        #[arg(long = "enrol", value_name = "NAME", requires = "image")]
+        /// Enrol a person's face: from photos (`--enrol Kalyan --image
+        /// a.jpg --image b.jpg`; the largest face in each) or from the
+        /// camera (`--enrol Kalyan --from-camera 8`: N good, different
+        /// frames; stop the robot first, it holds the camera). Each sample
+        /// keeps its aligned crop, so a change of recogniser can re-embed it.
+        #[arg(long = "enrol", value_name = "NAME")]
         enrol: Option<String>,
         /// Photo(s) for `--enrol`.
         #[arg(long = "image", value_name = "PATH")]
         image: Vec<PathBuf>,
+        /// Grab this many good frames from the camera for `--enrol`.
+        #[arg(long = "from-camera", value_name = "N")]
+        from_camera: Option<usize>,
+        /// Merge person B into person A (names or ids): faces, voices,
+        /// facts, relations, episodes all move to A; B goes. Backs up the
+        /// gallery first.
+        #[arg(long = "merge", num_args = 2, value_names = ["A", "B"])]
+        merge: Vec<String>,
+        /// List name-only people whose names are not names (mishearings
+        /// such as "Interested"); with `--yes`, remove them (after a backup).
+        #[arg(long = "prune-junk")]
+        prune_junk: bool,
+        /// Confirm `--prune-junk`.
+        #[arg(long = "yes")]
+        yes: bool,
+        /// Re-embed face samples made by another recogniser from their
+        /// stored crops (after switching `GLYDI_FACE_MODEL`).
+        #[arg(long = "reembed")]
+        reembed: bool,
     },
     /// The school ERP: check the sign-in, link an enrolled face to its
     /// record, ask about a day. Reads `GLYDI_ERP_URL`, `GLYDI_ERP_USER` and
@@ -181,7 +202,24 @@ fn main() -> anyhow::Result<()> {
             forget,
             enrol,
             image,
-        } => people(config.as_deref(), &forget, enrol.as_deref(), &image),
+            from_camera,
+            merge,
+            prune_junk,
+            yes,
+            reembed,
+        } => people(
+            config.as_deref(),
+            &PeopleArgs {
+                forget,
+                enrol,
+                image,
+                from_camera,
+                merge,
+                prune_junk,
+                yes,
+                reembed,
+            },
+        ),
         Cmd::School { what } => {
             let config = Config::load(None)?;
             school(&config, what)
@@ -672,24 +710,92 @@ mod gpu {
     }
 }
 
-/// `glydi people`: forget, enrol from photos, then list the gallery.
-fn people(
-    config: Option<&std::path::Path>,
-    forget: &[String],
-    enrol: Option<&str>,
-    image: &[PathBuf],
-) -> anyhow::Result<()> {
+/// What `glydi people` was asked to do.
+struct PeopleArgs {
+    forget: Vec<String>,
+    enrol: Option<String>,
+    image: Vec<PathBuf>,
+    from_camera: Option<usize>,
+    merge: Vec<String>,
+    prune_junk: bool,
+    yes: bool,
+    reembed: bool,
+}
+
+/// `glydi people`: merge, prune, forget, enrol, re-embed, then list.
+fn people(config: Option<&std::path::Path>, args: &PeopleArgs) -> anyhow::Result<()> {
     let config = Config::load(config)?;
-    let store = memory::Store::open(&config.db)?;
-    if let Some(name) = enrol {
-        enrol_from_photos(&config, &store, name, image)?;
+    let face_model = glydi::config::face_model_tag(&config.face_models_dir);
+    let store = memory::Store::open(&config.db)?.with_face_model(&face_model);
+    let mut backed_up = false;
+    let mut backup = |store: &memory::Store| -> anyhow::Result<()> {
+        if !backed_up {
+            let bak = store.backup_beside(&config.db)?;
+            println!("backed up the gallery to {}", bak.display());
+            backed_up = true;
+        }
+        Ok(())
+    };
+    if let [a, b] = args.merge.as_slice() {
+        let find = |who: &str| -> anyhow::Result<memory::PersonSummary> {
+            let all = store.people()?;
+            all.iter()
+                .find(|p| p.id.as_str() == who)
+                .cloned()
+                .or_else(|| {
+                    let id = store.resolve_name(who).ok().flatten()?;
+                    all.into_iter().find(|p| p.id == id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no one called {who}"))
+        };
+        let (keep, drop) = (find(a)?, find(b)?);
+        anyhow::ensure!(
+            keep.id != drop.id,
+            "{a} and {b} are the same person; give ids to merge two rows of one name"
+        );
+        backup(&store)?;
+        store.merge_people(&keep.id, &drop.id)?;
+        println!(
+            "merged {} ({}) into {} ({})",
+            drop.name, drop.id, keep.name, keep.id
+        );
     }
-    for who in forget {
+    if args.prune_junk {
+        let junk = store.junk_people()?;
+        if junk.is_empty() {
+            println!("no junk names");
+        }
+        if args.yes && !junk.is_empty() {
+            backup(&store)?;
+        }
+        for p in &junk {
+            if args.yes {
+                store.forget_person(&p.id)?;
+                println!("removed {:?} ({}), facts={}", p.name, p.id, p.facts);
+            } else {
+                println!(
+                    "junk? {:?} ({}), facts={}  (--yes to remove)",
+                    p.name, p.id, p.facts
+                );
+            }
+        }
+    }
+    for who in &args.forget {
         match store.forget_named(who) {
             Ok(true) => println!("forgot {who}"),
             Ok(false) => println!("no one called {who}"),
             Err(e) => println!("could not forget {who}: {e}"),
         }
+    }
+    if let Some(name) = &args.enrol {
+        anyhow::ensure!(
+            !args.image.is_empty() || args.from_camera.is_some(),
+            "--enrol needs --image PATH or --from-camera N"
+        );
+        enrol_face(&config, &store, name, &args.image, args.from_camera)?;
+    }
+    if args.reembed {
+        reembed(&config, &store)?;
     }
     let people = store.people()?;
     if people.is_empty() {
@@ -701,31 +807,81 @@ fn people(
             p.id, p.name, p.faces, p.voices, p.facts
         );
     }
+    for (id, name, crops, bare, active) in store.face_model_report()? {
+        println!(
+            "{name} ({id}): {active} sample(s) for {face_model}; {crops} re-embeddable (--reembed), \
+             {bare} need re-enrolment"
+        );
+    }
     Ok(())
 }
 
-/// Enrol `name` from photos: SCRFD finds the largest face in each, the
-/// five landmarks align it, `ArcFace` fingerprints it, and the gallery keeps
-/// the fingerprints under that name -- the same path a live enrolment
-/// takes, so the camera recognises the person from then on.
+/// The detector and recogniser of the configured pack, for the CLI.
 #[cfg(feature = "vision")]
-fn enrol_from_photos(
+struct FaceKit {
+    detector: sense_vision::scrfd::Scrfd,
+    embedder: sense_vision::arcface::ArcFace,
+}
+
+/// One face sample: unit embedding, aligned crop, quality, box width.
+#[cfg(feature = "vision")]
+struct FaceSample {
+    emb: Vec<f32>,
+    crop: Vec<u8>,
+    quality: f32,
+    width: f32,
+    score: f32,
+}
+
+#[cfg(feature = "vision")]
+impl FaceKit {
+    fn open(config: &Config) -> anyhow::Result<Self> {
+        let (det, rec) = glydi::config::face_model_files(&config.face_models_dir);
+        Ok(Self {
+            detector: sense_vision::scrfd::Scrfd::open(&det, &config.ort_lib, 640, 0.5, 0.4, 2)?,
+            embedder: sense_vision::arcface::ArcFace::open(&rec, &config.ort_lib, 2)?,
+        })
+    }
+
+    /// The largest face in `frame`, embedded.
+    fn largest(&mut self, frame: &sense_vision::image::Rgb) -> anyhow::Result<Option<FaceSample>> {
+        use sense_vision::arcface::FaceEmbedder;
+        use sense_vision::scrfd::FaceDetector;
+        let faces = self.detector.detect(frame)?;
+        let Some(face) = faces
+            .iter()
+            .max_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())))
+        else {
+            return Ok(None);
+        };
+        let crop = sense_vision::align::norm_crop(frame, &face.landmarks, 112);
+        let quality = sense_vision::attention::crop_quality(face, &crop);
+        let emb = sense_vision::arcface::normalize(&self.embedder.embed(&crop)?)
+            .ok_or_else(|| anyhow::anyhow!("zero embedding"))?;
+        Ok(Some(FaceSample {
+            emb,
+            crop: crop.pix,
+            quality,
+            width: face.width(),
+            score: face.score,
+        }))
+    }
+}
+
+/// Enrol `name` from photos and/or the camera: SCRFD finds the largest
+/// face, the five landmarks align it, `ArcFace` fingerprints it, and the
+/// gallery keeps fingerprint and crop under that name -- the same path a
+/// live enrolment takes, so the camera recognises the person from then on.
+#[cfg(feature = "vision")]
+fn enrol_face(
     config: &Config,
     store: &memory::Store,
     name: &str,
     images: &[PathBuf],
+    from_camera: Option<usize>,
 ) -> anyhow::Result<()> {
-    use sense_vision::arcface::FaceEmbedder;
-    use sense_vision::scrfd::FaceDetector;
-    let vc = sense_vision::VisionConfig {
-        models_dir: config.face_models_dir.clone(),
-        ort_lib: config.ort_lib.clone(),
-        ..sense_vision::VisionConfig::default()
-    };
-    let mut detector =
-        sense_vision::scrfd::Scrfd::open(&vc.detector_path(), &vc.ort_lib, 640, 0.5, 0.4, 2)?;
-    let mut embedder = sense_vision::arcface::ArcFace::open(&vc.recogniser_path(), &vc.ort_lib, 2)?;
-    let mut embeddings = Vec::new();
+    let mut kit = FaceKit::open(config)?;
+    let mut samples: Vec<FaceSample> = Vec::new();
     for path in images {
         let img = image::open(path)
             .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?
@@ -735,41 +891,117 @@ fn enrol_from_photos(
             h: img.height() as usize,
             pix: img.into_raw(),
         };
-        let faces = detector.detect(&frame)?;
-        let Some(face) = faces
-            .iter()
-            .max_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())))
-        else {
-            println!("{}: no face found, skipped", path.display());
+        match kit.largest(&frame)? {
+            None => println!("{}: no face found, skipped", path.display()),
+            Some(s) => {
+                // A photo is taken on purpose: kept even when poor, but
+                // said so (a single poor photo is what made one person
+                // indistinguishable from another in the live gallery).
+                println!(
+                    "{}: face {:.0} px, score {:.2}, quality {:.2}{}",
+                    path.display(),
+                    s.width,
+                    s.score,
+                    s.quality,
+                    if s.quality < sense_vision::attention::KEEP_SAMPLE {
+                        "  (poor: add more photos or --from-camera)"
+                    } else {
+                        ""
+                    }
+                );
+                samples.push(s);
+            }
+        }
+    }
+    if let Some(want) = from_camera {
+        samples.extend(camera_samples(config, &mut kit, want)?);
+    }
+    anyhow::ensure!(!samples.is_empty(), "no usable face; nothing enrolled");
+    let embs: Vec<&[f32]> = samples.iter().map(|s| s.emb.as_slice()).collect();
+    let crops: Vec<Option<&[u8]>> = samples.iter().map(|s| Some(s.crop.as_slice())).collect();
+    let id = store.enrol_with_crops(name, None, memory::Modality::Face, &embs, &crops)?;
+    println!("enrolled {name} as {id} with {} face sample(s)", embs.len());
+    Ok(())
+}
+
+/// Up to `want` good (quality over `KEEP_SAMPLE`) and mutually different
+/// (cosine under 0.95) frames of the largest face, within a minute.
+#[cfg(feature = "vision")]
+fn camera_samples(
+    config: &Config,
+    kit: &mut FaceKit,
+    want: usize,
+) -> anyhow::Result<Vec<FaceSample>> {
+    let mut cam = sense_vision::open_camera(config.camera_index, 1280, 720, 15).map_err(|e| {
+        anyhow::anyhow!(
+            "camera {}: {e} (is the robot running? it holds the camera)",
+            config.camera_index
+        )
+    })?;
+    println!("look at the camera; turn your head a little between frames");
+    let started = std::time::Instant::now();
+    let mut got: Vec<FaceSample> = Vec::new();
+    while got.len() < want && started.elapsed() < std::time::Duration::from_secs(60) {
+        let Some(frame) = cam.next_frame(std::time::Duration::from_millis(500))? else {
             continue;
         };
-        let crop = sense_vision::align::norm_crop(&frame, &face.landmarks, 112);
-        embeddings.push(embedder.embed(&crop)?);
+        let Some(s) = kit.largest(&frame.image)? else {
+            continue;
+        };
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        if s.quality < sense_vision::attention::KEEP_SAMPLE
+            || got.iter().any(|g| dot(&g.emb, &s.emb) >= 0.95)
+        {
+            continue;
+        }
         println!(
-            "{}: face {:.0}x{:.0} px, score {:.2}",
-            path.display(),
-            face.width(),
-            face.height(),
-            face.score
+            "frame {}: face {:.0} px, score {:.2}, quality {:.2}",
+            got.len() + 1,
+            s.width,
+            s.score,
+            s.quality
         );
+        got.push(s);
     }
-    anyhow::ensure!(
-        !embeddings.is_empty(),
-        "no usable face in the photos; nothing enrolled"
+    if got.len() < want {
+        println!("only {} good frame(s) in a minute", got.len());
+    }
+    Ok(got)
+}
+
+/// `--reembed`: samples from another recogniser, through this one.
+#[cfg(feature = "vision")]
+fn reembed(config: &Config, store: &memory::Store) -> anyhow::Result<()> {
+    use sense_vision::arcface::FaceEmbedder;
+    let mut kit = FaceKit::open(config)?;
+    let (done, left) = store.reembed_faces(&mut |crop: &[u8]| {
+        let rgb = sense_vision::image::Rgb {
+            w: 112,
+            h: 112,
+            pix: crop.to_vec(),
+        };
+        kit.embedder.embed(&rgb).map_err(|e| e.to_string())
+    })?;
+    println!(
+        "re-embedded {done} sample(s) for {}; {left} without a crop need re-enrolment",
+        store.face_model()
     );
-    let refs: Vec<&[f32]> = embeddings.iter().map(Vec::as_slice).collect();
-    let id = store.enrol(name, None, memory::Modality::Face, &refs)?;
-    println!("enrolled {name} as {id} with {} face sample(s)", refs.len());
     Ok(())
 }
 
 #[cfg(not(feature = "vision"))]
-fn enrol_from_photos(
+fn enrol_face(
     _config: &Config,
     _store: &memory::Store,
     _name: &str,
     _images: &[PathBuf],
+    _from_camera: Option<usize>,
 ) -> anyhow::Result<()> {
+    anyhow::bail!("this build has no vision; rebuild with --features vision")
+}
+
+#[cfg(not(feature = "vision"))]
+fn reembed(_config: &Config, _store: &memory::Store) -> anyhow::Result<()> {
     anyhow::bail!("this build has no vision; rebuild with --features vision")
 }
 

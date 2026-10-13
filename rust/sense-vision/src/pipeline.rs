@@ -31,6 +31,9 @@ use crate::{Error, VisionConfig};
 pub const MODALITY_FACE: &str = "face";
 /// Modality of a stranger's embedding, offered for enrolment.
 pub const MODALITY_FACE_EMBEDDING: &str = "face_embedding";
+/// The aligned 112x112 RGB crop (`Payload::Opaque(Arc<Vec<u8>>)`) of the
+/// `face_embedding` sent just before it on the same track.
+pub const MODALITY_FACE_CROP: &str = "face_crop";
 /// Modality carrying both attention scores at once as
 /// `Payload::Opaque(Arc<FaceAttention>)`, for a consumer that knows this
 /// crate (the UI's debug panel).
@@ -570,7 +573,7 @@ fn enrol(
     Ok(embs.len())
 }
 
-#[allow(clippy::too_many_arguments)] // the loop's whole state, one call site
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the loop's whole state, one call site
 fn process_frame(
     cfg: &VisionConfig,
     clock: &dyn Clock,
@@ -655,28 +658,53 @@ fn process_frame(
             continue;
         };
         let unit: Arc<[f32]> = Arc::from(unit);
-        let matched = gallery.best_match(&unit);
+        let single = gallery.best_match(&unit);
         // How good this sighting is to *remember* someone by: straight
-        // on, close, sharp. Recognition uses every sample; enrolment
-        // should use the good ones (see `attention::sample_quality`).
-        let grey: Vec<u8> = crop
-            .pix
-            .chunks_exact(3)
-            .map(|p| {
-                ((u16::from(p[0]) * 29 + u16::from(p[1]) * 150 + u16::from(p[2]) * 77) >> 8) as u8
-            })
-            .collect();
-        let quality = crate::attention::sample_quality(
-            tracker
-                .get(a.track)
-                .map_or(0.0, |t| t.attention.scores().facing),
-            det.width(),
-            crate::attention::sharpness(&grey, crop.w, crop.h),
-        );
+        // on, close, sharp, and a confident detection. Recognition uses
+        // every sample; enrolment and template updates only good ones
+        // (see `attention::sample_quality`).
+        let quality = if det.score < crate::attention::KEEP_DET_SCORE {
+            0.0
+        } else {
+            crate::attention::sample_quality(
+                tracker
+                    .get(a.track)
+                    .map_or(0.0, |t| t.attention.scores().facing),
+                det.width(),
+                crate::attention::sharpness(&crate::attention::grey(&crop.pix), crop.w, crop.h),
+            )
+        };
         if let Some(t) = tracker.get_mut(a.track) {
-            t.push_embedding_scored(unit, quality);
+            t.push_embedding_scored(Arc::clone(&unit), quality);
+            // Temporal smoothing: one frame that matches nobody (a blink,
+            // motion blur, a half turn) is retried as the mean of the
+            // track's last few, a steadier probe; the vote window then
+            // decides over the track, not the frame.
+            let matched = single.clone().or_else(|| {
+                t.mean_embedding(cfg.smooth_frames)
+                    .and_then(|m| gallery.best_match(&m))
+            });
             t.vote(matched, cfg.votes_to_confirm);
             t.note_embedded();
+            let crop_bytes: Arc<[u8]> = Arc::from(crop.pix.as_slice());
+            if t.person.is_none() {
+                t.keep_sample(Arc::clone(&unit), quality, Some(crop_bytes));
+            } else if let (Some((id, score)), Some(person)) = (&single, &t.person)
+                && id == person
+                && *score >= cfg.template_update_score
+                && quality >= crate::attention::KEEP_SAMPLE
+                && t.last_template_update.is_none_or(|at| {
+                    clock.now().saturating_duration_since(at)
+                        >= crate::tracker::TEMPLATE_UPDATE_EVERY
+                })
+            {
+                // Template update: a single frame, not the smoothed
+                // probe, and only for the name the track already holds.
+                t.last_template_update = Some(clock.now());
+                if gallery.update(id, &unit, Some(&crop_bytes)) {
+                    info!(track = a.track, entity = %id, score, quality, "face template updated");
+                }
+            }
         }
     }
 
@@ -774,16 +802,25 @@ fn emit(
         // recognise someone by later: the gallery this replaced held
         // twelve mid-conversation samples of its owner that scored 0.24
         // against his live face, under the 0.32 gate.
-        if t.person.is_none()
-            && let Some((emb, quality)) = t.best_embedding()
-            && quality >= crate::attention::KEEP_SAMPLE
-        {
-            let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE_EMBEDDING, now)
-                .with_confidence(quality)
-                .with_entity(EntityHint::Track(t.id))
-                .with_payload(Payload::Embedding(emb));
-            bump(&stats.evicted, tx.send(obs) as u64);
-            bump(&stats.observations, 1);
+        // Samples offered for enrolment: the track's good, mutually
+        // different ones, each once, each followed by its aligned crop
+        // (so the gallery can re-embed it under another recogniser).
+        if t.person.is_none() {
+            for k in t.take_unsent() {
+                let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE_EMBEDDING, now)
+                    .with_confidence(k.quality)
+                    .with_entity(EntityHint::Track(t.id))
+                    .with_payload(Payload::Embedding(k.emb));
+                bump(&stats.evicted, tx.send(obs) as u64);
+                bump(&stats.observations, 1);
+                if let Some(crop) = k.crop {
+                    let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE_CROP, now)
+                        .with_entity(EntityHint::Track(t.id))
+                        .with_payload(Payload::Opaque(Arc::new(crop.to_vec())));
+                    bump(&stats.evicted, tx.send(obs) as u64);
+                    bump(&stats.observations, 1);
+                }
+            }
         }
     }
     if cfg.single_focus {
