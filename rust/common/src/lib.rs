@@ -15,6 +15,7 @@
 pub mod channel;
 pub mod clock;
 pub mod focus;
+pub mod partial;
 pub mod preview;
 pub mod recorded;
 pub mod router;
@@ -25,6 +26,7 @@ pub mod types;
 pub use channel::{CommandQueue, ObservationRing, RingReceiver, RingSender};
 pub use clock::{Clock, FakeClock, RealClock};
 pub use focus::{is_placeholder, single_focus, spoken_safe};
+pub use partial::{MODALITY_PARTIAL_TRANSCRIPT, PartialTranscript};
 pub use preview::{MODALITY_CAMERA_PREVIEW, PREVIEW_MAX_WIDTH, Preview, PreviewFace};
 pub use recorded::{Recorded, RecordedHint, RecordedPayload};
 pub use router::{CommandRouter, RouterHandle};

@@ -2123,6 +2123,14 @@ fn apply_crowd(cfg: &mut AudioConfig, speaking: Option<Arc<common::SpeakingBoard
     {
         cfg.turn_early_prob = p.clamp(0.5, 0.99);
     }
+    // Streaming transcription while the person talks (`partial_transcript`
+    // every N ms of new speech, for speculative thinking); 0 turns it off.
+    if let Some(ms) = std::env::var("GLYDI_PARTIAL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        cfg.partial_every_ms = ms;
+    }
 }
 
 #[cfg(test)]

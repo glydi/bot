@@ -41,6 +41,7 @@ pub mod prompt;
 pub mod school_link;
 pub mod scope;
 pub mod sentence;
+pub mod speculate;
 pub mod templates;
 pub mod tools;
 pub mod understand;

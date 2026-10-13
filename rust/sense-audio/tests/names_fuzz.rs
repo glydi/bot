@@ -130,12 +130,20 @@ fn empty_gallery_is_identity() {
 }
 
 /// The module's own contract says a common English word is never snapped;
-/// in a name context it is ("honey" -> "Sony", "roman" -> "Rohan").
+/// it once was in a name context ("honey" -> "Sony", "roman" -> "Rohan").
 #[test]
-#[ignore = "product bug: fix_names snaps common words after 'name is' (honey->Sony, roman->Rohan)"]
 fn common_words_after_name_is_are_kept() {
     let names = gallery();
-    for s in ["name is honey my", "my name is roman"] {
+    for s in [
+        "name is honey my",
+        "my name is roman",
+        "my name is money",
+        "i am funny",
+        "this is my woman",
+        "call me lucky",
+        "its sunny",
+        "name is penny",
+    ] {
         assert_eq!(fix_names(s, &names, false), s);
     }
 }

@@ -158,6 +158,19 @@ pub struct Stats {
     pub audio_events: AtomicU64,
     /// `partial_utterance` observations emitted.
     pub partials: AtomicU64,
+    /// `partial_transcript` observations emitted (mid-speech and at
+    /// pauses).
+    pub partial_transcripts: AtomicU64,
+    /// Mid-speech partial jobs the recogniser ran.
+    pub growing_runs: AtomicU64,
+    /// Mid-speech partial jobs replaced in the slot before the worker
+    /// got to them (the one-queued cap at work).
+    pub growing_replaced: AtomicU64,
+    /// Total microseconds the recogniser spent on mid-speech partials:
+    /// the GPU/CPU cost of streaming transcription.
+    pub growing_us_total: AtomicU64,
+    /// Microseconds of the last mid-speech partial.
+    pub growing_us_last: AtomicU64,
 }
 
 /// One finished utterance, on its way to the worker.
@@ -182,6 +195,10 @@ pub(crate) struct Speculation {
     /// Everything said so far (held speech from a deferral included) up to
     /// the last voiced frame.
     pub samples: Vec<f32>,
+    /// A mid-speech partial on the growing buffer, not a pause: the worker
+    /// transcribes it (no speaker id), publishes a `partial_transcript`
+    /// and keeps nothing for the commit.
+    pub growing: bool,
 }
 
 /// The one-slot mailbox for speculations. A slot rather than a channel so a
@@ -392,6 +409,10 @@ pub(crate) struct Pipeline {
     pub spec_wake: Sender<()>,
     /// See [`PartialShared`].
     pub partial: PartialSlot,
+    /// Mid-speech partial transcripts: new voiced samples between two
+    /// runs of the recogniser on the growing buffer; 0 = off (only the
+    /// pause speculations transcribe ahead of the turn end).
+    pub partial_every_samples: usize,
     /// Sound-class awareness (`audio_event`), `None` when disabled.
     pub events: Option<EventDetector>,
     pub source_name: SmolStr,
@@ -455,6 +476,8 @@ impl Pipeline {
         let mut voiced_len = 0usize;
         let mut live_spec: Option<u64> = None;
         let mut next_spec_id = 0u64;
+        // `utterance.len()` when the last mid-speech partial was sent.
+        let mut grown_at = 0usize;
         // When the turn's speech began (the first start since the last
         // emitted turn), for the lip gate's window.
         let mut turn_started_at: Option<Instant> = None;
@@ -615,6 +638,15 @@ impl Pipeline {
                         self.spec_slot.lock().take();
                         tracing::debug!("speech resumed; speculation discarded");
                     }
+                    // Streaming transcription: every `partial_every_samples`
+                    // of new speech the worker gets the growing buffer.
+                    if self.partial_every_samples > 0
+                        && voiced_len >= grown_at + self.partial_every_samples
+                    {
+                        grown_at = voiced_len;
+                        next_spec_id += 1;
+                        self.grow(next_spec_id, &utterance[..voiced_len]);
+                    }
                 } else if quiet == self.speculate_after_frames && live_spec.is_none() {
                     next_spec_id += 1;
                     live_spec = self.speculate(next_spec_id, &utterance[..voiced_len]);
@@ -651,6 +683,7 @@ impl Pipeline {
                 // Too short to count (a cough): the VAD reset itself.
                 speaking = false;
                 utterance.clear();
+                grown_at = 0;
                 if self.gate.held().is_empty() {
                     turn_started_at = None;
                 }
@@ -705,6 +738,7 @@ impl Pipeline {
                 &mut utterance,
                 Vec::with_capacity(self.max_utterance_samples),
             );
+            grown_at = 0;
             if heard.is_empty() {
                 continue;
             }
@@ -787,11 +821,41 @@ impl Pipeline {
         samples.extend_from_slice(held);
         samples.extend_from_slice(voiced);
         tracing::debug!(id, secs = samples.len() as f32 / 16_000.0, "speculating");
-        *self.spec_slot.lock() = Some(Speculation { id, samples });
+        *self.spec_slot.lock() = Some(Speculation {
+            id,
+            samples,
+            growing: false,
+        });
         // `Full` means a wake is already pending, and the worker will see
         // the newer slot contents when it gets there.
         let _ = self.spec_wake.try_send(());
         Some(id)
+    }
+
+    /// A mid-speech partial: the growing buffer (held speech included) in
+    /// the worker's slot. Never displaces a pause speculation, and a newer
+    /// one replaces an older the worker has not picked up, so at most one
+    /// partial job is queued behind the one running.
+    fn grow(&self, id: u64, voiced: &[f32]) {
+        let held = self.gate.held();
+        let mut slot = self.spec_slot.lock();
+        match slot.as_ref() {
+            Some(s) if !s.growing => return,
+            Some(_) => {
+                self.stats.growing_replaced.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+        let mut samples = Vec::with_capacity(held.len() + voiced.len());
+        samples.extend_from_slice(held);
+        samples.extend_from_slice(voiced);
+        *slot = Some(Speculation {
+            id,
+            samples,
+            growing: true,
+        });
+        drop(slot);
+        let _ = self.spec_wake.try_send(());
     }
 
     /// The VAD ended a turn: judge it, emit `turn_ended`, and hand a
@@ -846,6 +910,14 @@ impl Pipeline {
             }
             Verdict::Emit { samples, judged } => {
                 self.partial.lock().deferred = false;
+                // A mid-speech partial still queued describes this turn,
+                // which is over: it must not come out after the utterance.
+                {
+                    let mut slot = self.spec_slot.lock();
+                    if slot.as_ref().is_some_and(|s| s.growing) {
+                        slot.take();
+                    }
+                }
                 if let Some((complete, prob)) = judged {
                     self.emit(
                         self.obs("turn_ended")
@@ -930,6 +1002,9 @@ pub(crate) struct Worker {
     pub clock: Arc<dyn Clock>,
     pub tx: RingSender,
     pub stats: Arc<Stats>,
+    /// The turn's partial transcripts so far: the last text (for the
+    /// stable prefix) and the sequence number. Reset at each commit.
+    pub turn_partial: (Option<String>, u64),
 }
 
 impl Worker {
@@ -977,6 +1052,10 @@ impl Worker {
                     let Some(spec) = self.spec_slot.lock().take() else {
                         continue;
                     };
+                    if spec.growing {
+                        self.run_growing(&spec, last_match.as_ref());
+                        continue;
+                    }
                     let analysis = self.analyse(&spec.samples);
                     self.stats.speculations.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
@@ -986,6 +1065,15 @@ impl Worker {
                         "speculation ready"
                     );
                     self.offer_partial(spec.id, &analysis, last_match.as_ref());
+                    if let Some(t) = analysis.text.as_deref() {
+                        let who = analysis
+                            .voice
+                            .as_ref()
+                            .and_then(|v| v.hit.as_ref())
+                            .or(last_match.as_ref())
+                            .map(|(id, _)| id.clone());
+                        self.publish_partial(t, true, who);
+                    }
                     if cached.replace((spec, analysis)).is_some() {
                         self.stats.speculations_wasted.fetch_add(1, Ordering::Relaxed);
                     }
@@ -993,6 +1081,68 @@ impl Worker {
             }
         }
         tracing::info!("utterance worker stopped");
+    }
+
+    /// A mid-speech partial: the recogniser alone (speaker id waits for
+    /// the pause), then a `partial_transcript`.
+    fn run_growing(&mut self, spec: &Speculation, last_match: Option<&(EntityId, f32)>) {
+        let Some(stt) = self.stt.as_mut() else {
+            return;
+        };
+        let t0 = Instant::now();
+        let text = stt.transcribe(&spec.samples);
+        let took = t0.elapsed();
+        let us = took.as_micros() as u64;
+        self.stats.growing_runs.fetch_add(1, Ordering::Relaxed);
+        self.stats.growing_us_total.fetch_add(us, Ordering::Relaxed);
+        self.stats.growing_us_last.store(us, Ordering::Relaxed);
+        match text {
+            Ok(t) => {
+                tracing::debug!(
+                    id = spec.id,
+                    secs = spec.samples.len() as f32 / 16_000.0,
+                    ms = took.as_millis() as u64,
+                    text = %t,
+                    "partial transcript"
+                );
+                self.publish_partial(&t, false, last_match.map(|(id, _)| id.clone()));
+            }
+            Err(e) => tracing::debug!(error = %e, "partial transcription failed"),
+        }
+    }
+
+    /// Send one `partial_transcript`, its stable prefix agreed against the
+    /// turn's previous one. Blank text is not sent.
+    fn publish_partial(&mut self, text: &str, at_pause: bool, who: Option<EntityId>) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let (prev, seq) = &mut self.turn_partial;
+        let stable_words = prev
+            .as_deref()
+            .map_or(0, |p| common::partial::agreed_prefix(p, text));
+        *seq += 1;
+        let p = common::PartialTranscript {
+            text: text.to_owned(),
+            stable_words,
+            seq: *seq,
+            at_pause,
+        };
+        *prev = Some(text.to_owned());
+        self.stats
+            .partial_transcripts
+            .fetch_add(1, Ordering::Relaxed);
+        let mut o = Observation::new(
+            self.source_name.clone(),
+            common::MODALITY_PARTIAL_TRANSCRIPT,
+            self.clock.now(),
+        )
+        .with_payload(p.into_payload());
+        if let Some(id) = who {
+            o = o.with_entity(EntityHint::Known(id));
+        }
+        self.emit(o);
     }
 
     /// A speculation was transcribed: leave the text where the pipeline
@@ -1104,6 +1254,8 @@ impl Worker {
         cached: &mut Option<(Speculation, Analysis)>,
         last_match: &mut Option<(EntityId, f32)>,
     ) {
+        // The turn is over: its partials are done.
+        self.turn_partial = (None, 0);
         let secs = job.samples.len() as f32 / 16_000.0;
         // Two checks, either alone would do: the id says no speech
         // followed the speculation, and the prefix test says the audio is
@@ -1444,6 +1596,7 @@ mod tests {
             clock: Arc::new(RealClock),
             tx,
             stats: stats.clone(),
+            turn_partial: (None, 0),
         };
         let thread = std::thread::spawn(move || worker.run());
         Rig {
@@ -1459,7 +1612,11 @@ mod tests {
 
     impl Rig {
         fn speculate(&self, id: u64, samples: Vec<f32>) {
-            *self.slot.lock() = Some(Speculation { id, samples });
+            *self.slot.lock() = Some(Speculation {
+                id,
+                samples,
+                growing: false,
+            });
             self.wake.try_send(()).ok();
         }
 
@@ -1473,14 +1630,44 @@ mod tests {
                     speculation,
                 })
                 .ok();
-            let o = self
-                .rx
-                .recv_timeout(Duration::from_secs(2))
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| panic!("no utterance"));
-            assert_eq!(o.modality, "utterance");
-            o.payload.as_text().unwrap_or("").to_string()
+            // Partials of the pause speculation come first; skip them.
+            loop {
+                let o = self
+                    .rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| panic!("no utterance"));
+                if o.modality == common::MODALITY_PARTIAL_TRANSCRIPT {
+                    continue;
+                }
+                assert_eq!(o.modality, "utterance");
+                return o.payload.as_text().unwrap_or("").to_string();
+            }
+        }
+
+        fn grow(&self, id: u64, samples: Vec<f32>) {
+            *self.slot.lock() = Some(Speculation {
+                id,
+                samples,
+                growing: true,
+            });
+            self.wake.try_send(()).ok();
+        }
+
+        /// The next `partial_transcript`, skipping anything else.
+        fn next_partial(&self) -> common::PartialTranscript {
+            loop {
+                let o = self
+                    .rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| panic!("no partial"));
+                if let Some(p) = common::PartialTranscript::from_observation(&o) {
+                    return p.clone();
+                }
+            }
         }
 
         fn finish(mut self) -> Arc<Stats> {
@@ -1491,6 +1678,37 @@ mod tests {
             }
             self.stats
         }
+    }
+
+    #[test]
+    fn growing_partials_are_published_with_a_stable_prefix_and_not_reused() {
+        let r = rig();
+        r.grow(1, vec![0.5; 1000]);
+        let p1 = r.next_partial();
+        assert_eq!(p1.text, "1000 samples");
+        assert_eq!((p1.seq, p1.stable_words, p1.at_pause), (1, 0, false));
+        r.grow(2, vec![0.5; 2000]);
+        let p2 = r.next_partial();
+        // "1000 samples" vs "2000 samples": no word agrees.
+        assert_eq!((p2.seq, p2.stable_words), (2, 0));
+        r.grow(3, vec![0.5; 2000]);
+        let p3 = r.next_partial();
+        assert_eq!((p3.seq, p3.stable_words), (3, 2), "same text: all stable");
+        // The pause speculation is published too, marked as such.
+        r.speculate(4, vec![0.5; 2000]);
+        let p4 = r.next_partial();
+        assert!(p4.at_pause);
+        assert_eq!(p4.seq, 4);
+        // A growing job is never what a commit reuses: only the pause is.
+        assert_eq!(r.commit(vec![0.5; 2000], Some(4)), "2000 samples");
+        assert_eq!(r.calls.load(Ordering::Relaxed), 4);
+        // The next turn starts a fresh sequence.
+        r.grow(5, vec![0.5; 300]);
+        assert_eq!(r.next_partial().seq, 1);
+        let s = r.finish();
+        assert_eq!(s.growing_runs.load(Ordering::Relaxed), 4);
+        assert_eq!(s.speculations_used.load(Ordering::Relaxed), 1);
+        assert_eq!(s.partial_transcripts.load(Ordering::Relaxed), 5);
     }
 
     #[test]
@@ -1546,6 +1764,7 @@ mod tests {
         *r.slot.lock() = Some(Speculation {
             id: 1,
             samples: vec![0.5; 100],
+            growing: false,
         });
         r.speculate(2, vec![0.5; 200]);
         std::thread::sleep(Duration::from_millis(50));
@@ -1608,6 +1827,7 @@ mod tests {
             clock: clock.clone(),
             tx: tx.clone(),
             stats: stats.clone(),
+            turn_partial: (None, 0),
         };
         let pipeline = Pipeline {
             source: Some(Box::new(source)),
@@ -1622,6 +1842,7 @@ mod tests {
             spec_slot: slot,
             spec_wake: wake_tx,
             partial,
+            partial_every_samples: 0,
             events: None,
             source_name: "mic0".into(),
             clock,
@@ -1661,7 +1882,7 @@ mod tests {
         // instant); what matters is each partial ahead of its verdict.
         let kinds: Vec<_> = kinds
             .into_iter()
-            .filter(|k| k.0 != "voice_activity")
+            .filter(|k| k.0 != "voice_activity" && k.0 != common::MODALITY_PARTIAL_TRANSCRIPT)
             .collect();
         let names: Vec<&str> = kinds.iter().map(|k| k.0.as_str()).collect();
         assert_eq!(

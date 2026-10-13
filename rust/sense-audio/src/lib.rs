@@ -28,6 +28,7 @@
 //! | `voice_identity` | `Embedding`, entity `Known(id)` if matched | per utterance >= 1 s |
 //! | `utterance`      | `Text`, entity from the latest voice match | per transcribed utterance |
 //! | `partial_utterance` | `Text` (transcript so far), same entity | while the judge holds a turn open (see [`pipeline::PartialShared`]) |
+//! | `partial_transcript` | `Opaque(Arc<`[`common::PartialTranscript`]`>)` (text, stable prefix, seq, `at_pause`), same entity | every [`AudioConfig::partial_every_ms`] of new speech while talking, and at each pause; never after the turn's `utterance` |
 //! | `language`       | `Text("en"\|"hi"\|...)`, same entity | with each `utterance`; detected when [`AudioConfig::language`] is `None` on a multilingual model |
 //! | `voice_affect`   | `Opaque(Arc<`[`affect::Affect`]`>)`, same entity | with each `utterance` (>= 0.3 s voiced) |
 //! | `arousal`        | `Level(0..1)`, same entity | with each `voice_affect` |
@@ -44,6 +45,13 @@ pub mod denoise;
 /// in half at p >= 0.8 (1 of 6 at 0.9, with p50 703 ms, no gain). Cutting
 /// a visitor off costs more than half a second.
 pub const DEFAULT_TURN_EARLY_MS: u32 = 220;
+
+/// Default for [`AudioConfig::partial_every_ms`]: a partial transcript
+/// every 400 ms of new speech. Parakeet costs ~100-200 ms on clips of
+/// 0.4-3 s (RTX 5060, int8 encoder, measured 2026-10-13 with the live bot
+/// sharing the GPU), so the worker is busy under half the time while
+/// someone talks, and the cap of one queued job bounds it regardless.
+pub const DEFAULT_PARTIAL_MS: u32 = 400;
 /// After a turn the judge deferred, the most silence (from the last
 /// voiced frame) before it is answered anyway.
 pub const MAX_TURN_WAIT_MS: u32 = 1200;
@@ -263,6 +271,13 @@ pub struct AudioConfig {
     /// 0 waits for the hangover as the Go build did, which costs ~640 ms
     /// per reply; see [`pipeline`].
     pub speculate_after_frames: usize,
+    /// Streaming transcription: ms of new speech between two runs of the
+    /// recogniser on the growing buffer while the person is still talking,
+    /// each published as a `partial_transcript` (see
+    /// [`common::PartialTranscript`]). 0 = off. At most one such job is
+    /// queued behind the one running; a pause speculation is never
+    /// displaced by one. Default [`DEFAULT_PARTIAL_MS`].
+    pub partial_every_ms: u32,
     /// Who voices are matched against. `None` uses an empty
     /// [`InMemoryGallery`] with the default gates.
     pub gallery: Option<Arc<dyn VoiceGallery>>,
@@ -329,6 +344,7 @@ impl std::fmt::Debug for AudioConfig {
             .field("max_utterance_secs", &self.max_utterance_secs)
             .field("whisper_threads", &self.whisper_threads)
             .field("speculate_after_frames", &self.speculate_after_frames)
+            .field("partial_every_ms", &self.partial_every_ms)
             .field("gallery", &self.gallery.as_ref().map(|_| "custom"))
             .field("warm_up", &self.warm_up)
             .field("aec", &self.aec)
@@ -379,6 +395,7 @@ impl AudioConfig {
             max_utterance_secs: 20.0,
             whisper_threads: 4,
             speculate_after_frames: 1,
+            partial_every_ms: DEFAULT_PARTIAL_MS,
             gallery: None,
             warm_up: true,
             aec: true,
@@ -901,6 +918,7 @@ impl AudioSense {
 
     /// Start the pipeline and worker threads, over `source` if there is
     /// one, otherwise waiting for [`AudioSenseHandle::attach`].
+    #[allow(clippy::too_many_lines)]
     fn start(
         config: AudioConfig,
         prepared: Prepared,
@@ -967,6 +985,12 @@ impl AudioSense {
             },
             spec_slot: spec_slot.clone(),
             spec_wake: wake_tx,
+            // Only a recogniser makes partials.
+            partial_every_samples: if stt.is_some() {
+                config.partial_every_ms as usize * config.sample_rate as usize / 1000
+            } else {
+                0
+            },
             partial: partial.clone(),
             events,
             source_name: config.source_name.clone(),
@@ -1003,6 +1027,7 @@ impl AudioSense {
             clock,
             tx,
             stats: stats.clone(),
+            turn_partial: (None, 0),
         };
 
         let worker = std::thread::Builder::new()
