@@ -37,6 +37,9 @@ pub struct Visit {
     pub name: Option<String>,
     /// "Rohan's father", from how they introduced themselves.
     pub relation: Option<String>,
+    /// The last "my <relation>" they mentioned without a name ("my
+    /// brother is coming"), for a "his name is Joel" that follows.
+    pub mentioned_kin: Option<String>,
     /// The last [`KEEP`] exchanges, oldest first.
     pub exchanges: VecDeque<Exchange>,
     /// Every question they asked this visit, oldest first (for "what was
@@ -92,14 +95,22 @@ impl Visit {
         if let Some(r) = relation_in(heard) {
             self.relation = Some(r);
         }
+        if let Some(k) = kin_mentioned(heard) {
+            self.mentioned_kin = Some(k);
+        }
         if is_question(heard) {
-            self.questions.push(heard.to_owned());
+            self.questions.push(clip(heard, HEARD_MAX));
+            if self.questions.len() > KEEP {
+                self.questions.remove(0);
+            }
         }
         // Whatever they said next answers what we asked last.
         self.open_question = last_question(said);
+        // Bounded: a long ramble is kept by its start, so the notebook
+        // (and every prompt it goes into) stays small.
         self.exchanges.push_back(Exchange {
-            heard: heard.to_owned(),
-            said: said.trim().to_owned(),
+            heard: clip(heard, HEARD_MAX),
+            said: clip(said.trim(), HEARD_MAX),
         });
         while self.exchanges.len() > KEEP {
             self.exchanges.pop_front();
@@ -303,6 +314,29 @@ fn last_question(said: &str) -> Option<String> {
         .map(str::trim)
         .rfind(|s| s.ends_with('?'))
         .map(str::to_owned)
+}
+
+/// Characters kept of one utterance in the notebook.
+const HEARD_MAX: usize = 400;
+
+/// `s` cut to at most `max` characters, on a word boundary, with "...".
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(a, _)| a);
+    format!("{cut} ...")
+}
+
+/// The last "my <relation word>" in `text`: "my brother is coming" ->
+/// "brother".
+pub fn kin_mentioned(text: &str) -> Option<String> {
+    let w = crate::understand::words(text);
+    w.windows(2)
+        .rev()
+        .find(|p| p[0] == "my" && crate::people::Relation::from_word(&p[1]).is_some())
+        .map(|p| p[1].clone())
 }
 
 #[cfg(test)]

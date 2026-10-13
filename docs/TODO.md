@@ -41,7 +41,7 @@
 13. Jetson: build the CUDA/TensorRT onnxruntime on the board; `deploy/jetson/install.sh`.
 
 ## Found live 2026-10-14 (fix when testing resumes)
-- Speed: qwen2.5:7b (GLYDI_DEEP_MODEL default) fills the 8 GB GPU and pushes qwen2.5:3b to 95% CPU; fast path slows to ~2 s and the understand call can time out. .env now has GLYDI_DEEP_MODEL=off. Decide: load the deep model on demand, a smaller deep model, or keep off. The default in code is still the 7B.
+- Speed (done 2026-10-13): GLYDI_DEEP_MODEL now defaults to off in code; an opted-in deep model loads on demand (keep_alive 30 s) behind a free-VRAM check (deliberate::deep). Understand call bounded at 1.2 s.
 - Unprompted lines still spoken in people mode: "So, what's been keeping you busy, Sony?", "What's Kalyan got you looking for today?", "Found ya, Sony!". Find which path bypasses the people-mode gate.
 - Test campaign (cd4b3c8) was stopped while running the e2e eval on the extra cases; resume: run scripts/scenarios_more.py, the fuzz suites and the eval, collect the bug list.
 - Known failing: deliberate voice guards `leaks_are_caught`, `voice_guards_are_total_and_bounded` (from the new fuzz tests).

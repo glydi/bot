@@ -73,6 +73,7 @@ impl Relation {
             Self::ChildOf => Self::ParentOf,
             Self::TeacherOf => Self::StudentOf,
             Self::StudentOf => Self::TeacherOf,
+            Self::Other(w) => Self::Other(other_inverse(w).to_owned()),
             r => r.clone(),
         }
     }
@@ -81,22 +82,32 @@ impl Relation {
     /// speaker used for them: "my son" -> the son is `ChildOf` the speaker.
     /// `None` for a word that is not a relation.
     pub fn from_word(word: &str) -> Option<Self> {
-        let w = word
-            .trim()
-            .trim_start_matches("my ")
-            .trim_end_matches('s')
-            .to_lowercase();
+        let w = word.trim().trim_start_matches("my ").to_lowercase();
+        // "step mother", "mother in law", "step-mother": one hyphenated word.
+        let w = w
+            .replace("step ", "step")
+            .replace("step-", "step")
+            .replace(" in law", "-in-law")
+            .replace(" in-law", "-in-law");
+        // A plural, but not a word that ends in s ("boss", "bus").
+        let w = match w.strip_suffix('s') {
+            Some(stem) if !w.ends_with("ss") && !w.ends_with("-in-laws") => stem.to_owned(),
+            _ => w.replace("-in-laws", "-in-law"),
+        };
+        if let Some(k) = KIN.iter().find(|(word, _)| *word == w) {
+            return Some(Self::Other(k.1.to_owned()));
+        }
         Some(match w.as_str() {
             "son" | "daughter" | "child" | "kid" | "boy" | "girl" | "child_of" => Self::ChildOf,
-            "father" | "mother" | "dad" | "mum" | "mom" | "parent" | "papa" | "mama"
-            | "parent_of" => Self::ParentOf,
-            "brother" | "sister" | "sibling" | "sibling_of" => Self::SiblingOf,
+            "father" | "mother" | "dad" | "mum" | "mom" | "parent" | "papa" | "mama" | "amma"
+            | "appa" | "mummy" | "daddy" | "parent_of" => Self::ParentOf,
+            "brother" | "sister" | "sibling" | "sibling_of" | "didi" | "bhaiya" | "bhai"
+            | "akka" => Self::SiblingOf,
             "friend" | "best friend" | "friend_of" => Self::FriendOf,
             "teacher" | "teacher_of" => Self::TeacherOf,
             "student" | "pupil" | "student_of" => Self::StudentOf,
             "wife" | "husband" | "spouse" | "spouse_of" => Self::SpouseOf,
-            "cousin" | "uncle" | "aunt" | "aunty" | "grandfather" | "grandmother" | "grandma"
-            | "grandpa" | "neighbour" | "neighbor" | "nephew" | "niece" => Self::Other(w),
+            "neighbour" | "neighbor" => Self::Other("neighbour".to_owned()),
             _ => return None,
         })
     }
@@ -390,6 +401,87 @@ pub fn may_discuss(speaker: Option<&EntityId>, about: &EntityId, speaker_edges: 
         Some(_) => speaker_edges.iter().any(|e| &e.other == about),
         None => false,
     }
+}
+
+/// Kin words kept as [`Relation::Other`], by their class: the class is
+/// what is stored, so the inverse is exact ("X is my grandfather" makes
+/// me X's grandchild, and X my grandparent).
+const KIN: &[(&str, &str)] = &[
+    ("grandfather", "grandparent"),
+    ("grandmother", "grandparent"),
+    ("grandpa", "grandparent"),
+    ("grandma", "grandparent"),
+    ("grandparent", "grandparent"),
+    ("nani", "grandparent"),
+    ("nana", "grandparent"),
+    ("dadi", "grandparent"),
+    ("dada", "grandparent"),
+    ("ajji", "grandparent"),
+    ("thatha", "grandparent"),
+    ("grandson", "grandchild"),
+    ("granddaughter", "grandchild"),
+    ("grandchild", "grandchild"),
+    ("uncle", "uncle or aunt"),
+    ("aunt", "uncle or aunt"),
+    ("aunty", "uncle or aunt"),
+    ("auntie", "uncle or aunt"),
+    ("chacha", "uncle or aunt"),
+    ("chachi", "uncle or aunt"),
+    ("mami", "uncle or aunt"),
+    ("mausi", "uncle or aunt"),
+    ("masi", "uncle or aunt"),
+    ("bua", "uncle or aunt"),
+    ("tau", "uncle or aunt"),
+    ("mamu", "uncle or aunt"),
+    ("uncle or aunt", "uncle or aunt"),
+    ("nephew", "nephew or niece"),
+    ("niece", "nephew or niece"),
+    ("nephew or niece", "nephew or niece"),
+    ("cousin", "cousin"),
+    ("stepfather", "stepparent"),
+    ("stepmother", "stepparent"),
+    ("stepparent", "stepparent"),
+    ("stepson", "stepchild"),
+    ("stepdaughter", "stepchild"),
+    ("stepchild", "stepchild"),
+    ("stepbrother", "stepsibling"),
+    ("stepsister", "stepsibling"),
+    ("stepsibling", "stepsibling"),
+    ("father-in-law", "parent-in-law"),
+    ("mother-in-law", "parent-in-law"),
+    ("parent-in-law", "parent-in-law"),
+    ("son-in-law", "child-in-law"),
+    ("daughter-in-law", "child-in-law"),
+    ("child-in-law", "child-in-law"),
+    ("brother-in-law", "sibling-in-law"),
+    ("sister-in-law", "sibling-in-law"),
+    ("sibling-in-law", "sibling-in-law"),
+    ("guardian", "guardian"),
+    ("ward", "ward"),
+    ("neighbour", "neighbour"),
+];
+
+/// Each class and its other side; symmetric classes are absent.
+const KIN_INVERSE: &[(&str, &str)] = &[
+    ("grandparent", "grandchild"),
+    ("grandchild", "grandparent"),
+    ("uncle or aunt", "nephew or niece"),
+    ("nephew or niece", "uncle or aunt"),
+    ("stepparent", "stepchild"),
+    ("stepchild", "stepparent"),
+    ("parent-in-law", "child-in-law"),
+    ("child-in-law", "parent-in-law"),
+    ("guardian", "ward"),
+    ("ward", "guardian"),
+];
+
+/// The other side of a kin class; an unknown word keeps itself (a
+/// symmetric relation like "colleague").
+fn other_inverse(w: &str) -> &str {
+    KIN_INVERSE
+        .iter()
+        .find(|(k, _)| *k == w)
+        .map_or(w, |(_, inv)| inv)
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ pub fn relation_noun(r: &Relation) -> &str {
         Relation::FriendOf => "friend",
         Relation::TeacherOf => "teacher",
         Relation::StudentOf => "student",
-        Relation::SpouseOf => "family",
+        Relation::SpouseOf => "spouse",
         Relation::Other(w) => w,
     }
 }

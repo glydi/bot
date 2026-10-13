@@ -23,6 +23,7 @@ use crate::converse::{self, PERSONA, pick};
 use crate::handoff::Handoff;
 use crate::people::{FactOp, Relation};
 use crate::prompt::Message;
+use crate::speculate::CLAUSE_MIN_WORDS;
 use crate::understand::{self, Mention, UnderstandModel, Understanding};
 use crate::visit::Awaiting;
 use common::Observation;
@@ -337,7 +338,19 @@ impl Session {
             self.visit.name.clone_from(&my_name);
         }
         // An answer the bot was waiting for, by rule.
+        // "my brother is coming ..." then "his name is Joel".
+        let late = understand::third_person_name(text)
+            .and_then(|n| self.visit.mentioned_kin.take().map(|w| (n, w)));
         let awaited = match (&self.visit.awaiting, bare_name(text)) {
+            _ if late.is_some() => late.map(|(n, w)| {
+                let mut u = Understanding::of("tell_relation");
+                u.people.push(Mention {
+                    name: n,
+                    relation_to_speaker: Some(w.clone()),
+                    reference: Some(format!("my {w}")),
+                });
+                u
+            }),
             (Some(Awaiting::Name), Some(n)) => {
                 let mut u = Understanding::of("tell_name");
                 u.people.push(Mention {
@@ -375,14 +388,30 @@ impl Session {
                 ms: 0,
             },
             None => {
-                let notebook = converse::layered(
-                    self.facts.as_ref(),
-                    me.as_ref(),
-                    my_name.as_deref(),
-                    &self.visit,
-                );
-                let model = self.people.as_ref().and_then(|p| p.understander.clone());
-                understand::understand(model.as_deref(), &notebook, text).await
+                // Understood while they were still talking, when the final
+                // transcript says the same.
+                let early = match self.prepared.as_mut() {
+                    Some(p)
+                        if common::partial::normalise(&p.text)
+                            == common::partial::normalise(text) =>
+                    {
+                        p.understood().await
+                    }
+                    _ => None,
+                };
+                if let Some(u) = early {
+                    tracing::info!(by = u.by, "understood ahead (speculation)");
+                    u
+                } else {
+                    let notebook = converse::layered(
+                        self.facts.as_ref(),
+                        me.as_ref(),
+                        my_name.as_deref(),
+                        &self.visit,
+                    );
+                    let model = self.people.as_ref().and_then(|p| p.understander.clone());
+                    understand::understand(model.as_deref(), &notebook, text).await
+                }
             }
         };
         tracing::info!(
@@ -702,10 +731,13 @@ impl Session {
                 Some(n) => format!("I'm doing great, thanks {n}! How about you?"),
                 None => "I'm doing great, thanks! How about you?".to_owned(),
             }),
-            "ask_about_bot" => Some(
+            "ask_about_bot" => Some(if asks_what_i_do(text) {
+                "I greet everyone at the door, remember names and who comes with whom,                  mark attendance, and answer simple school questions."
+                    .to_owned()
+            } else {
                 "I'm Glydi, the robot at the door. I remember people, and who they come with."
-                    .to_owned(),
-            ),
+                    .to_owned()
+            }),
             "ask_about_me" => Some(match (&me, &my_name) {
                 // A specific question ("what is my favourite colour?"):
                 // answer just that, from the fact that matches it best.
@@ -845,6 +877,8 @@ impl Session {
             }
             other => other,
         };
+        // One word cap on every path (live: a 55-word "who is Raj?").
+        let line = line.map(|l| cap_words(&l, REPLY_WORDS));
         if let Some(l) = line {
             if std::mem::take(&mut self.streamed) {
                 // Already said while the model wrote it.
@@ -920,6 +954,31 @@ impl Session {
         let me = me?;
         let mut confirm = None;
         for m in &u.people {
+            // A chain link: "Mrs Bose" with reference "Rohan's mother" is
+            // the mother of Rohan, who was stored a moment ago.
+            if m.relation_to_speaker.is_none()
+                && !m.name.is_empty()
+                && let Some((owner, word)) =
+                    m.reference.as_deref().and_then(|r| r.split_once("'s "))
+                && let Some(r) = Relation::from_word(word)
+                && let Some(owner_id) = self.facts.resolve_name(owner)
+                && owner_id != *me
+            {
+                // `m` is `r` of the owner, so the owner is `r.inverse()` of `m`.
+                self.facts.relate_people(
+                    &owner_id,
+                    &r.inverse(),
+                    &m.name,
+                    text,
+                    u.confidence.max(0.5),
+                );
+                if confirm.is_none() {
+                    confirm = Some(format!("I'll remember {} is {owner}'s {word}.", m.name));
+                } else if let Some(c) = confirm.as_mut() {
+                    c.push_str(&format!(" And {} is {owner}'s {word}.", m.name));
+                }
+                continue;
+            }
             let (Some(word), false) = (m.relation_to_speaker.as_deref(), m.name.is_empty()) else {
                 continue;
             };
@@ -1008,6 +1067,9 @@ impl Session {
         let stream = self.backend.chat(req);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let need = required_words(content);
+        // No question of its own after the decided line (live: "Nice to
+        // meet you, Meera! What brings you here today?").
+        let ask = content.contains('?');
         let carries = |s: &str| {
             let low = s.to_lowercase();
             need.iter().all(|w| low.contains(w.as_str()))
@@ -1015,12 +1077,11 @@ impl Session {
                 && (content.contains('?') || !s.contains('?'))
         };
         let (raw, first) = self
-            .stream_say_first(stream, deadline, obs, cancel, &carries)
+            .stream_say_first(stream, deadline, obs, cancel, &carries, &|c: &str| {
+                ask || !c.contains('?')
+            })
             .await?;
         if let Some(first) = first {
-            // No question of its own after the decided line (live: "Nice
-            // to meet you, Meera! What brings you here today?").
-            let ask = content.contains('?');
             return Ok(self.finish_streamed(first, raw.as_deref(), &need, ask));
         }
         let Some(raw) = raw else {
@@ -1066,6 +1127,7 @@ impl Session {
         obs: &mut mpsc::Receiver<Observation>,
         cancel: &CancellationToken,
         first_ok: &(dyn Fn(&str) -> bool + Send + Sync),
+        more_ok: &(dyn Fn(&str) -> bool + Send + Sync),
     ) -> Result<(Option<String>, Option<(String, usize)>), ()> {
         use futures_util::StreamExt as _;
         let mut text = String::new();
@@ -1099,15 +1161,50 @@ impl Session {
                     Some(Err(_)) => break None,
                     Some(Ok(ChatEvent::Text(t))) => {
                         text.push_str(&t);
-                        if !tried && let Some(end) = sentence_end(&text) {
-                            tried = true;
-                            let said = crate::voice::speakable(&text[..end], CHAT_WORDS)
-                                .filter(|s| s.split_whitespace().count() >= 3)
-                                .filter(|s| self.line_ok(s) && first_ok(s));
-                            if let Some(s) = said {
-                                tracing::info!(sentence = s, "said while thinking");
-                                self.say(s.clone());
-                                first = Some((s, end));
+                        // The first chunk: a clause when it already passes
+                        // (Kokoro starts on it while the model writes on),
+                        // else the whole first sentence.
+                        if !tried {
+                            let clause = crate::speculate::clause_end(&text, CLAUSE_MIN_WORDS);
+                            let sentence = sentence_end(&text);
+                            for (end, last_try) in [(clause, false), (sentence, true)] {
+                                let Some(end) = end else { continue };
+                                let said = crate::voice::speakable(&text[..end], CHAT_WORDS)
+                                    .filter(|s| s.split_whitespace().count() >= 3)
+                                    .filter(|s| self.line_ok(s) && first_ok(s));
+                                if let Some(s) = said {
+                                    tracing::info!(chunk = s, "said while thinking");
+                                    self.say(s.clone());
+                                    first = Some((s, end));
+                                    tried = true;
+                                    break;
+                                }
+                                if last_try {
+                                    tried = true;
+                                }
+                            }
+                        } else if let Some((said, used)) = first.as_mut() {
+                            // Then each further clause as it completes,
+                            // within the word budget.
+                            while let Some(cut) = text
+                                .get(*used..)
+                                .and_then(|r| crate::speculate::clause_end(r, CLAUSE_MIN_WORDS))
+                            {
+                                let chunk = text[*used..*used + cut].trim().to_owned();
+                                let total = said.split_whitespace().count()
+                                    + chunk.split_whitespace().count();
+                                if chunk.is_empty()
+                                    || total > CHAT_WORDS
+                                    || !more_ok(&chunk)
+                                    || !self.line_ok(&chunk)
+                                {
+                                    break;
+                                }
+                                tracing::info!(chunk, "said while thinking");
+                                self.say(chunk.clone());
+                                said.push(' ');
+                                said.push_str(&chunk);
+                                *used += cut;
                             }
                         }
                     }
@@ -1161,6 +1258,38 @@ impl Session {
             && !self.said.repeats(l)
     }
 
+    /// The chat reply's request for `text` from `name` (also what the
+    /// speculator starts on a partial transcript).
+    pub(super) fn chat_request(&self, text: &str, name: Option<&str>) -> ChatRequest {
+        let ctx = match name {
+            Some(n) => format!("[talking with] {n}"),
+            None => "[talking with] someone new".to_owned(),
+        };
+        // The conversation so far as real turns, so the reply follows on
+        // from it, then the person card and the line.
+        let mut m = vec![Message::system(format!("{PERSONA}\n{}", now_line()))];
+        for e in self.visit.recent() {
+            m.push(Message::user(e.heard.clone()));
+            m.push(Message::assistant(e.said.clone()));
+        }
+        m.push(Message::user(format!("{ctx}\n[said] {text}")));
+        ChatRequest {
+            messages: m,
+            tools: Vec::new(),
+            max_tokens: 60,
+            temperature: 0.7,
+            json_object: false,
+        }
+    }
+
+    /// Who a partial transcript is from, for the speculator.
+    pub(super) fn who_for_speculation(
+        &self,
+        speaker: Option<&EntityId>,
+    ) -> (Option<EntityId>, Option<String>) {
+        self.who(speaker)
+    }
+
     async fn chat_line(
         &mut self,
         text: &str,
@@ -1173,38 +1302,24 @@ impl Session {
         // about them (likes, family, past visits) is said when they ask,
         // never volunteered.
         let _ = me;
-        let ctx = match name {
-            Some(n) => format!("[talking with] {n}"),
-            None => "[talking with] someone new".to_owned(),
-        };
-        let req = ChatRequest {
-            messages: {
-                // The conversation so far as real turns, so the reply
-                // follows on from it, then the person card and the line.
-                let mut m = vec![Message::system(format!(
-                    "{PERSONA}
-{}",
-                    now_line()
-                ))];
-                for e in self.visit.recent() {
-                    m.push(Message::user(e.heard.clone()));
-                    m.push(Message::assistant(e.said.clone()));
-                }
-                m.push(Message::user(format!("{ctx}\n[said] {text}")));
-                m
-            },
-            tools: Vec::new(),
-            max_tokens: 60,
-            temperature: 0.7,
-            json_object: false,
-        };
-        let stream = self.backend.chat(req);
+        let req = self.chat_request(text, name);
+        // The reply already started from the partial transcript, when the
+        // final said the same; else a fresh request.
+        let ahead = self
+            .prepared
+            .as_mut()
+            .filter(|p| common::partial::normalise(&p.text) == common::partial::normalise(text))
+            .and_then(crate::speculate::Prepared::take_chat);
+        if ahead.is_some() {
+            tracing::info!("chat reply started ahead (speculation)");
+        }
+        let stream = ahead.unwrap_or_else(|| self.backend.chat(req));
         // Bounded: a slow or stuck model gives way to a short line of our own.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         // Think while speaking: the first sentence is said the moment it
         // is complete, while the model writes the rest.
         let (raw, first) = self
-            .stream_say_first(stream, deadline, obs, cancel, &|_| true)
+            .stream_say_first(stream, deadline, obs, cancel, &|_| true, &|_| true)
             .await?;
         if let Some(first) = first {
             return Ok(Some(self.finish_streamed(first, raw.as_deref(), &[], true)));
@@ -1261,6 +1376,7 @@ impl Session {
     /// The slow path: a holding line at once, then the stronger model with
     /// the whole layered context and a silent reasoning step, within
     /// [`DEEP_CAP`]. `Err` = cancelled (barge-in).
+    #[allow(clippy::too_many_lines)]
     async fn deep_line(
         &mut self,
         text: &str,
@@ -1317,6 +1433,8 @@ impl Session {
             .unwrap_or_else(|| Arc::clone(&self.backend));
         let mut stream = backend.chat(req);
         let deadline = t0 + DEEP_CAP;
+        let mut spoken = String::new();
+        let mut spoken_upto = 0usize;
         let mut raw = String::new();
         let done = loop {
             tokio::select! {
@@ -1336,11 +1454,72 @@ impl Session {
                         tracing::info!(error = %e, "slow path: model failed");
                         break false;
                     }
-                    Some(Ok(ChatEvent::Text(t))) => raw.push_str(&t),
+                    Some(Ok(ChatEvent::Text(t))) => {
+                        raw.push_str(&t);
+                        // After the silent reasoning, say each clause as it
+                        // completes rather than the whole answer at the end.
+                        if let Some(at) = raw.find("</think>") {
+                            let body = &raw[at + "</think>".len()..];
+                            while let Some(cut) = body
+                                .get(spoken_upto..)
+                                .and_then(|r| crate::speculate::clause_end(r, CLAUSE_MIN_WORDS))
+                            {
+                                let chunk = body[spoken_upto..spoken_upto + cut].trim().to_owned();
+                                let total = spoken.split_whitespace().count()
+                                    + chunk.split_whitespace().count();
+                                let real = format!("{} {}", self.real_context(), ctx.to_lowercase());
+                                if chunk.is_empty()
+                                    || total > DEEP_WORDS
+                                    || crate::voice::leaks_instructions(&chunk)
+                                    || crate::voice::leaks_example(&chunk, &real)
+                                    || chunk.contains('[')
+                                    || chunk.contains('<')
+                                {
+                                    break;
+                                }
+                                tracing::info!(chunk, "slow path: said while thinking");
+                                self.say(chunk.clone());
+                                if !spoken.is_empty() {
+                                    spoken.push(' ');
+                                }
+                                spoken.push_str(&chunk);
+                                spoken_upto += cut;
+                            }
+                        }
+                    }
                     Some(Ok(ChatEvent::Call(_))) => {}
                 }
             }
         };
+        if !spoken.is_empty() {
+            // The rest after the last clause said: one more piece when it
+            // is complete and fits.
+            let tail = raw
+                .find("</think>")
+                .and_then(|at| raw.get(at + "</think>".len() + spoken_upto..))
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let room = DEEP_WORDS.saturating_sub(spoken.split_whitespace().count());
+            if done
+                && !tail.is_empty()
+                && tail.split_whitespace().count() <= room
+                && !crate::voice::leaks_instructions(&tail)
+                && !tail.contains('[')
+                && !tail.contains('<')
+            {
+                self.say(tail.clone());
+                spoken.push(' ');
+                spoken.push_str(&tail);
+            }
+            self.streamed = true;
+            tracing::info!(
+                ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                answer = spoken.as_str(),
+                "slow path answered (streamed)"
+            );
+            return Ok(spoken);
+        }
         let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (mut answer, reasoning) = crate::voice::strip_reasoning(&raw);
         // Out of time mid-answer: the complete sentences so far are said.
@@ -1636,6 +1815,44 @@ fn said_name(text: &str, held: Option<&str>) -> Option<String> {
 }
 
 /// "What's my name?", "who am I?", "do you know me?".
+/// "what can you do?", "what do you do here?": the bot's job, not its name.
+fn asks_what_i_do(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "can you do",
+        "do you do",
+        "are you for",
+        "can you help with",
+        "your job",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
+
+/// The most words any spoken reply carries.
+const REPLY_WORDS: usize = 45;
+
+/// `l` cut to whole sentences within `max` words (else the first `max`
+/// words with a full stop).
+fn cap_words(l: &str, max: usize) -> String {
+    if l.split_whitespace().count() <= max {
+        return l.to_owned();
+    }
+    let mut out = String::new();
+    for s in l.split_inclusive(['.', '!', '?']) {
+        let next = format!("{out}{s}");
+        if next.split_whitespace().count() > max {
+            break;
+        }
+        out = next;
+    }
+    if out.trim().is_empty() {
+        let w: Vec<&str> = l.split_whitespace().take(max).collect();
+        return format!("{}.", w.join(" ").trim_end_matches([',', ';', ':']));
+    }
+    out.trim().to_owned()
+}
+
 fn asks_name_only(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     ["my name", "who am i", "know me", "remember me", "mera naam"]
@@ -1997,6 +2214,87 @@ mod tests {
 "
             )
         );
+    }
+
+    /// The campaign's relation and two-people bugs, rules only.
+    #[tokio::test]
+    async fn campaign_relations_and_two_people() {
+        let mut bad = Vec::new();
+        // A relation named later.
+        {
+            let mut r = rig(vec![]);
+            r.say("I'm Arun", None).await;
+            let arun = r.facts.resolve_name("Arun").unwrap();
+            r.say("my brother is coming to pick me up", Some(&arun))
+                .await;
+            let l = r.say("his name is Joel", Some(&arun)).await;
+            let ok = r.facts.resolve_name("Joel").is_some_and(|j| {
+                r.facts
+                    .edges(&arun)
+                    .iter()
+                    .any(|e| e.other == j && e.relation == Relation::SiblingOf)
+            });
+            if !ok {
+                bad.push(format!("named later: {l:?}"));
+            }
+        }
+        // A relation corrected.
+        {
+            let mut r = rig(vec![]);
+            r.say("I'm Ram", None).await;
+            let ram = r.facts.resolve_name("Ram").unwrap();
+            r.say("Sita is my sister", Some(&ram)).await;
+            let l = r.say("no, Sita is my wife", Some(&ram)).await;
+            let rels: Vec<Relation> = r
+                .facts
+                .edges(&ram)
+                .iter()
+                .map(|e| e.relation.clone())
+                .collect();
+            if rels != vec![Relation::SpouseOf] {
+                bad.push(format!("corrected: {l:?} edges {rels:?}"));
+            }
+        }
+        // A friend introduced beside the speaker, then in focus.
+        {
+            let mut r = rig(vec![]);
+            r.say("I'm Arun", None).await;
+            let arun = r.facts.resolve_name("Arun").unwrap();
+            let l = r.say("and this is my friend Bala", Some(&arun)).await;
+            if !l.contains("Bala") || l.contains("Nice to meet you, Arun") {
+                bad.push(format!("friend: {l:?}"));
+            }
+            match r.facts.resolve_name("Bala") {
+                Some(bala) => {
+                    let l = r.say("what's my name?", Some(&bala)).await;
+                    if !l.contains("Bala") || l.contains("Arun") {
+                        bad.push(format!("Bala asks her name: {l:?}"));
+                    }
+                }
+                None => bad.push("Bala not stored".to_owned()),
+            }
+        }
+        // A chain: my friend's mother.
+        {
+            let mut r = rig(vec![]);
+            r.say("I'm Kavya", None).await;
+            let kavya = r.facts.resolve_name("Kavya").unwrap();
+            let l = r
+                .say("Mrs Bose is my friend Rohan's mother", Some(&kavya))
+                .await;
+            let ok = r.facts.resolve_name("Rohan").is_some_and(|ro| {
+                r.facts.resolve_name("Mrs Bose").is_some_and(|b| {
+                    r.facts
+                        .edges(&ro)
+                        .iter()
+                        .any(|e| e.other == b && e.relation == Relation::ChildOf)
+                })
+            });
+            if !ok {
+                bad.push(format!("chain: {l:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     fn json(intent: &str, people: &str, facts: &str) -> String {

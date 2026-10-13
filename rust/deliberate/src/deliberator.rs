@@ -710,6 +710,11 @@ pub struct Session {
     /// The question whose answer was just called wrong: this turn
     /// re-answers it, once.
     correcting: Option<String>,
+    /// Speculative thinking on partial transcripts (people mode); see
+    /// [`crate::speculate`].
+    spec: crate::speculate::Speculator,
+    /// What a confirmed speculation handed to the turn being answered.
+    prepared: Option<crate::speculate::Prepared>,
 }
 
 impl Session {
@@ -723,7 +728,13 @@ impl Session {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let (condense_tx, condense_rx) = mpsc::unbounded_channel();
+        let spec = crate::speculate::Speculator::new(
+            config.people.as_ref().and_then(|p| p.understander.clone()),
+            config.people.as_ref().map(|_| Arc::clone(&backend)),
+        );
         Self {
+            spec,
+            prepared: None,
             backend,
             // The reach tools the environment allows, run for real; the
             // policy is read once here and `specs()` describes exactly
@@ -3322,6 +3333,36 @@ impl Session {
                     // in passing is superseded by this.
                     partial = None;
                     early_due = None;
+                    // Speculative work on the same words is handed over;
+                    // anything else is cancelled.
+                    let heard = o.payload.as_text().map_or("", str::trim);
+                    self.prepared = self.spec.on_final(heard);
+                }
+                common::MODALITY_PARTIAL_TRANSCRIPT => {
+                    if self.people.is_some()
+                        && let Some(p) = common::PartialTranscript::from_observation(&o)
+                    {
+                        let hint = o
+                            .entity
+                            .as_ref()
+                            .and_then(common::EntityHint::known)
+                            .cloned();
+                        let (me, name) = self.who_for_speculation(hint.as_ref());
+                        let notebook = crate::converse::layered(
+                            self.facts.as_ref(),
+                            me.as_ref(),
+                            name.as_deref(),
+                            &self.visit,
+                        );
+                        let mut spec = std::mem::replace(
+                            &mut self.spec,
+                            crate::speculate::Speculator::new(None, None),
+                        );
+                        let req = |t: &str| Some(self.chat_request(t, name.as_deref()));
+                        spec.on_partial(p, || notebook, req);
+                        self.spec = spec;
+                    }
+                    continue;
                 }
                 PARTIAL_UTTERANCE => {
                     if let Some(t) = o.payload.as_text().map(str::trim).filter(|t| !t.is_empty()) {
@@ -3466,12 +3507,21 @@ impl Session {
             };
             let token = shutdown.child_token();
             *current.lock() = Some(token.clone());
+            // A joined continuation is not what was speculated on.
+            if self.prepared.as_ref().is_some_and(|p| {
+                common::partial::normalise(&p.text) != common::partial::normalise(&text)
+            }) {
+                self.prepared = None;
+            }
             let end = self
                 .handle_utterance(&text, speaker.as_ref(), &mut obs, token)
                 .await;
             *current.lock() = None;
+            self.prepared = None;
             match end {
                 Ok(TurnEnd::Cancelled) => {
+                    // Barge-in: whatever was being prepared is moot.
+                    self.spec.cancel();
                     last_cancelled = Some((text, self.clock.now()));
                 }
                 Ok(TurnEnd::Done) => {}
@@ -4878,6 +4928,112 @@ mod tests {
         handle.cancel_current(); // nothing in flight: a no-op
         drop(obs_tx);
         handle.shutdown();
+    }
+
+    /// An understander that counts its calls and always says chit-chat.
+    struct CountingUnderstander(std::sync::atomic::AtomicUsize);
+
+    impl crate::understand::UnderstandModel for CountingUnderstander {
+        fn complete<'a>(
+            &'a self,
+            _system: &'a str,
+            _user: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(r#"{"intent":"chit_chat","people":[],"facts":[],"refers_to":null,"heard_ok":true,"confidence":0.9}"#.to_owned())
+            })
+        }
+    }
+
+    fn partial_obs(text: &str, seq: u64, at_pause: bool) -> Observation {
+        let p = common::PartialTranscript {
+            text: text.to_owned(),
+            stable_words: text.split_whitespace().count(),
+            seq,
+            at_pause,
+        };
+        Observation::new("mic0", common::MODALITY_PARTIAL_TRANSCRIPT, Instant::now())
+            .with_payload(p.into_payload())
+    }
+
+    /// Partials, then the final: speculation is used when the final says
+    /// the same (the understand model is called once, at the pause, not
+    /// again for the final), cancelled when it differs, and nothing is
+    /// said before the final transcript.
+    fn speculation_run(final_text: &str) -> (usize, Vec<Command>, Vec<Command>) {
+        let (obs_tx, obs_rx) = crossbeam_channel::bounded::<Observation>(8);
+        let llm = MockLlm::new(vec![
+            Script::text(&["That sounds lovely, ", "I hope it goes well."]),
+            Script::text(&["That sounds lovely, ", "I hope it goes well."]),
+        ]);
+        let commands = Arc::new(CommandQueue::new());
+        let und = Arc::new(CountingUnderstander(std::sync::atomic::AtomicUsize::new(0)));
+        let mut config = model_config();
+        config.people = Some(crate::People {
+            understander: Some(und.clone()),
+            ..crate::People::default()
+        });
+        config.attention = false;
+        let handle = Deliberator::spawn_with(
+            llm,
+            config,
+            obs_rx,
+            room_with(vec![]),
+            Arc::new(InMemoryFacts::new()),
+            commands.clone(),
+            Arc::new(FakeClock::new()),
+        )
+        .unwrap();
+        obs_tx
+            .send(partial_obs("we went to the lake", 1, false))
+            .unwrap();
+        obs_tx
+            .send(partial_obs("we went to the lake on sunday", 2, true))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let before: Vec<Command> = std::iter::from_fn(|| commands.try_pop()).collect();
+        obs_tx
+            .send(
+                Observation::new("mic0", UTTERANCE, Instant::now())
+                    .with_payload(Payload::Text(final_text.into())),
+            )
+            .unwrap();
+        let mut after = Vec::new();
+        while let Some(c) = commands.pop_timeout(Duration::from_secs(5)) {
+            let idle = c.kind == "idle";
+            after.push(c);
+            if idle {
+                break;
+            }
+        }
+        drop(obs_tx);
+        handle.shutdown();
+        (
+            und.0.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            after,
+        )
+    }
+
+    #[test]
+    fn speculation_is_used_when_the_final_matches() {
+        let (calls, before, after) = speculation_run("we went to the lake on Sunday.");
+        assert!(
+            before.iter().all(|c| c.kind != "say"),
+            "audio before the final: {before:?}"
+        );
+        assert_eq!(calls, 1, "understood once, at the pause");
+        assert!(after.iter().any(|c| c.kind == "say"), "{after:?}");
+    }
+
+    #[test]
+    fn speculation_is_cancelled_when_the_final_differs() {
+        let (calls, before, after) = speculation_run("we went to the zoo on Monday");
+        assert!(before.iter().all(|c| c.kind != "say"), "{before:?}");
+        assert_eq!(calls, 2, "the final is understood afresh");
+        assert!(after.iter().any(|c| c.kind == "say"), "{after:?}");
     }
 
     fn intent(json: &str) -> Command {

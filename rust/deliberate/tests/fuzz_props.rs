@@ -323,7 +323,6 @@ fn validator_never_panics_and_keeps_its_promises() {
 /// Known gap, documented as a test: the invented-name check is a substring
 /// test, so "Al" survives in "always" and "Pri" in "pricey".
 #[test]
-#[ignore = "product bug: validate() accepts a name that is only a substring of another word"]
 fn validator_drops_a_name_that_is_only_inside_another_word() {
     let raw = r#"{"intent":"tell_relation","confidence":0.9,"people":[{"name":"Al","relation_to_speaker":"son"}]}"#;
     let u = validate(raw, "I always come here", "").unwrap();
@@ -516,7 +515,6 @@ fn visit_notebook_limits_hold() {
 
 /// A 20 kB ramble must not blow the prompt up without bound.
 #[test]
-#[ignore = "product bug: Visit::record keeps each utterance whole, so the notebook (prompt) grows with ramble length"]
 fn notebook_is_bounded_for_rambles() {
     let mut v = Visit::new(None, None);
     for _ in 0..6 {
@@ -653,7 +651,6 @@ fn relation_words_coverage_report() {
 /// Known asymmetry: grandfather/uncle are `Other`, whose inverse is
 /// itself, so "Ravi is my grandfather" makes me Ravi's grandfather too.
 #[test]
-#[ignore = "product bug: Relation::Other inverse is itself (uncle<->uncle, grandfather<->grandfather)"]
 fn other_relations_have_a_real_inverse() {
     let g = Relation::from_word("grandfather").unwrap();
     assert_ne!(g.inverse(), g);

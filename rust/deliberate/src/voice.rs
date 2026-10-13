@@ -2286,6 +2286,11 @@ pub fn leaks_example(sentence: &str, real: &str) -> bool {
     })
 }
 
+/// Whether `needle` occurs in `haystack` on word boundaries.
+pub fn has_words(haystack: &str, needle: &str) -> bool {
+    contains_word(haystack, needle)
+}
+
 fn contains_word(haystack: &str, needle: &str) -> bool {
     haystack.match_indices(needle).any(|(i, _)| {
         let before = haystack[..i].chars().next_back();

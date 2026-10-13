@@ -375,7 +375,8 @@ pub fn validate(raw: &str, utterance: &str, context: &str) -> Result<Understandi
     u.people.retain_mut(|p| {
         p.name = p.name.trim().to_owned();
         let named = !p.name.is_empty();
-        if named && !hay.contains(&p.name.to_lowercase()) {
+        // As whole words: "Al" is not in "I always come here".
+        if named && !crate::voice::has_words(&hay, &p.name.to_lowercase()) {
             tracing::info!(name = p.name, "understand: invented name dropped");
             return false;
         }
@@ -577,6 +578,27 @@ pub fn title_word(w: &str) -> Option<&'static str> {
     })
 }
 
+/// "his name is Joel", "she's called Mira", "her name's Anu": the name.
+pub fn third_person_name(text: &str) -> Option<String> {
+    let w = words(text);
+    let s: Vec<&str> = w.iter().map(String::as_str).collect();
+    let s: Vec<&str> = s
+        .iter()
+        .copied()
+        .skip_while(|x| matches!(*x, "and" | "oh" | "so" | "well" | "yes" | "yeah"))
+        .collect();
+    let rest = match s.as_slice() {
+        ["his" | "her" | "their", "name", "is", rest @ ..]
+        | ["his" | "her" | "their", "name's", rest @ ..]
+        | ["he's" | "she's", "called", rest @ ..]
+        | ["he" | "she", "is", "called", rest @ ..]
+        | ["he's" | "she's", "named", rest @ ..] => rest,
+        _ => return None,
+    };
+    let n = rest.first()?;
+    (rest.len() <= 2 && name_word(n)).then(|| cap(n))
+}
+
 /// Whether `name` appears capitalised in `text` as said (a transcriber
 /// capitalises names): "I'm Anil Kapoor, here for..." yes, "I'm starving
 /// today" no.
@@ -647,8 +669,57 @@ fn relation_statement(s: &[&str]) -> Option<Understanding> {
     let s: Vec<&str> = s
         .iter()
         .copied()
-        .skip_while(|w| matches!(*w, "and" | "also" | "so" | "oh" | "well"))
+        .skip_while(|w| {
+            matches!(
+                *w,
+                "and" | "also" | "so" | "oh" | "well" | "no" | "actually" | "sorry" | "nope"
+            )
+        })
         .collect();
+    // A chain: "Mrs Bose is my friend Rohan's mother" -- Rohan is my
+    // friend, and Mrs Bose is Rohan's mother.
+    let chain = |who: String, rel: &str, owner: &str, rel2: &str| {
+        let mut u = tell(cap(owner), rel);
+        u.people.push(Mention {
+            name: who,
+            relation_to_speaker: None,
+            reference: Some(format!("{}'s {rel2}", cap(owner))),
+        });
+        u
+    };
+    let possessive = |w: &str| {
+        w.strip_suffix("'s")
+            .filter(|o| name_word(o))
+            .map(str::to_owned)
+    };
+    let is_rel = |w: &str| crate::people::Relation::from_word(w).is_some();
+    match s.as_slice() {
+        [title, name, "is", "my", rel, owner, rel2, ..]
+            if title_word(title).is_some()
+                && name_word(name)
+                && is_rel(rel)
+                && is_rel(rel2)
+                && possessive(owner).is_some() =>
+        {
+            return Some(chain(
+                format!("{} {}", title_word(title).unwrap_or_default(), cap(name)),
+                rel,
+                &possessive(owner).unwrap_or_default(),
+                rel2,
+            ));
+        }
+        [name, "is", "my", rel, owner, rel2, ..]
+            if name_word(name) && is_rel(rel) && is_rel(rel2) && possessive(owner).is_some() =>
+        {
+            return Some(chain(
+                cap(name),
+                rel,
+                &possessive(owner).unwrap_or_default(),
+                rel2,
+            ));
+        }
+        _ => {}
+    }
     match s.as_slice() {
         ["my", rel, "is", name, ..] | ["my", rel, name, ..]
             if crate::people::Relation::from_word(rel).is_some()
@@ -865,6 +936,10 @@ pub fn rules(text: &str) -> Option<Understanding> {
     if [
         "mera naam kya hai",
         "mera naam kya",
+        "what should you call me",
+        "what do you call me",
+        "what will you call me",
+        "what are you going to call me",
         "what's my name",
         "whats my name",
         "what is my name",
