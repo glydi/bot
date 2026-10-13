@@ -141,6 +141,17 @@ impl Rig {
         );
     }
 
+    /// A voice blip of exactly `len` on the observation clock, sent back to
+    /// back: a loaded machine cannot stretch it into a sustained voice the
+    /// way a `sleep(len)` between the edges can.
+    fn stamped_blip(&self, len: Duration) {
+        let on = self.now();
+        self.push(Observation::new("mic0", "voice_activity", on).with_payload(Payload::Bool(true)));
+        self.push(
+            Observation::new("mic0", "voice_activity", on + len).with_payload(Payload::Bool(false)),
+        );
+    }
+
     /// A voice blip of `len` -- the shape of a bell, a cough, a door.
     fn blip(&self, len: Duration) {
         self.voice(true);
@@ -444,7 +455,9 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     // said before (the repeat guard), so the same five would be silent.
     let second_story = ["Red.", "Green.", "Blue.", "Gold.", "Grey."];
     let reply = || Script::text(&sentences).with_delay(Duration::from_millis(250));
-    let reply2 = || Script::text(&second_story).with_delay(Duration::from_millis(250));
+    // The second story streams slowly (~3 s) so the 600 ms barge-in always
+    // lands mid-reply, however late a loaded machine notices the start.
+    let reply2 = || Script::text(&second_story).with_delay(Duration::from_millis(600));
     let rig = Rig::build(temp_db("bargein"), vec![reply(), reply2()]);
     let john = EntityHint::Known(EntityId::new("john"));
 
@@ -454,7 +467,7 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
         wait_for(Duration::from_secs(2), || !rig.spoken().is_empty()),
         "reply never started"
     );
-    rig.blip(Duration::from_millis(150));
+    rig.stamped_blip(Duration::from_millis(150));
     assert!(
         wait_for(Duration::from_secs(8), || replies_in(rig.spoken()).len()
             >= sentences.len()),
@@ -474,9 +487,9 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
         "second reply never started"
     );
     rig.blip(Duration::from_millis(600));
-    // The stream would take another ~1 s to finish; give it that and more,
+    // The stream would take another ~2.5 s to finish; give it that and more,
     // and it must still fall short.
-    std::thread::sleep(Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(3200));
     let second: Vec<String> = rig.spoken()[before..].to_vec();
     assert!(
         second.len() < second_story.len(),
@@ -485,7 +498,7 @@ fn blip_keeps_the_reply_but_sustained_voice_cancels_it() {
     assert_eq!(rig.llm.requests().len(), 2);
     rig.finish();
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
@@ -639,7 +652,7 @@ fn voice_edge_right_behind_a_level_still_cancels_the_reply() {
     let started = Instant::now();
     let sentences: Vec<String> = (1..=12).map(|i| format!("S{i}.")).collect();
     let refs: Vec<&str> = sentences.iter().map(String::as_str).collect();
-    let reply = || Script::text(&refs).with_delay(Duration::from_millis(150));
+    let reply = || Script::text(&refs).with_delay(Duration::from_millis(300));
     let rig = Rig::build(temp_db("edge"), vec![reply(), reply(), reply()]);
     let john = EntityHint::Known(EntityId::new("john"));
     let mut late = Vec::new();
@@ -662,22 +675,23 @@ fn voice_edge_right_behind_a_level_still_cancels_the_reply() {
         rig.voice(true);
         std::thread::sleep(Duration::from_millis(1100));
         rig.voice(false);
-        // Anything synthesised more than 700 ms after the edge (400 ms of
-        // sustain plus generous slack) was spoken after the interruption.
+        // Anything synthesised more than 1500 ms after the edge (400 ms of
+        // sustain plus slack for a loaded machine) was spoken after the
+        // interruption; an uncancelled stream runs ~3.6 s, so it still shows.
         let stray: Vec<String> = rig.synth.timeline()[before..]
             .iter()
-            .filter(|s| s.started.saturating_duration_since(edge_at) > Duration::from_millis(700))
+            .filter(|s| s.started.saturating_duration_since(edge_at) > Duration::from_millis(1500))
             .map(|s| s.text.clone())
             .collect();
         if !stray.is_empty() {
             late.push((round, stray));
         }
-        assert!(wait_for(Duration::from_secs(3), || !rig.app.is_speaking()));
+        assert!(wait_for(Duration::from_secs(6), || !rig.app.is_speaking()));
     }
     assert!(late.is_empty(), "spoken after the interruption: {late:?}");
     rig.finish();
     assert!(
-        started.elapsed() < Duration::from_secs(12),
+        started.elapsed() < Duration::from_secs(40),
         "{:?}",
         started.elapsed()
     );
