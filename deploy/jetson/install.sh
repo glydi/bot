@@ -9,6 +9,7 @@
 #     GLYDI_TARGET_CPU=cortex-a78ae ...install.sh   # tune rustc for this board
 #     GLYDI_OLLAMA_KEEP_ALIVE=30m   ...install.sh   # instead of "resident for good"
 #     GLYDI_SKIP_MODELFILE=1        ...install.sh   # do not (re)create glydi-1.5b
+#     GLYDI_SKIP_GPU_ORT=1          ...install.sh   # stay on the CPU onnxruntime
 #
 # Idempotent: every step checks for its result first, so re-running after
 # a dropped download or a failed build only redoes what is missing. Then
@@ -127,34 +128,11 @@ else
 fi
 ls -l "$ORT_DIR"
 
-# TODO(jetson-gpu): this is the CPU execution provider. ONNX Runtime with
-# the CUDA / TensorRT EPs for Jetson is NOT in the microsoft/onnxruntime
-# release tarballs (those are x86_64 CUDA only). NVIDIA publishes Jetson
-# builds as Python wheels on the Jetson Zoo / jetson-ai-lab index:
-#
-#     https://elinux.org/Jetson_Zoo#ONNX_Runtime
-#     https://pypi.jetson-ai-lab.io/jp6/cu126        (JetPack 6.x, CUDA 12.6)
-#     onnxruntime_gpu-<ver>-cp310-cp310-linux_aarch64.whl
-#
-# but a wheel ships the provider libraries
-# (onnxruntime/capi/libonnxruntime_providers_{cuda,tensorrt,shared}.so)
-# and a pybind module, not a standalone libonnxruntime.so with the C API
-# that `ort` needs. Getting the GPU EP means building ORT on the Jetson
-# with --build_shared_lib --use_cuda --use_tensorrt
-# (https://onnxruntime.ai/docs/build/eps.html#nvidia-jetson-tx1tx2nanoxavierorin,
-# ~2 h, needs a swap file) and pointing ORT_DYLIB_PATH at that .so, with
-# libonnxruntime_providers_cuda.so and _shared.so beside it. The Rust side
-# is done: `ort` is built with the `cuda` and `tensorrt` features, and
-# GLYDI_TTS_GPU=1 / GLYDI_STT_GPU=1 / GLYDI_VISION_GPU=1 put Kokoro,
-# Parakeet's encoder and the vision models on the CUDA provider; GLYDI_TRT=1
-# puts TensorRT (FP16, engines cached under models/.../trt_cache) in front
-# of it (`rust/accel` is the one place the choice is made). Measured
-# on an RTX 5060: a Kokoro chunk 130-320 ms against 440-1070 ms
-# on a CPU). With the CPU-only runtime those flags fall back to the CPU
-# with a logged warning. Until the build is done the CPU EP is what
-# ships: SCRFD + MobileFaceNet + Parakeet int8 + Kokoro all run on the
-# six A78 cores, and vision stays at a lower frame rate than the Mac's
-# 15 fps.
+# GPU: this is the CPU library, the fallback that always works. The CUDA +
+# TensorRT one (from the jetson-ai-lab onnxruntime-gpu wheel, which ships a
+# real libonnxruntime.so with the C API) is step 8b below,
+# deploy/jetson/install-gpu-ort.sh; build-ort-gpu.sh builds it on the board
+# if the wheel ever goes away.
 
 # --- 4. ollama ---------------------------------------------------------------
 
@@ -340,13 +318,34 @@ log "build: cargo build --release -p glydi --features vision,kokoro (jobs=$CARGO
 (cd "$REPO/rust" && cargo build --release -p glydi --features vision,kokoro)
 BIN="$CARGO_TARGET_DIR/release/glydi"
 
+# --- 8b. GPU onnxruntime ----------------------------------------------------
+
+# CUDA + TensorRT onnxruntime into models/onnxruntime/linux-aarch64-gpu,
+# self-test, then .env's ORT_DYLIB_PATH and GLYDI_{STT,TTS,VISION}_GPU /
+# GLYDI_TRT flip to it. Any failure leaves the CPU library and the flags
+# at 0. Then warm-trt.sh builds the TensorRT engines (minutes, once) so the
+# first visitor does not. GLYDI_SKIP_GPU_ORT=1 skips both;
+# GLYDI_SKIP_TRT_WARM=1 skips only the warm-up.
+ORT_EP="CPU EP, $ORT_VERSION"
+if [ "${GLYDI_SKIP_GPU_ORT:-0}" = "1" ]; then
+    log "GPU onnxruntime: skipped (GLYDI_SKIP_GPU_ORT=1)"
+else
+    "$HERE/install-gpu-ort.sh" || echo "install-gpu-ort.sh failed; staying on the CPU library"
+    if grep -q '^ORT_DYLIB_PATH=.*linux-aarch64-gpu' "$REPO/.env"; then
+        ORT_EP="CUDA/TensorRT EP: models/onnxruntime/linux-aarch64-gpu"
+        if [ "${GLYDI_SKIP_TRT_WARM:-0}" != "1" ]; then
+            "$HERE/warm-trt.sh" || echo "warm-trt.sh failed; engines will build on first use"
+        fi
+    fi
+fi
+
 # --- 9. summary + check ------------------------------------------------------
 
 log "summary"
 cat <<SUMMARY
   repo          $REPO
   binary        $BIN
-  onnxruntime   $ORT_DIR (CPU EP, $ORT_VERSION)
+  onnxruntime   $ORT_DIR ($ORT_EP)
   ollama        $MODEL_GLYDI (default, num_ctx 2048), $MODEL_SMALL, $MODEL_LARGE
   ollama env    /etc/systemd/system/ollama.service.d/glydi.conf
   config        $REPO/.env

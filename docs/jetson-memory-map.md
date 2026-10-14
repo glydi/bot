@@ -62,18 +62,42 @@ for exactly this: GPU flags 0, `GLYDI_PARTIAL_MS=0`, buffalo_s, no pose.
 | headroom of 7 400 (page cache for the GGUF and ONNX files, KV growth, load peaks) | 2 250-3 250 |
 | with `qwen2.5:3b` instead | +800: headless 4 950 (headroom 2.45 GB), GNOME 5 950 (1.45 GB: too tight) |
 
-### After the TensorRT onnxruntime build (target)
+### GPU provider (install-gpu-ort.sh; estimates until measured on the Orin)
 
-Moving Parakeet's encoder, Kokoro and the vision graphs to CUDA/TRT
-adds one CUDA context + cuDNN/cuBLAS/TRT workspaces in glydi (~450 MB)
-and TRT engines (~same as the weights); the CPU-side arenas shrink by
-about as much. Net memory: roughly +300-500 MB, i.e. ~4.7 GB headless.
+The library: onnxruntime-gpu 1.23.0 from the jetson-ai-lab wheel
+(CUDA 12.6, cuDNN 9, TensorRT 10), in models/onnxruntime/linux-aarch64-gpu.
+Files: libonnxruntime.so 24 MB, providers_cuda 134 MB, providers_tensorrt
+0.9 MB (mapped, mostly page cache). The GPU shares the 8 GB pool, so
+"GPU memory" below is the same RAM the totals count.
+
+| item | MB (est) | note |
+| --- | ---: | --- |
+| CUDA context in glydi (lazy module loading, the 12.x default) | 250-400 | one per process, shared by every session |
+| cuDNN 9 + cuBLAS/cuBLASLt handles and kernels | 200-400 | loaded on the first CUDA session |
+| Kokoro v1.0: TRT FP16 engine (82 M params) + activations | 200-300 | replaces ~470 MB of CPU arena |
+| Parakeet encoder: the int8 export's MatMulInteger/DynamicQuantize nodes are not TensorRT's, so most of it runs on the CUDA EP with int8 weights | 650-900 | replaces ~750 MB CPU; an fp16 engine of the 0.6 B encoder would be ~1 200 |
+| SCRFD 500m + MobileFaceNet engines | 30-60 | |
+| TRT builder workspace during an engine build | up to 1 024 | rust/accel caps it; only while building, i.e. warm-trt.sh at install, not in service |
+| ORT CUDA arena per session (BFC, grows to the peak, never shrinks) | 50-300 each | no `gpu_mem_limit` set in rust/accel yet |
+
+Net: roughly +400-700 MB over the CPU-provider totals, ~4.6-4.9 GB headless,
+inside the 7.4 GB. The risky moment is an engine build at run time (a new
+input shape) with Ollama resident: the 1 GB workspace on top. warm-trt.sh
+moves the common shapes to install time. If `tegrastats` shows RAM above
+~6.5 GB in service: GLYDI_TRT=0 (CUDA EP only, no builds), or
+GLYDI_STT_GPU=0 (Parakeet back to the CPU, the biggest graph).
+
 What it buys (est, scaled from the RTX 5060 by ~8-10x lower GPU
 throughput, FP16 TRT): Parakeet 3 s clip ~100-200 ms, a partial tick
 ~60-150 ms (so `GLYDI_PARTIAL_MS=800` becomes affordable, 400 maybe),
 Kokoro chunk ~200-400 ms, buffalo_l possible (R50 FP16 ~15-25 ms). It
 also means the LLM and the ONNX graphs share one GPU: watch TTS chunk
 times while Ollama generates (`tegrastats` GR3D at 99 %).
+
+Follow-ups for rust/accel (not done, measure first): a per-session
+`gpu_mem_limit` and `arena_extend_strategy=kSameAsRequested`; a way to
+keep Parakeet on the CUDA EP while Kokoro/vision use TensorRT (today
+GLYDI_TRT promotes every GPU model).
 
 ## The one-resident-LLM rule
 
@@ -118,7 +142,7 @@ conversation quality on the board says so.
 | deep model / any second LLM | 7B = 4.7 GB | `GLYDI_DEEP_MODEL=off`, one-model rule |
 | GNOME kiosk + qwen2.5:3b | 1.3 GB headroom | cage kiosk, or glydi-1.5b |
 | Kokoro fp32 on CPU for the first clause | 0.5-0.9 s alone eats the 1 s budget | measure; kokoro int8 model as a CPU option (fixer list); TRT build |
-| GPU flags set without the GPU library | failed provider registration per model, misleading logs | GPU flags 0 until the TRT build lands |
+| GPU flags set without the GPU library | failed provider registration per model, misleading logs | install-gpu-ort.sh sets the flags only after its self-test passes; `--cpu` resets |
 
 ## Not adopted from the earlier proposal, and why
 

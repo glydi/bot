@@ -16,6 +16,16 @@ docs/jetson-memory-map.md. Board config: deploy/jetson/env.jetson.
 - [x] CI: workspace-wide `cargo check` for aarch64 (cross) and a native
       arm64 release build of the Jetson feature set (`jetson-build` job,
       runs on GitHub's `ubuntu-22.04-arm`; not runnable on the Windows PC).
+- [x] GPU onnxruntime source found and checked on the PC (2026-10-14):
+      the jetson-ai-lab `jp6/cu126` onnxruntime_gpu 1.23.0 and 1.24.0
+      cp310 aarch64 wheels contain `onnxruntime/capi/libonnxruntime.so.1.2x.0`
+      (ELF aarch64, SONAME libonnxruntime.so.1, RUNPATH $ORIGIN, exports
+      `OrtGetApiBase` and the CUDA/TensorRT append functions) plus
+      providers_{cuda,tensorrt,shared}.so. NEEDED: cudart/cublas/cublasLt
+      .so.12, cufft .so.11, cudnn .so.9, nvinfer/nvonnxparser .so.10;
+      highest GLIBC 2.34 (22.04 has 2.35). Build info: 1.23.0 cuda 12.6,
+      1.24.0 cuda 12.9, so 1.23.0 is the default. `ort` 2.0.0-rc.13 with no
+      `api-*` feature needs >= 1.17. sha256 pinned in install-gpu-ort.sh.
 - [x] Memory totals fit on paper: ~4.3 GB headless, ~4.4 GB cage, ~5.3 GB
       GNOME, of ~7.4 GB usable.
 
@@ -30,9 +40,23 @@ docs/jetson-memory-map.md. Board config: deploy/jetson/env.jetson.
 - [ ] Latency on the CPU provider: Parakeet final pass for 1/3/5 s,
       Kokoro first clause, LLM TTFT and tok/s (`glydi check`, bench crate,
       `scripts/simulate.py`). Target: first audio under 1 s.
-- [ ] onnxruntime CUDA + TensorRT built on the board (TODO item 13), then
-      `ORT_DYLIB_PATH` to it, `GLYDI_{STT,TTS,VISION}_GPU=1 GLYDI_TRT=1`,
-      engines cached, re-measure; then try `GLYDI_PARTIAL_MS=800` (then 400).
+- [ ] GPU onnxruntime on the board: `deploy/jetson/install-gpu-ort.sh`
+      (install.sh step 8b) passes: ldd finds every CUDA/cuDNN/TRT library,
+      the C API reports 1.23.0, `gpu_ort_selftest.py` shows
+      CUDAExecutionProvider for each model and the TensorRT EP builds an
+      engine; .env then has ORT_DYLIB_PATH=...linux-aarch64-gpu and the
+      four flags at 1. If the 12.6-vs-wheel CUDA mismatch or anything else
+      fails: `build-ort-gpu.sh` (~2 h, swap file) then
+      `GLYDI_ORT_GPU_SOURCE=build install-gpu-ort.sh`.
+- [ ] `glydi run` log says "Loaded ONNX Runtime dylib ... linux-aarch64-gpu;
+      version '1.23.0'" and no "falling back to CPU" for any model.
+- [ ] `deploy/jetson/warm-trt.sh`: the "cached" pass takes seconds per
+      model (engines hit); `--list` sizes; re-run with `--clear` after any
+      JetPack/TensorRT/onnxruntime/model change.
+- [ ] Re-measure with the GPU: Parakeet final pass, Kokoro first clause,
+      vision frame, memory (map's GPU table); then try
+      `GLYDI_PARTIAL_MS=800` (then 400). Parakeet int8 under TensorRT may
+      be slower than on the CUDA EP alone: compare GLYDI_TRT=0/1.
 - [ ] GPU contention: Kokoro chunk times while Ollama generates.
 - [ ] Thermals: `tegrastats` temps and clocks over a 30 min busy run in
       the enclosure, in the board's 15 W / 25 W (Super) mode; no throttling.

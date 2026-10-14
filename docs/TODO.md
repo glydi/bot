@@ -53,3 +53,10 @@ env.jetson: GPU flags 0 until the TRT build, GLYDI_PARTIAL_MS=0, RSS 2816/3584, 
 Code follow-ups for rust/: aarch64 default buffalo_s; CPU-aware/windowed partials; whisper fallback lazy;
 speculative reply aborted must cancel the Ollama stream (one slot); warn when chat/understand/memory model
 differs from the local model on aarch64; optional kokoro int8 for the CPU provider.
+
+## Jetson GPU onnxruntime (2026-10-14)
+Item 13 answered without building: the jetson-ai-lab onnxruntime_gpu wheel (jp6/cu126, 1.23.0) ships a
+real libonnxruntime.so with the C API; deploy/jetson/install-gpu-ort.sh (install.sh step 8b, opt-out
+GLYDI_SKIP_GPU_ORT=1) extracts it, self-tests, flips .env; warm-trt.sh builds engines; build-ort-gpu.sh
+is the on-board fallback. Board checks: docs/jetson-readiness.md. rust/accel follow-ups: gpu_mem_limit,
+Parakeet on CUDA EP while the rest use TRT.
