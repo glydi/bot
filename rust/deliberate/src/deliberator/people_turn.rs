@@ -484,8 +484,28 @@ impl Session {
             && understand::asks(text)
             && (intent != "everyday" || reasons_about(text))
             && refers_to_told(text, &self.visit);
+        // Anything the code can reason out exactly from this visit.
+        let solvable = matches!(
+            intent,
+            "ask_about_me"
+                | "ask_about_person"
+                | "out_of_zone"
+                | "everyday"
+                | "chit_chat"
+                | "unclear"
+        ) && understand::asks(text)
+            && crate::reason::answer(
+                text,
+                &self
+                    .visit
+                    .exchanges
+                    .iter()
+                    .map(|e| e.heard.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .is_some();
         let labelled = intent == "deep";
-        if unsure_question || rule_deep || over_told {
+        if unsure_question || rule_deep || over_told || solvable {
             intent = "deep";
         }
         // The fallback (no model answer) is small talk on purpose: a
@@ -821,6 +841,22 @@ impl Session {
                 Some("Okay, I've forgotten you. Bye for now!".to_owned())
             }
             "everyday" => Some(everyday_answer(text)),
+            // Times, days, ages, counts, allergies: worked out in code
+            // from what they said this visit, exact and instant.
+            "deep"
+                if let Some(a) = crate::reason::answer(
+                    text,
+                    &self
+                        .visit
+                        .exchanges
+                        .iter()
+                        .map(|e| e.heard.clone())
+                        .collect::<Vec<_>>(),
+                ) =>
+            {
+                tracing::info!(answer = a, "slow path answered in code");
+                Some(a)
+            }
             "deep" => match self
                 .deep_line(text, me.as_ref(), my_name.as_deref(), obs, cancel)
                 .await

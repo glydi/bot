@@ -39,6 +39,7 @@ pub mod learn;
 pub mod mock;
 pub mod people;
 pub mod prompt;
+pub mod reason;
 pub mod school_link;
 pub mod scope;
 pub mod sentence;
