@@ -1849,7 +1849,9 @@ pub fn is_fragment_utterance(text: &str) -> bool {
                 | "her"
         )
     };
-    if (3..=8).contains(&w.len()) && w.last().is_some_and(|l| dangling(l)) {
+    // Spelled letters at the end ("M I N A") are not a cut-off sentence.
+    let spelled = w.iter().rev().take(2).all(|x| x.chars().count() == 1);
+    if (3..=8).contains(&w.len()) && !spelled && w.last().is_some_and(|l| dangling(l)) {
         return true;
     }
     if w.len() > 3 {

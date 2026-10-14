@@ -1221,6 +1221,20 @@ pub fn rules(text: &str) -> Option<Understanding> {
         });
         return Some(u);
     }
+    // "not Meena, Mina, M I N A" / "not Meena, Mina": the second name.
+    if s.first() == Some(&"not")
+        && s.len() >= 3
+        && name_word(s[1])
+        && let Some(n) = crate::voice::spelled_name(text, false)
+            .or_else(|| s.get(2).filter(|n| name_word(n)).map(|n| cap(n)))
+    {
+        let mut u = Understanding::of("correct_name");
+        u.people.push(Mention {
+            name: n,
+            ..Mention::default()
+        });
+        return Some(u);
+    }
     if has("that's not my name")
         || has("thats not my name")
         || has("my name is not")
@@ -1425,7 +1439,17 @@ pub fn rules(text: &str) -> Option<Understanding> {
                 return Some(u);
             }
             (Some(n), None) if s.len() <= 5 || n.split(' ').all(|p| capitalised_in(text, p)) => {
-                let mut u = Understanding::of("tell_name");
+                // "no no, my name is Rahul not Raju": a correction.
+                let w0 = words(text);
+                let corrects = matches!(
+                    w0.first().map(String::as_str),
+                    Some("no" | "actually" | "sorry" | "nope")
+                ) || w0.iter().any(|x| x == "not");
+                let mut u = Understanding::of(if corrects {
+                    "correct_name"
+                } else {
+                    "tell_name"
+                });
                 u.people.push(Mention {
                     name: n.clone(),
                     ..Mention::default()
