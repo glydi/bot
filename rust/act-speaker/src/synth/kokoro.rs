@@ -134,6 +134,23 @@ pub enum Optimize {
 /// than real time is a bad trade. See the table in that test.
 pub const DEFAULT_INTRA_THREADS: usize = 2;
 
+/// `GLYDI_KOKORO_INT8=1`: the int8-quantised graph
+/// (`kokoro-v1.0.int8.onnx`, 92 MB instead of 325 MB). Same voices file.
+/// A memory option, not a speed one: on the PC's CPU (Core Ultra 5 225F,
+/// 2026-10-14, live bot running) first audio was ~1.7x slower (12 words
+/// 2.40 s vs 1.38 s; 4 words 1.21 s vs 0.84 s) with the same audio
+/// lengths. Measure on the Orin before choosing it there.
+pub const INT8_ENV: &str = "GLYDI_KOKORO_INT8";
+
+/// The graph file in the model directory.
+pub fn model_file(int8: bool) -> &'static str {
+    if int8 {
+        "kokoro-v1.0.int8.onnx"
+    } else {
+        "kokoro-v1.0.onnx"
+    }
+}
+
 /// The variable that moves synthesis to the GPU: `GLYDI_TTS_GPU=1`
 /// (`GLYDI_TRT=1` on top for `TensorRT`; see [`accel`]).
 pub const GPU_ENV: &str = "GLYDI_TTS_GPU";
@@ -307,7 +324,9 @@ impl Kokoro {
     /// (`KokoroTTS._load`), and a model that cannot run should fail here.
     pub fn open(cfg: &KokoroConfig) -> Result<Self, SynthError> {
         let dir = cfg.model_dir.clone().unwrap_or_else(default_model_dir);
-        let model = dir.join("kokoro-v1.0.onnx");
+        let model = dir.join(model_file(
+            std::env::var(INT8_ENV).is_ok_and(|v| v.trim() == "1"),
+        ));
         let voices = dir.join("voices-v1.0.bin");
         for p in [&model, &voices] {
             if !p.is_file() {

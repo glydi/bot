@@ -133,3 +133,11 @@ conversation quality on the board says so.
 - **llama-server instead of Ollama.** The equivalent flags are set on
   the Ollama service instead (ollama-override.conf) and `num_ctx 2048`
   in deploy/jetson/Modelfile.
+
+### Kokoro int8 (option, measured 2026-10-14 on the PC CPU)
+
+`GLYDI_KOKORO_INT8=1` loads `kokoro-v1.0.int8.onnx` (92 MB, fetch with
+`scripts/fetch-models.sh kokoro-int8`) instead of the 325 MB fp32 graph:
+~230 MB less RSS, but first audio ~1.7x slower on the x86 CPU (12 words
+2.40 s vs 1.38 s). Use only if memory is the binding limit; measure on
+the Orin first.

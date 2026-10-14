@@ -37,6 +37,7 @@ parakeet|$models/parakeet/vocab.txt|$HF/istupakov/parakeet-tdt-0.6b-v2-onnx/reso
 parakeet|$models/parakeet/config.json|$HF/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/main/config.json
 kokoro|$kokoro/kokoro-v1.0.onnx|https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
 kokoro|$kokoro/voices-v1.0.bin|https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+kokoro-int8|$kokoro/kokoro-v1.0.int8.onnx|https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx
 yamnet|$models/yamnet/yamnet.onnx|$HF/zeropointnine/yamnet-onnx/resolve/main/yamnet.onnx
 yamnet|$models/yamnet/yamnet_class_map.csv|$HF/zeropointnine/yamnet-onnx/resolve/main/yamnet_class_map.csv
 vision|$models/vision/yolov5n.onnx|https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx
