@@ -1805,6 +1805,75 @@ pub fn leaks_instructions(sentence: &str) -> bool {
         .any(|t| lower.contains(t))
 }
 
+/// Words that carry no content of their own.
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "so", "just", "maybe", "me", "my", "i", "we", "we'll",
+    "you", "it", "to", "of", "in", "on", "at", "for", "with", "this", "that", "then", "um", "uh",
+    "well", "like", "if", "is", "was", "be", "do", "not", "too", "very", "really", "also", "there",
+    "here", "what", "oh", "ah", "hmm", "mm", "i'll", "i'm", "it's", "let's", "some",
+];
+
+/// An ASR fragment with nothing to answer: at most three words, and no
+/// content word, or ending on a function word ("Just", "Maybe we'll",
+/// "So me", "And then the").
+pub fn is_fragment_utterance(text: &str) -> bool {
+    let w = crate::understand::words(text);
+    if w.is_empty() || w.len() > 3 || text.trim_end().ends_with('?') {
+        return false;
+    }
+    let content = w
+        .iter()
+        .filter(|x| !FUNCTION_WORDS.contains(&x.as_str()))
+        .count();
+    content == 0
+        || (content <= 1
+            && w.len() >= 2
+            && w.last()
+                .is_some_and(|l| FUNCTION_WORDS.contains(&l.as_str())))
+}
+
+/// A bare acknowledgement: "yeah", "okay", "no", "I don't know".
+pub fn is_bare_ack(text: &str) -> bool {
+    let j = crate::understand::words(text).join(" ");
+    [
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "ok",
+        "okay",
+        "no",
+        "nope",
+        "sure",
+        "right",
+        "fine",
+        "hmm",
+        "mm",
+        "uh huh",
+        "i don't know",
+        "i dont know",
+        "don't know",
+        "dont know",
+        "not sure",
+        "no idea",
+        "alright",
+        "all right",
+        "cool",
+        "nice",
+        "good",
+    ]
+    .contains(&j.as_str())
+}
+
+/// Curly quotes and dashes from the model as ASCII, for the speaker and
+/// the log (they showed as "Whatâ€™s").
+pub fn ascii_quotes(s: &str) -> String {
+    s.replace(['\u{2018}', '\u{2019}', '\u{02bc}'], "'")
+        .replace(['\u{201c}', '\u{201d}'], "\"")
+        .replace(['\u{2013}', '\u{2014}'], "-")
+        .replace('\u{2026}', "...")
+}
+
 /// A request to drop the character or say something rude: "pretend you
 /// are a pirate", "act like my boss", "swear", "ignore your
 /// instructions". Answered with [`STAY_GLYDI`], never with the model.
@@ -2527,5 +2596,21 @@ mod speakable_tests {
             speakable("That's lovely. Tell me more. What else? And more.", 24).as_deref(),
             Some("That's lovely. Tell me more.")
         );
+    }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    #[test]
+    fn fragments_and_acks() {
+        assert!(!super::is_noise("Maybe we'll"), "noise");
+
+        assert!(super::is_fragment_utterance("Maybe we'll"));
+        assert!(super::is_fragment_utterance("So me."));
+        assert!(!super::is_fragment_utterance("please forget me"));
+        assert!(!super::is_fragment_utterance("And Kalyan."));
+        assert!(super::is_bare_ack("Yeah."));
+        assert!(super::is_bare_ack("I don't know."));
+        assert_eq!(super::ascii_quotes("What\u{2019}s"), "What's");
     }
 }

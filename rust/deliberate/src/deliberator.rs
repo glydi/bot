@@ -2263,7 +2263,7 @@ impl Session {
 
     fn say(&self, sentence: String) {
         // The hard guard: no placeholder or raw id is ever said aloud.
-        let safe = common::spoken_safe(&sentence);
+        let safe = common::spoken_safe(&crate::voice::ascii_quotes(&sentence));
         let sentence = if safe == sentence { sentence } else { safe };
         if sentence.trim().is_empty() {
             tracing::info!("say dropped: nothing left after the id guard");

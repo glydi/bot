@@ -985,6 +985,21 @@ pub fn rules(text: &str) -> Option<Understanding> {
         }
     }
     if [
+        "i don't know",
+        "i dont know",
+        "don't know",
+        "dont know",
+        "no idea",
+        "not sure",
+        "i'm not sure",
+        "dunno",
+    ]
+    .iter()
+    .any(|p| joined == *p)
+    {
+        return Some(Understanding::of("chit_chat"));
+    }
+    if [
         "mera naam kya hai",
         "mera naam kya",
         "what should you call me",
@@ -1256,6 +1271,35 @@ pub fn rules(text: &str) -> Option<Understanding> {
     if deep_question(text) {
         return Some(Understanding::of("deep"));
     }
+    // A question about themselves is never a fact ("which class do I
+    // study in?" was stored as "studys in"): it asks what we know.
+    if asks(text) {
+        let t = format!(" {joined} ");
+        let about_me = [" do i ", " did i ", " am i ", " was i ", " have i ", " my "]
+            .iter()
+            .any(|p| t.contains(p));
+        let about_others = s.iter().any(|w| {
+            crate::people::Relation::from_word(w).is_some()
+                || (w.ends_with("'s")
+                    && !matches!(
+                        *w,
+                        "what's"
+                            | "who's"
+                            | "where's"
+                            | "when's"
+                            | "how's"
+                            | "it's"
+                            | "that's"
+                            | "there's"
+                            | "he's"
+                            | "she's"
+                            | "let's"
+                    ))
+        });
+        if about_me && !about_others && !out_of_zone(&joined) && !everyday(&joined) {
+            return Some(Understanding::of("ask_about_me"));
+        }
+    }
     if let Some(f) = own_fact(&s) {
         let mut u = Understanding::of("tell_fact");
         u.facts.push(f);
@@ -1391,6 +1435,92 @@ pub fn open_question(text: &str) -> bool {
 /// "my favourite colour is red", "I like cricket", "I have a dog called
 /// Bruno": the fact, third person ("favourite colour is red", "likes
 /// cricket", "has a dog called Bruno").
+/// "study" -> "studies", "teach" -> "teaches", "play" -> "plays".
+pub fn third_person(verb: &str) -> String {
+    let v = verb.trim();
+    if let Some(stem) = v.strip_suffix('y')
+        && !stem.ends_with(['a', 'e', 'i', 'o', 'u'])
+    {
+        return format!("{stem}ies");
+    }
+    if v.ends_with("sh")
+        || v.ends_with("ch")
+        || v.ends_with('s')
+        || v.ends_with('x')
+        || v.ends_with('o')
+    {
+        return format!("{v}es");
+    }
+    format!("{v}s")
+}
+
+/// Whether a fact's object says something: not empty, not only
+/// prepositions and articles ("in", "at the").
+fn has_object(object: &str) -> bool {
+    object.split_whitespace().any(|w| {
+        !matches!(
+            w,
+            "in" | "at" | "on" | "the" | "a" | "an" | "to" | "for" | "with" | "of" | "my" | "now"
+        )
+    })
+}
+
+/// "in sixth class" / "in class six" / "6th standard" -> "in class 6".
+pub fn class_number(object: &str) -> String {
+    const ORD: &[(&str, u32)] = &[
+        ("first", 1),
+        ("second", 2),
+        ("third", 3),
+        ("fourth", 4),
+        ("fifth", 5),
+        ("sixth", 6),
+        ("seventh", 7),
+        ("eighth", 8),
+        ("ninth", 9),
+        ("tenth", 10),
+        ("eleventh", 11),
+        ("twelfth", 12),
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+        ("eleven", 11),
+        ("twelve", 12),
+    ];
+    let w: Vec<&str> = object.split_whitespace().collect();
+    let is_class = |x: &str| matches!(x, "class" | "grade" | "standard" | "std");
+    if !w.iter().any(|x| is_class(x)) {
+        return object.to_owned();
+    }
+    let n = w.iter().find_map(|x| {
+        let x = x
+            .trim_end_matches("th")
+            .trim_end_matches("st")
+            .trim_end_matches("nd")
+            .trim_end_matches("rd");
+        x.parse::<u32>()
+            .ok()
+            .filter(|n| (1..=12).contains(n))
+            .or_else(|| {
+                ORD.iter()
+                    .find(|(o, _)| *o == x || o.trim_end_matches("th") == x)
+                    .map(|(_, n)| *n)
+            })
+    });
+    let lead = if w.first() == Some(&"in") { "in " } else { "" };
+    match n {
+        Some(n) => format!("{lead}class {n}"),
+        None => object.to_owned(),
+    }
+}
+
+/// The fact a statement about themselves gives (see the doc above `third_person`).
 pub fn own_fact(s: &[&str]) -> Option<String> {
     // "actually I moved, I work at the hospital now": the last clause
     // that says something is the fact.
@@ -1443,7 +1573,10 @@ fn own_fact_here(s: &[&str]) -> Option<String> {
             | "drive" | "cook" | "paint" | "collect" | "coach" | "run"),
             _,
             ..,
-        ] if s.len() <= 9 => Some(format!("{verb}s {}", rest(2)).replace("practices", "practises")),
+        ] if s.len() <= 9 => {
+            let object = rest(2);
+            has_object(&object).then(|| format!("{} {}", third_person(verb), class_number(&object)))
+        }
         ["i" | "we", "live" | "stay", "in" | "at" | "near", _, ..] if s.len() <= 9 => {
             Some(format!("lives {}", rest(2)))
         }
@@ -1458,12 +1591,13 @@ fn own_fact_here(s: &[&str]) -> Option<String> {
             _,
             ..,
         ] if s.len() <= 10 => Some(format!("lives in {}", rest(4))),
-        ["i'm" | "im", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 6 => {
-            Some(format!("is in class {}", rest(3)))
-        }
-        ["i", "am", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 7 => {
-            Some(format!("is in class {}", rest(4)))
-        }
+        ["i'm" | "im", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 6 => Some(
+            format!("is in {}", class_number(&format!("class {}", rest(3)))),
+        ),
+        ["i", "am", "in", "class" | "grade" | "standard", _, ..] if s.len() <= 7 => Some(format!(
+            "is in {}",
+            class_number(&format!("class {}", rest(4)))
+        )),
         _ => None,
     }
 }
@@ -1612,12 +1746,26 @@ mod tests {
 
     #[test]
     fn signed_sums_are_everyday() {
-        assert_eq!(rules("what is minus five plus three").unwrap().intent, "everyday");
-        assert_eq!(rules("what is 10 divided by 0").map(|u| u.intent).as_deref(), Some("everyday"));
-        assert_eq!(rules("hi, this is Kavya").unwrap().people[0].name, "Kavya");
-        assert_eq!(rules("this is Mrs Kapoor").unwrap().people[0].name, "Mrs Kapoor");
         assert_eq!(
-            rules("namaste beta, I am Kamala, Rohan's grandmother").unwrap().people[0].name,
+            rules("what is minus five plus three").unwrap().intent,
+            "everyday"
+        );
+        assert_eq!(
+            rules("what is 10 divided by 0")
+                .map(|u| u.intent)
+                .as_deref(),
+            Some("everyday")
+        );
+        assert_eq!(rules("hi, this is Kavya").unwrap().people[0].name, "Kavya");
+        assert_eq!(
+            rules("this is Mrs Kapoor").unwrap().people[0].name,
+            "Mrs Kapoor"
+        );
+        assert_eq!(
+            rules("namaste beta, I am Kamala, Rohan's grandmother")
+                .unwrap()
+                .people[0]
+                .name,
             "Kamala"
         );
     }
@@ -1687,7 +1835,7 @@ mod tests {
         );
         assert_eq!(
             f("sorry, I'm in class four now").as_deref(),
-            Some("is in class four")
+            Some("is in class 4")
         );
     }
 

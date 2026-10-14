@@ -83,26 +83,24 @@ pub const CLARIFY: &[&str] = &[
 pub const ASK_NAME: &str = "Hello! I'm Glydi. What's your name?";
 /// Asked when an unknown face stands beside someone known.
 pub const WHO_FRIEND: &str = "Who's your friend?";
+/// One "Sorry?" for a fragment per this long; silence otherwise.
+pub const FRAGMENT_GAP: Duration = Duration::from_secs(20);
 /// Chit-chat reply ceiling in words.
 pub const CHAT_WORDS: usize = 24;
 
 /// Intents whose decided line is said in the model's own words.
+/// Exact lines (live 2026-10-14: "What can you do for me?" lost its
+/// answer to "That's wonderful, I'm glad to help!"): the bot's own
+/// description, how it is, what it recalls, name confirmations, forgetting
+/// and the clarify line are said as decided.
 const REPHRASE: &[&str] = &[
     "greet",
     "bye",
-    "how_are_you",
-    "ask_about_bot",
-    "ask_about_me",
-    "ask_about_person",
     "tell_fact",
     "tell_relation",
-    "tell_name",
-    "correct_name",
-    "forget_me",
     // Not "everyday": sums, dates and times are said exactly (the model
     // turned "can't divide by zero" into "Got it, a tricky one").
     "out_of_zone",
-    "unclear",
 ];
 
 fn unix_now() -> f64 {
@@ -119,7 +117,22 @@ fn bare_name(text: &str) -> Option<String> {
         .filter(|x| {
             !matches!(
                 *x,
-                "it's" | "its" | "is" | "her" | "his" | "name" | "she's" | "he's"
+                "it's"
+                    | "its"
+                    | "is"
+                    | "her"
+                    | "his"
+                    | "name"
+                    | "she's"
+                    | "he's"
+                    | "and"
+                    | "so"
+                    | "um"
+                    | "uh"
+                    | "oh"
+                    | "well"
+                    | "i'm"
+                    | "me"
             )
         })
         .collect();
@@ -233,7 +246,13 @@ impl Session {
     /// Whether `id` had their hello in this visit (the visit's own flag,
     /// or a hello inside [`super::VISIT_GAP`]).
     pub(super) fn greeted_this_visit(&self, id: &EntityId) -> bool {
-        (self.visit.greeted && self.visit.key.as_ref().is_none_or(|k| k == id))
+        // A visit in progress had its hello, whoever it was said to: a
+        // track change or a Kalyan/Sunit flicker is not a new arrival
+        // (live: three hellos in three minutes to one person).
+        let active = self
+            .attention_at
+            .is_some_and(|t| self.clock.now().saturating_duration_since(t) < super::VISIT_GAP);
+        (self.visit.greeted && (active || self.visit.key.as_ref().is_none_or(|k| k == id)))
             || self
                 .greeted_at
                 .get(id)
@@ -371,6 +390,32 @@ impl Session {
             );
             self.ui("idle");
             return Ok(TurnEnd::Done);
+        }
+        // A fragment ("Just", "Maybe we'll", "So me") or a bare "yeah"
+        // with nothing asked: no model, no invented question. At most one
+        // short "Sorry?" per FRAGMENT_GAP, otherwise silence.
+        if self.visit.awaiting.is_none()
+            && self
+                .visit
+                .open_question
+                .as_deref()
+                .is_none_or(|q| q == "Sorry?")
+        {
+            let ack = crate::voice::is_bare_ack(text);
+            if ack || crate::voice::is_fragment_utterance(text) {
+                let now = self.clock.now();
+                let recent = self
+                    .visit
+                    .sorry_at
+                    .is_some_and(|t| now.saturating_duration_since(t) < FRAGMENT_GAP);
+                tracing::info!(text, ack, recent, "fragment: no model");
+                if !ack && !recent {
+                    self.visit.sorry_at = Some(now);
+                    self.speak_line("Sorry?".to_owned());
+                }
+                self.ui("idle");
+                return Ok(TurnEnd::Done);
+            }
         }
         let (mut me, mut my_name) = self.who(speaker);
         if self.visit.name.is_none() {
@@ -856,7 +901,19 @@ impl Session {
                         })
                         .filter(|(n, _)| *n > 0)
                         .max_by_key(|(n, _)| *n);
+                    let class = facts.iter().find_map(|f| {
+                        let w: Vec<&str> = f.split_whitespace().collect();
+                        w.windows(2)
+                            .find(|p| p[0] == "class" && p[1].chars().all(|c| c.is_ascii_digit()))
+                            .map(|p| p[1].to_owned())
+                    });
+                    let asks_class = ["class", "grade", "standard", "study", "studies"]
+                        .iter()
+                        .any(|k| words.iter().any(|w| w == k));
                     match best {
+                        _ if asks_class && class.is_some() => {
+                            format!("You're in class {}.", class.unwrap_or_default())
+                        }
                         Some((_, f)) => {
                             let said = second_person(f);
                             if said.starts_with("your ") {
@@ -1372,7 +1429,16 @@ impl Session {
     /// no prompt brackets, no repeat of a recent line.
     fn line_ok(&self, l: &str) -> bool {
         let real = self.real_context();
-        !crate::voice::leaks_instructions(l)
+        let low = l.to_lowercase();
+        // Never its own words quoted back ("What did you mean by \"this is
+        // Sunit\"?").
+        let quotes_own = l.contains(['"', '\u{201c}', '\u{201d}'])
+            || self.said.all().iter().rev().take(6).any(|s| {
+                let s = s.trim().trim_end_matches(['.', '!', '?']).to_lowercase();
+                s.split_whitespace().count() >= 3 && low.contains(&s)
+            });
+        !quotes_own
+            && !crate::voice::leaks_instructions(l)
             && !crate::voice::leaks_example(l, &real)
             && !l.contains('[')
             && !self.said.repeats(l)
@@ -2129,6 +2195,16 @@ fn second_person(fact: &str) -> String {
         *first = match first.as_str() {
             "has" => "have".to_owned(),
             "is" => "are".to_owned(),
+            x if x.ends_with("ies") && x.len() > 4 => format!("{}y", &x[..x.len() - 3]),
+            x if (x.ends_with("ches")
+                || x.ends_with("shes")
+                || x.ends_with("sses")
+                || x.ends_with("xes")
+                || x.ends_with("oes"))
+                && x.len() > 4 =>
+            {
+                x[..x.len() - 2].to_owned()
+            }
             x if x.ends_with('s') && x.len() > 3 => x[..x.len() - 1].to_owned(),
             x => x.to_owned(),
         };
@@ -2608,6 +2684,109 @@ mod tests {
         assert!(l.contains("Kalyan"), "{l}");
         assert_eq!(r.s.current_person.as_ref().map(|c| &c.0), Some(&kalyan));
         assert!(r.s.face_ambiguous.is_none());
+    }
+
+    /// The live conversation of 2026-10-14 07:41-07:48, line by line.
+    #[tokio::test]
+    #[allow(clippy::many_single_char_names)]
+    async fn live_conversation_2026_10_14() {
+        let mut r = rig(vec![]);
+        let l = r.say("Come to me.", None).await;
+        let _ = l;
+        // The name question, then "And Kalyan." is the name.
+        r.s.visit.awaiting = Some(Awaiting::Name);
+        let l = r.say("And Kalyan.", None).await;
+        assert!(l.contains("Kalyan"), "{l}");
+        let kalyan = r.facts.resolve_name("Kalyan").unwrap();
+        let k = &kalyan;
+        // What it can do: said exactly.
+        let l = r.say("What can you do for me?", Some(k)).await;
+        assert!(l.contains("greet everyone at the door"), "{l}");
+        // Fragments: one "Sorry?" then silence; a bare "Yeah." is silent.
+        r.clock.advance(Duration::from_secs(21));
+        let l = r.say("Just", Some(k)).await;
+        assert_eq!(l, "Sorry?");
+        let l = r.say("Maybe we'll", Some(k)).await;
+        assert_eq!(l, "", "second fragment inside 20 s: silence");
+        let l = r.say("So me.", Some(k)).await;
+        assert_eq!(l, "", "second fragment inside 20 s: silence");
+        let l = r.say("Yeah.", Some(k)).await;
+        assert_eq!(l, "", "no invented question after a bare yeah");
+        // A question about themselves is never a fact nor the front desk.
+        let l = r.say("What's my favorite color?", Some(k)).await;
+        assert!(l.contains("haven't told me"), "{l}");
+        let l = r.say("I study in sixth class", Some(k)).await;
+        assert!(!l.is_empty());
+        let facts = r.facts.recall(k);
+        assert!(facts.iter().any(|f| f == "studies in class 6"), "{facts:?}");
+        let l = r.say("Which class do I study in?", Some(k)).await;
+        assert_eq!(l, "You're in class 6.");
+        assert!(!r.facts.recall(k).iter().any(|f| f.contains("studys")));
+        // "I don't know." is not "forget me".
+        let l = r.say("I don't know.", Some(k)).await;
+        assert!(!l.contains("forgotten"), "{l}");
+        assert!(r.facts.resolve_name("Kalyan").is_some());
+        // Hellos in the same visit: never a second "Nice to see you again".
+        let a = r.say("Hello.", Some(k)).await;
+        let b = r.say("Hello?", Some(k)).await;
+        assert!(
+            !a.contains("see you again") && !b.contains("see you again"),
+            "{a} / {b}"
+        );
+        assert!(!b.starts_with("Good "), "a second full greeting: {b}");
+        // No line ever quotes or echoes the bot's own words.
+        for l in r.s.said.all() {
+            assert!(!l.contains('"') && !l.contains('\u{2019}'), "{l}");
+        }
+    }
+
+    /// Ten kinds of fact: told, asked in the same visit, asked next visit.
+    #[tokio::test]
+    async fn ten_fact_types_are_recalled() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "I study in sixth class",
+                "which class do I study in?",
+                "class 6",
+            ),
+            ("I live in Kukatpally", "where do I live?", "kukatpally"),
+            ("I like cricket", "what do I like?", "cricket"),
+            ("I work at a bank", "where do I work?", "bank"),
+            (
+                "my favourite colour is blue",
+                "what's my favourite colour?",
+                "blue",
+            ),
+            ("I play the tabla", "what do I play?", "tabla"),
+            ("I teach maths", "what do I teach?", "maths"),
+            (
+                "I have a dog called Bruno",
+                "what's my dog called?",
+                "bruno",
+            ),
+            ("I speak Telugu", "what language do I speak?", "telugu"),
+            ("I learn Kathak", "what do I learn?", "kathak"),
+        ];
+        let mut bad = Vec::new();
+        for (tell, ask, want) in cases {
+            let mut r = rig(vec![]);
+            r.say("I'm Sunit", None).await;
+            let id = r.facts.resolve_name("Sunit").unwrap();
+            r.say(tell, Some(&id)).await;
+            let same = r.say(ask, Some(&id)).await;
+            r.s.new_visit();
+            r.s.greeted_at.clear();
+            let next = r.say(ask, Some(&id)).await;
+            for (when, l) in [("same visit", &same), ("next visit", &next)] {
+                if !l.to_lowercase().contains(want) {
+                    bad.push(format!(
+                        "{tell:?} / {ask:?} ({when}): {l:?} facts {:?}",
+                        r.facts.recall(&id)
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     fn json(intent: &str, people: &str, facts: &str) -> String {

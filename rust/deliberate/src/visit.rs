@@ -59,6 +59,8 @@ pub struct Visit {
     pub greeted: bool,
     /// "Are you Sony or Kalyan?" was asked this visit (once).
     pub asked_which: bool,
+    /// When the last "Sorry?" for a fragment was said.
+    pub sorry_at: Option<std::time::Instant>,
     /// People they told about before giving their own name ("this is my
     /// sister Priya" from a stranger): stored once the name comes.
     pub pending_people: Vec<crate::understand::Mention>,
