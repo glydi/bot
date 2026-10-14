@@ -494,10 +494,40 @@ pub async fn understand(
 
 /// Lower-case words, punctuation dropped (apostrophes kept).
 pub fn words(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '\''))
+    let raw: Vec<String> = text
+        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase().replace('\u{2019}', "'"))
-        .collect()
+        .collect();
+    // Kin words said in pieces are one word: "mother in law" (also
+    // "mother-in-law", split above), "step mother".
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let w = &raw[i];
+        if raw.get(i + 1).map(String::as_str) == Some("in")
+            && raw
+                .get(i + 2)
+                .is_some_and(|l| l == "law" || l == "laws" || l == "law's")
+            && crate::people::Relation::from_word(w).is_some()
+        {
+            let tail = raw[i + 2].strip_prefix("law").unwrap_or("");
+            out.push(format!("{w}-in-law{tail}"));
+            i += 3;
+            continue;
+        }
+        if w == "step"
+            && let Some(n) = raw.get(i + 1)
+            && crate::people::Relation::from_word(&format!("step{n}")).is_some()
+        {
+            out.push(format!("step{n}"));
+            i += 2;
+            continue;
+        }
+        out.push(w.clone());
+        i += 1;
+    }
+    out
 }
 
 fn cap(w: &str) -> String {
@@ -549,6 +579,22 @@ pub fn first_name_in(text: &str) -> Option<String> {
             )
         })
         .collect();
+    // "everyone calls me Sid", "people call me Adi", "you can call me
+    // Bunty": the name they go by.
+    if let Some(i) = s
+        .windows(2)
+        .position(|p| matches!(p[0], "call" | "calls") && p[1] == "me")
+        && let Some(n) = s.get(i + 2)
+        && name_word(n)
+    {
+        return Some(cap(n));
+    }
+    // Honorifics are not names: "I am Sir Anand", "I'm Ma'am Sunita".
+    let s: Vec<&str> = s
+        .iter()
+        .copied()
+        .filter(|x| !matches!(*x, "sir" | "ma'am" | "maam" | "madam" | "madame"))
+        .collect();
     // "this is Kavya" / "this is Mrs Kapoor" said of oneself (not "this
     // is my sister ...", a relation).
     if let ["this", "is", n, rest @ ..] = s.as_slice()
@@ -599,6 +645,17 @@ pub fn first_name_in(text: &str) -> Option<String> {
         return None;
     }
     name_word(first).then(|| cap(first))
+}
+
+/// "two" -> 2 (small counts).
+fn num_word(w: &str) -> Option<u32> {
+    w.parse().ok().or(match w {
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        _ => None,
+    })
 }
 
 /// "mr" -> "Mr": the titles a name may carry.
@@ -1131,6 +1188,40 @@ pub fn rules(text: &str) -> Option<Understanding> {
     } else {
         s
     };
+    // "I have two kids, Riya and Kabir", "I have a son, Arav": the
+    // children by name.
+    if let ["i", "have", n, kids, rest @ ..] = s.as_slice()
+        && (num_word(n).is_some() || matches!(*n, "a" | "one"))
+        && let Some(rel) = match *kids {
+            "kids" | "children" | "kid" | "child" => Some("child"),
+            "sons" | "son" | "boys" => Some("son"),
+            "daughters" | "daughter" | "girls" => Some("daughter"),
+            _ => None,
+        }
+    {
+        let names: Vec<String> = rest
+            .iter()
+            .filter(|w| {
+                !matches!(
+                    **w,
+                    "and" | "named" | "called" | "they're" | "theyre" | "are"
+                )
+            })
+            .filter(|w| name_word(w) && capitalised_in(text, w))
+            .map(|w| cap(w))
+            .collect();
+        if !names.is_empty() {
+            let mut u = Understanding::of("tell_relation");
+            for name in names {
+                u.people.push(Mention {
+                    name,
+                    relation_to_speaker: Some(rel.to_owned()),
+                    reference: Some(format!("my {rel}")),
+                });
+            }
+            return Some(u);
+        }
+    }
     // "this is my sister Priya", "meet my friend Sony", "my son Rohan"
     for start in [
         &["this", "is", "my"][..],
@@ -1217,6 +1308,7 @@ pub fn rules(text: &str) -> Option<Understanding> {
     // "how is she", "is my son here", "where is Rohan", "who is she"
     let ask = match s.as_slice() {
         ["is", "my", rel, ..]
+        | ["who", "are" | "is", "my", rel]
         | ["how", "is", "my", rel, ..]
         | ["how's", "my", rel, ..]
         | ["where", "is", "my", rel, ..]
@@ -1226,7 +1318,19 @@ pub fn rules(text: &str) -> Option<Understanding> {
         | ["where", "is", who, ..]
         | ["where's", who, ..]
         | ["who", "is", who]
+        | ["who", "is", who, "to", "me"]
+        | ["who's", who, "to", "me"]
         | ["who's", who] => Some(vec![*who]),
+        // "does she like drawing?", "how old is he?", "where do they
+        // live?": about the person the pronoun points at.
+        [
+            "does" | "is" | "did" | "can",
+            p @ ("she" | "he" | "they"),
+            ..,
+        ]
+        | ["how", "old", "is" | "are", p @ ("she" | "he" | "they"), ..]
+        | ["where", "do" | "does", p @ ("she" | "he" | "they"), ..]
+        | ["what", "does" | "do", p @ ("she" | "he" | "they"), ..] => Some(vec![*p]),
         ["is", who, "here" | "in" | "at" | "there", ..] => Some(vec![*who]),
         _ => None,
     };

@@ -98,7 +98,9 @@ impl Relation {
             return Some(Self::Other(k.1.to_owned()));
         }
         Some(match w.as_str() {
-            "son" | "daughter" | "child" | "kid" | "boy" | "girl" | "child_of" => Self::ChildOf,
+            "son" | "daughter" | "child" | "children" | "kid" | "boy" | "girl" | "child_of" => {
+                Self::ChildOf
+            }
             "father" | "mother" | "dad" | "mum" | "mom" | "parent" | "papa" | "mama" | "amma"
             | "appa" | "mummy" | "daddy" | "parent_of" => Self::ParentOf,
             "brother" | "sister" | "sibling" | "sibling_of" | "didi" | "bhaiya" | "bhai"

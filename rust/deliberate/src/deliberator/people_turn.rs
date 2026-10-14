@@ -251,6 +251,45 @@ impl Session {
         (known, stranger)
     }
 
+    /// "who are my children?" / "who are my friends?": all of them, by
+    /// name; `None` when the question is not about a plural relation.
+    pub(super) fn plural_relation_answer(
+        &self,
+        text: &str,
+        me: Option<&EntityId>,
+    ) -> Option<String> {
+        let me = me?;
+        let w = understand::words(text);
+        let (plural, single) = [
+            ("children", "child"),
+            ("kids", "child"),
+            ("sons", "son"),
+            ("daughters", "daughter"),
+            ("brothers", "brother"),
+            ("sisters", "sister"),
+            ("siblings", "sibling"),
+            ("friends", "friend"),
+            ("parents", "parent"),
+        ]
+        .into_iter()
+        .find(|(p, _)| w.iter().any(|x| x == p))?;
+        let want = Relation::from_word(single)?;
+        // The edge is seen from my side: my child is someone I am parent of.
+        let mine = want.inverse();
+        let names: Vec<String> = self
+            .facts
+            .edges(me)
+            .into_iter()
+            .filter(|e| e.relation == mine)
+            .map(|e| e.other_name)
+            .collect();
+        Some(match names.as_slice() {
+            [] => format!("You haven't told me about your {plural} yet."),
+            [one] => format!("Your {single} is {one}."),
+            [rest @ .., last] => format!("Your {plural} are {} and {last}.", rest.join(", ")),
+        })
+    }
+
     /// Whether the chest screen can register people.
     pub(super) fn register_panel(&self) -> bool {
         self.people.as_ref().is_some_and(|p| p.register_panel)
@@ -443,7 +482,11 @@ impl Session {
                 .is_none_or(|q| q == "Sorry?")
         {
             let ack = crate::voice::is_bare_ack(text);
-            if ack || crate::voice::is_fragment_utterance(text) {
+            // A short command the rules understand ("forget me") is not
+            // a fragment.
+            let meant = understand::rules(text)
+                .is_some_and(|u| !matches!(u.intent.as_str(), "chit_chat" | "unclear"));
+            if !meant && (ack || crate::voice::is_fragment_utterance(text)) {
                 let now = self.clock.now();
                 let recent = self
                     .visit
@@ -900,6 +943,10 @@ impl Session {
                     )
                 })
             }
+            // "who are my children?": everyone with that relation.
+            "ask_about_person" if let Some(l) = self.plural_relation_answer(text, me.as_ref()) => {
+                Some(l)
+            }
             "ask_about_person" => {
                 let target = u
                     .people
@@ -970,7 +1017,7 @@ impl Session {
             "ask_about_me" => Some(match (&me, &my_name) {
                 // A specific question ("what is my favourite colour?"):
                 // answer just that, from the fact that matches it best.
-                (Some(id), Some(_)) if asked_detail(text).is_some() => {
+                (Some(id), Some(_)) if asked_detail(text).is_some() && !asks_name_only(text) => {
                     let words = asked_detail(text).unwrap_or_default();
                     let facts: Vec<String> = self
                         .facts
@@ -2265,9 +2312,16 @@ fn cap_words(l: &str, max: usize) -> String {
 
 fn asks_name_only(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    ["my name", "who am i", "know me", "remember me", "mera naam"]
-        .iter()
-        .any(|p| t.contains(p))
+    [
+        "my name",
+        "who am i",
+        "know me",
+        "remember me",
+        "mera naam",
+        "call me",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
 }
 
 fn second_person(fact: &str) -> String {
@@ -2870,6 +2924,72 @@ mod tests {
                         r.facts.recall(&id)
                     ));
                 }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// `scenarios_more` regressions after the live fixes (2026-10-14).
+    #[tokio::test]
+    async fn kin_words_kids_nicknames_honorifics_commands() {
+        let mut bad = Vec::new();
+        for (turns, want, not) in [
+            (
+                &[
+                    "I'm Gita",
+                    "my mother-in-law Savitri is visiting",
+                    "who is Savitri?",
+                ][..],
+                "in-law",
+                "your mother.",
+            ),
+            (
+                &[
+                    "I'm Gita",
+                    "my mother in law Savitri is visiting",
+                    "who is Savitri?",
+                ][..],
+                "in-law",
+                "your mother.",
+            ),
+            (
+                &[
+                    "I'm Asha",
+                    "I have two kids, Riya and Kabir",
+                    "who are my children?",
+                ][..],
+                "Kabir",
+                "haven't",
+            ),
+            (
+                &[
+                    "my name is Aditya but call me Adi",
+                    "what should you call me",
+                ][..],
+                "Adi",
+                "haven't",
+            ),
+            (
+                &["I'm Siddharth", "everyone calls me Sid", "what's my name?"][..],
+                "Sid",
+                "Sorry",
+            ),
+            (&["good morning, I am Sir Anand"][..], "Anand", "Sir!"),
+            (
+                &["hello I'm Ma'am Sunita, the librarian"][..],
+                "Sunita",
+                "Sorry",
+            ),
+            (&["forget me"][..], "", "Sorry?"),
+        ] {
+            let mut r = rig(vec![]);
+            let mut last = String::new();
+            for t in turns {
+                let sp = r.s.current_person.as_ref().map(|(i, _)| i.clone());
+                last = r.say(t, sp.as_ref()).await;
+            }
+            if !last.contains(want) || last.contains(not) {
+                bad.push(format!("{turns:?} -> {last:?}"));
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
