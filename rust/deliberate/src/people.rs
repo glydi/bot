@@ -403,6 +403,27 @@ pub fn may_discuss(speaker: Option<&EntityId>, about: &EntityId, speaker_edges: 
     }
 }
 
+/// Two relation words in a row ("wife's brother") as the one relation
+/// word they make, when it is a common one; `None` otherwise.
+pub fn compose(first: &str, second: &str) -> Option<&'static str> {
+    use Relation as R;
+    let a = Relation::from_word(first)?;
+    let b = Relation::from_word(second)?;
+    // `a` is the relation of the first person to me, `b` of the second
+    // to the first.
+    Some(match (a, b) {
+        (R::SpouseOf, R::SiblingOf) | (R::SiblingOf, R::SpouseOf) => "sibling-in-law",
+        (R::SpouseOf, R::ParentOf) => "parent-in-law",
+        (R::ChildOf, R::SpouseOf) => "child-in-law",
+        (R::SiblingOf, R::ChildOf) => "nephew or niece",
+        (R::ParentOf, R::SiblingOf) => "uncle or aunt",
+        (R::ParentOf, R::ParentOf) => "grandparent",
+        (R::ChildOf, R::ChildOf) => "grandchild",
+        (R::ParentOf, R::ChildOf) => "sibling",
+        _ => return None,
+    })
+}
+
 /// Kin words kept as [`Relation::Other`], by their class: the class is
 /// what is stored, so the inverse is exact ("X is my grandfather" makes
 /// me X's grandchild, and X my grandparent).

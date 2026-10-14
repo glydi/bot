@@ -476,8 +476,16 @@ impl Session {
             && understand::open_question(text);
         let rule_deep = matches!(intent, "chit_chat" | "unclear" | "feeling" | "tell_fact")
             && understand::deep_question(text);
+        // A question over what they told earlier this visit ("which one
+        // should I pick up first?", "whose exam comes first?"): reasoning,
+        // not a hand-off, a clock reading or a guess.
+        let over_told = (matches!(intent, "out_of_zone" | "everyday" | "chit_chat" | "unclear")
+            || (intent == "ask_about_me" && text.to_ascii_lowercase().contains("how many")))
+            && understand::asks(text)
+            && (intent != "everyday" || reasons_about(text))
+            && refers_to_told(text, &self.visit);
         let labelled = intent == "deep";
-        if unsure_question || rule_deep {
+        if unsure_question || rule_deep || over_told {
             intent = "deep";
         }
         // The fallback (no model answer) is small talk on purpose: a
@@ -1370,7 +1378,7 @@ static HOLD_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 pub const DEEP_GIVE_UP: &str =
     "Sorry, I couldn't think that one through just now. Could you ask me again?";
 /// The slow path's instructions.
-const DEEP_RULES: &str = "Now a question that needs real thought. First reason inside <think></think>, never spoken, step by step: 1) what exactly they ask (first? last? older? which one? yes or no?); 2) list every fact above that matters, each with its time, day, age or number written as a number (five = 5:00, half past four = 4:30, Tuesday before Friday); 3) compare those values explicitly, one short line per comparison, saying which is earlier, later, bigger or smaller; 4) the answer that follows from that comparison, checked once against the question. Then, after </think>, the spoken answer: one to three short sentences, at most 45 words, leading with the answer itself (the name, time or yes/no), then the reason from what they told you. Never invent people, facts or events you were not told. If the answer is not in what you know, say so simply and suggest who could help (their family, a teacher, the front desk). No emoji, no lists.";
+const DEEP_RULES: &str = "Now a question that needs real thought. First reason silently, step by step: 1) what exactly they ask (first? last? older? which one? yes or no?); 2) list every fact above that matters, each with its time, day, age or number written as a number (five = 5:00, half past four = 4:30, Tuesday before Friday); 3) compare those values explicitly, one short line per comparison, saying which is earlier, later, bigger or smaller; 4) the answer that follows from that comparison, checked once against the question. Reply as one JSON object only: {\"think\": \"those steps, short\", \"answer\": \"the spoken answer\"}. The answer is one to three short sentences, at most 45 words, leading with the answer itself (the name, time or yes/no), then the reason from what they told you. Never invent people, facts or events you were not told. If the answer is not in what you know, say so simply and suggest who could help (their family, a teacher, the front desk). No emoji, no lists.";
 
 impl Session {
     /// The slow path: a holding line at once, then the stronger model with
@@ -1424,7 +1432,7 @@ impl Session {
             tools: Vec::new(),
             max_tokens: 320,
             temperature: 0.2,
-            json_object: false,
+            json_object: true,
         };
         let backend = self
             .people
@@ -1471,6 +1479,7 @@ impl Session {
                                 if chunk.is_empty()
                                     || total > DEEP_WORDS
                                     || crate::voice::leaks_instructions(&chunk)
+                                    || reads_steps(&chunk)
                                     || crate::voice::leaks_example(&chunk, &real)
                                     || chunk.contains('[')
                                     || chunk.contains('<')
@@ -1505,6 +1514,7 @@ impl Session {
                 && !tail.is_empty()
                 && tail.split_whitespace().count() <= room
                 && !crate::voice::leaks_instructions(&tail)
+                && !reads_steps(&tail)
                 && !tail.contains('[')
                 && !tail.contains('<')
             {
@@ -1521,6 +1531,17 @@ impl Session {
             return Ok(spoken);
         }
         let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The JSON reply: only "answer" is ever spoken; a reply cut off by
+        // the deadline still gives a complete "answer" when it came first
+        // or was closed.
+        let raw = match deep_json(&raw) {
+            Some((think, answer)) => format!("<think>{think}</think>{answer}"),
+            None if raw.trim_start().starts_with('{') => {
+                tracing::info!(raw, "slow path: no answer in the JSON");
+                String::new()
+            }
+            None => raw,
+        };
         let (mut answer, reasoning) = crate::voice::strip_reasoning(&raw);
         // Out of time mid-answer: the complete sentences so far are said.
         let partial = !done && raw.contains("</think>");
@@ -1555,7 +1576,26 @@ impl Session {
 fn deep_answer(answer: &str) -> Option<String> {
     crate::voice::speakable(answer, DEEP_WORDS)
         .map(|l| l.trim().to_owned())
-        .filter(|l| !l.is_empty() && !crate::voice::leaks_instructions(l))
+        .filter(|l| !l.is_empty() && !crate::voice::leaks_instructions(l) && !reads_steps(l))
+}
+
+/// Whether a spoken piece of the slow answer reads the reasoning steps
+/// back (live sim: "What exactly you ask is which one?").
+fn reads_steps(l: &str) -> bool {
+    let low = l.to_ascii_lowercase();
+    crate::voice::echoes_prompt(l, DEEP_RULES)
+        || [
+            "what exactly",
+            "you ask is",
+            "they ask",
+            "the question is",
+            "step 1",
+            "step one",
+            "comparison:",
+            "facts that matter",
+        ]
+        .iter()
+        .any(|p| low.contains(p))
 }
 
 /// Lines whose exact words matter and are never reworded: privacy, the
@@ -1827,6 +1867,103 @@ fn asks_what_i_do(text: &str) -> bool {
     ]
     .iter()
     .any(|p| t.contains(p))
+}
+
+/// `(think, answer)` from the slow path's JSON reply, if its "answer" is
+/// there and complete.
+fn deep_json(raw: &str) -> Option<(String, String)> {
+    let t = raw.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        let answer = v.get("answer")?.as_str()?.trim().to_owned();
+        let think = v
+            .get("think")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_owned();
+        return (!answer.is_empty()).then_some((think, answer));
+    }
+    // Cut off: a closed "answer" string is enough.
+    let at = t.find("\"answer\"")?;
+    let rest = t[at + "\"answer\"".len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut esc = false;
+    for c in rest.chars() {
+        match (esc, c) {
+            (true, c) => {
+                out.push(c);
+                esc = false;
+            }
+            (false, '\\') => esc = true,
+            (false, '"') => {
+                return (!out.trim().is_empty()).then(|| (String::new(), out.trim().to_owned()));
+            }
+            (false, c) => out.push(c),
+        }
+    }
+    None
+}
+
+/// A question that asks for a judgement, not a reading: "what time
+/// should I leave?" (not "what time is it?").
+fn reasons_about(text: &str) -> bool {
+    let t = format!(" {} ", text.to_ascii_lowercase());
+    [
+        " should ", " can ", " could ", " will ", " first", " last", " earlier", " later",
+        " before ", " after ",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
+}
+
+/// Whether a question leans on something they said earlier this visit:
+/// it shares a name or a content word with one of their earlier lines, or
+/// it compares ("which", "whose", "first", "older", "how many") after they
+/// told the bot facts.
+fn refers_to_told(text: &str, visit: &crate::visit::Visit) -> bool {
+    const STOP: &[&str] = &[
+        "what", "which", "whose", "who", "when", "where", "how", "should", "could", "would",
+        "will", "can", "the", "a", "an", "is", "are", "do", "does", "did", "i", "my", "me", "of",
+        "them", "they", "to", "for", "first", "last", "this", "that", "it", "and", "or", "you",
+        "your", "have", "has", "one", "pick", "up", "today", "week", "after", "before",
+    ];
+    let told: Vec<String> = visit
+        .exchanges
+        .iter()
+        .flat_map(|e| understand::words(&e.heard))
+        .collect();
+    if told.is_empty() {
+        return false;
+    }
+    let w = understand::words(text);
+    let shared = w
+        .iter()
+        .filter(|x| x.len() > 2 && !STOP.contains(&x.as_str()))
+        .any(|x| {
+            told.iter()
+                .any(|t| t.trim_end_matches("'s") == x.trim_end_matches("'s"))
+        });
+    let t = format!(" {} ", w.join(" "));
+    let compares = [
+        " which ",
+        " whose ",
+        " first",
+        " last",
+        " older",
+        " younger",
+        " earlier",
+        " later",
+        " how many ",
+        " how much ",
+        " should i ",
+        " can my ",
+    ]
+    .iter()
+    .any(|c| t.contains(c));
+    shared || (compares && visit.exchanges.len() >= 2)
 }
 
 /// The most words any spoken reply carries.

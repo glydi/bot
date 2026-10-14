@@ -656,6 +656,7 @@ pub fn asks(text: &str) -> bool {
 
 /// "my son is Aarav", "my son Imran also studies here", "Ananya is my
 /// daughter", "Mrs Rao is my teacher": a relation told, with the name.
+#[allow(clippy::too_many_lines)]
 fn relation_statement(s: &[&str]) -> Option<Understanding> {
     let tell = |name: String, rel: &str| {
         let mut u = Understanding::of("tell_relation");
@@ -719,6 +720,20 @@ fn relation_statement(s: &[&str]) -> Option<Understanding> {
             ));
         }
         _ => {}
+    }
+    // "my wife's brother Arjun": two steps folded into one relation.
+    if let ["my", r1, r2, rest @ ..] = s.as_slice()
+        && let Some(r1) = r1.strip_suffix("'s")
+        && let Some(word) = crate::people::compose(r1, r2)
+    {
+        let name = rest
+            .iter()
+            .copied()
+            .skip_while(|w| matches!(*w, "is" | "called" | "named"))
+            .find(|w| name_word(w))
+            .map(cap)
+            .unwrap_or_default();
+        return Some(tell(name, word));
     }
     match s.as_slice() {
         ["my", rel, "is", name, ..] | ["my", rel, name, ..]
@@ -1557,6 +1572,17 @@ mod tests {
                 assert_eq!(r.u.intent, "chit_chat", "{what}");
             }
         }
+    }
+
+    #[test]
+    fn two_step_relations_fold() {
+        let u = rules("my wife's brother Arjun is visiting today").unwrap();
+        assert_eq!(u.intent, "tell_relation");
+        assert_eq!(u.people[0].name, "Arjun");
+        assert_eq!(
+            u.people[0].relation_to_speaker.as_deref(),
+            Some("sibling-in-law")
+        );
     }
 
     #[test]
