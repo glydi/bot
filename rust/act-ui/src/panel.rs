@@ -25,7 +25,8 @@ use crate::debug::Sources;
 use crate::settings::{self, Field, Kind};
 use crate::state::UiState;
 use crate::strip::{PreviewTexture, state_word, strip_rows};
-use crate::visitor::{Clock, Welcome};
+use crate::tracking;
+use crate::visitor::{Clock, SchoolView, Welcome};
 
 /// Which screen is up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,6 +61,11 @@ pub struct Panel {
     /// Whether the small live video is shown (`GLYDI_SHOW_VIDEO`, default
     /// on). Only hides the picture; recognition keeps running.
     pub show_video: bool,
+    /// Whether the tracking overlay and the "In view" list are drawn
+    /// (`GLYDI_SHOW_TRACKING`, default on).
+    pub show_tracking: bool,
+    /// Whether the ERP details card is open (a tap on the badge).
+    erp_open: bool,
 }
 
 /// Camera width on the home screen, logical pixels.
@@ -73,6 +79,8 @@ const QUIET: egui::Color32 = egui::Color32::from_gray(0x6a);
 const GOOD: egui::Color32 = egui::Color32::from_rgb(0x3f, 0x8e, 0x6a);
 /// A bad one.
 const BAD: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x3a, 0x3a);
+/// Needs a look, not broken.
+const WARN: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x7a, 0x10);
 
 impl Panel {
     /// A panel on the home screen with the form loaded from the
@@ -97,6 +105,8 @@ impl Panel {
                 std::env::var("GLYDI_SHOW_VIDEO").as_deref().map(str::trim),
                 Ok("0" | "false" | "off" | "no")
             ),
+            show_tracking: crate::tracking::show_tracking_from_env(),
+            erp_open: false,
         }
     }
 
@@ -155,8 +165,11 @@ impl Panel {
             });
     }
 
+    // One screen, top to bottom; splitting it would only scatter the layout.
+    #[allow(clippy::too_many_lines)]
     fn home(&mut self, ui: &mut egui::Ui, state: &UiState, sources: &Sources, now: Instant) {
         let (word, colour) = state_word(state.expression(now));
+        let school_view = (sources.school)();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("GLYDI").size(18.0).color(QUIET));
             ui.add_space(14.0);
@@ -184,13 +197,45 @@ impl Panel {
                 if ui.add(toggle).clicked() {
                     self.show_video = !self.show_video;
                 }
+                let (label, tint) = if self.show_tracking {
+                    ("Tracking overlay: on", GOOD)
+                } else {
+                    ("Tracking overlay: off", QUIET)
+                };
+                let toggle = egui::Button::new(egui::RichText::new(label).size(16.0).color(tint))
+                    .min_size(egui::vec2(44.0, 36.0));
+                if ui.add(toggle).clicked() {
+                    self.show_tracking = !self.show_tracking;
+                }
+                let (badge, tone) = tracking::erp_badge(school_view.as_ref());
+                let tint = match tone {
+                    tracking::ErpTone::Good => GOOD,
+                    tracking::ErpTone::Warn => WARN,
+                    tracking::ErpTone::Quiet => QUIET,
+                };
+                let b = egui::Button::new(egui::RichText::new(badge).size(14.0).color(tint))
+                    .frame(false)
+                    .min_size(egui::vec2(44.0, 36.0));
+                if ui.add(b).clicked() {
+                    self.erp_open = !self.erp_open;
+                }
             });
         });
+        if self.erp_open {
+            egui::Frame::new()
+                .fill(egui::Color32::from_gray(0xee))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    for l in tracking::erp_details(school_view.as_ref(), tracking::utc_now()) {
+                        ui.label(egui::RichText::new(l).size(14.0).color(QUIET));
+                    }
+                });
+        }
 
         let clock = Clock::now();
         let welcome = Welcome::from_faces(&state.faces, now);
         let heard = (sources.heard)();
-        let school_view = (sources.school)();
         // Off: no texture upload at all, the picture is simply not drawn.
         let camera = if self.show_video {
             self.preview.ensure(ui.ctx(), &state.faces)
@@ -227,14 +272,21 @@ impl Panel {
                                 .color(QUIET),
                         );
                     });
+                    if let Some(t) = tracking::today_line(school_view.as_ref()) {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(t).size(16.0).color(QUIET));
+                    }
                     ui.add_space(28.0);
                     bubble(ui, "You", heard.as_deref(), false);
                     ui.add_space(10.0);
                     bubble(ui, "GLYDI", state.said.as_deref(), true);
                 });
                 if let Some(id) = camera {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        camera_view(ui, id, state);
+                    ui.vertical(|ui| {
+                        camera_view(ui, id, state, self.show_tracking, school_view.as_ref(), now);
+                        if self.show_tracking {
+                            in_view(ui, state, school_view.as_ref(), now);
+                        }
                     });
                 }
             });
@@ -423,7 +475,14 @@ fn bubble(ui: &mut egui::Ui, who: &str, text: Option<&str>, bot: bool) {
 }
 
 /// The camera, with a box and a name on each face.
-fn camera_view(ui: &mut egui::Ui, id: egui::TextureId, state: &UiState) {
+fn camera_view(
+    ui: &mut egui::Ui,
+    id: egui::TextureId,
+    state: &UiState,
+    tracking_on: bool,
+    school: Option<&SchoolView>,
+    now: Instant,
+) {
     let aspect = state
         .faces
         .preview
@@ -440,6 +499,10 @@ fn camera_view(ui: &mut egui::Ui, id: egui::TextureId, state: &UiState) {
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+    if tracking_on {
+        tracking::draw_overlay(painter, rect, &state.faces, school, now, 1.0);
+        return;
+    }
     for r in strip_rows(state.faces.preview.as_deref()) {
         let boxed = egui::Rect::from_min_size(
             rect.min + egui::vec2(r.x * rect.width(), r.y * rect.height()),
@@ -467,6 +530,59 @@ fn camera_view(ui: &mut egui::Ui, id: egui::TextureId, state: &UiState) {
             egui::FontId::proportional(14.0),
             r.colour(),
         );
+    }
+}
+
+/// The "In view" list under the camera: focused person first, then
+/// known people, then strangers. Names only of people in view.
+fn in_view(ui: &mut egui::Ui, state: &UiState, school: Option<&SchoolView>, now: Instant) {
+    let rows = tracking::in_view_rows(&state.faces, school, now);
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("In view")
+            .size(14.0)
+            .color(QUIET)
+            .strong(),
+    );
+    if rows.is_empty() {
+        ui.label(egui::RichText::new("nobody").size(14.0).color(QUIET));
+        return;
+    }
+    for r in rows.iter().take(6) {
+        ui.horizontal(|ui| {
+            let c = if r.focused {
+                tracking::colour::FOCUS
+            } else if r.known {
+                tracking::colour::KNOWN
+            } else {
+                tracking::colour::STRANGER
+            };
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 5.0, c);
+            ui.label(egui::RichText::new(&r.name).size(16.0).color(INK).strong());
+            ui.label(
+                egui::RichText::new(format!(
+                    "#{} · {} · {} · {:.2}",
+                    r.track,
+                    tracking::short_duration(r.for_),
+                    if r.attentive {
+                        "looking"
+                    } else {
+                        "not looking"
+                    },
+                    r.score
+                ))
+                .size(13.0)
+                .color(QUIET),
+            );
+        });
+        if let Some(m) = &r.mark {
+            ui.label(
+                egui::RichText::new(format!("    {m}"))
+                    .size(13.0)
+                    .color(GOOD),
+            );
+        }
     }
 }
 

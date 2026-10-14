@@ -115,9 +115,30 @@ fn update_view(engine: &Engine, view: &Mutex<SchoolView>) {
             (name, state)
         })
         .collect();
+    // The header badge and the today card: codes, counts and times only.
+    let status = engine.status();
+    let today_info = engine
+        .snapshot()
+        .lock()
+        .day(today, &school::Scope::School)
+        .map(|d| act_ui::visitor::TodayInfo {
+            open: d.open,
+            reason: d.reason.clone(),
+            events: d.events.clone(),
+        });
     let mut v = view.lock();
-    v.online = engine.status().online;
+    v.online = status.online;
     v.marks = marks;
+    v.synced_utc = (status.refreshed_at > 0).then_some(status.refreshed_at);
+    v.last_sync = v.synced_utc.map(|t| engine.time().hhmm(t));
+    v.queued = status.pending;
+    v.auth_problem = status.auth_problem;
+    v.last_error = if status.last_mark_error.is_empty() {
+        status.last_refresh_error
+    } else {
+        status.last_mark_error
+    };
+    v.today = today_info;
 }
 
 /// The thread: check the account, then run the schedule and take

@@ -20,6 +20,29 @@ pub struct SchoolView {
     pub online: bool,
     /// Name (lower-case) -> state of today's mark.
     pub marks: std::collections::HashMap<String, MarkState>,
+    /// `HH:MM` (school time) of the last good refresh, if any.
+    pub last_sync: Option<String>,
+    /// UTC seconds of the last good refresh, for the snapshot age.
+    pub synced_utc: Option<i64>,
+    /// Marks waiting to be sent.
+    pub queued: usize,
+    /// A sign-in problem being waited out (an error code), or empty.
+    pub auth_problem: String,
+    /// The last error code (refresh or mark), or empty.
+    pub last_error: String,
+    /// Today for the whole school, if the snapshot has it.
+    pub today: Option<TodayInfo>,
+}
+
+/// Today for the whole school, for the compact card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TodayInfo {
+    /// School is open.
+    pub open: bool,
+    /// Why not, when closed ("Gandhi Jayanti", "Sunday").
+    pub reason: Option<String>,
+    /// Holidays and events on the day, by name.
+    pub events: Vec<String>,
 }
 
 /// Where a person's attendance mark stands.

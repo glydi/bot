@@ -1875,6 +1875,12 @@ fn ui_sources(
                 .map(|(t, _)| t.clone())
         }
     });
+    // "Sony or Kalyan?": the ambiguous face's ids as names. Called once
+    // per new ambiguous pair, not per frame.
+    s.name_of = Some(Box::new({
+        let store = Arc::clone(&store);
+        move |id: &str| store.name_of(&common::EntityId::new(id))
+    }));
     s.known_count = Some(Box::new({
         let cached: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
         move || {

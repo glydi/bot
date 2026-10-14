@@ -22,6 +22,9 @@ use crate::strip::PreviewTexture;
 /// lock the fast path never takes.
 pub type Getter<T> = Box<dyn Fn() -> T + Send>;
 
+/// A gallery id to its display name.
+pub type NameOf = Box<dyn Fn(&str) -> Option<String> + Send>;
+
 /// How many events the panel shows.
 pub const EVENT_LINES: usize = 50;
 
@@ -51,6 +54,10 @@ pub struct Sources {
     /// The school link's view of attendance (see
     /// [`crate::visitor::SchoolView`]); `None` when no ERP is configured.
     pub school: Getter<Option<crate::visitor::SchoolView>>,
+    /// A gallery id to its display name, for the "Sony or Kalyan?" label
+    /// of an ambiguous face. Called once per new ambiguous pair, not per
+    /// frame. `None`: the ids are shown as they are.
+    pub name_of: Option<NameOf>,
 }
 
 impl Sources {
@@ -64,6 +71,7 @@ impl Sources {
             known_count: None,
             heard: Box::new(|| None),
             school: Box::new(|| None),
+            name_of: None,
         }
     }
 }
@@ -100,13 +108,24 @@ impl Tab {
 /// texture, which is re-uploaded only when a new preview has arrived
 /// (`Faces::seq`), not every frame. The texture lives here rather than in
 /// the window so the Faces tab and the presence strip share one upload.
-#[derive(Default)]
 pub struct Panel {
     /// The open tab.
     pub tab: Tab,
     /// The camera preview as a texture, shared with
     /// [`strip`](crate::strip).
     pub preview: PreviewTexture,
+    /// The tracking overlay on the Faces tab (`GLYDI_SHOW_TRACKING`).
+    pub show_tracking: bool,
+}
+
+impl Default for Panel {
+    fn default() -> Self {
+        Self {
+            tab: Tab::default(),
+            preview: PreviewTexture::default(),
+            show_tracking: crate::tracking::show_tracking_from_env(),
+        }
+    }
 }
 
 impl Panel {
@@ -184,29 +203,26 @@ fn faces_tab(ui: &mut egui::Ui, panel: &mut Panel, state: &UiState, src: &Source
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
-        for f in &preview.faces {
-            let colour = face_colour(f);
-            let focus_mode = preview.faces.iter().any(|g| g.focused);
-            let (colour, width) = match (focus_mode, f.focused) {
-                (true, true) => (crate::strip::FOCUS, 4.0),
-                (true, false) => (crate::strip::BACKGROUND, 1.0),
-                (false, _) => (colour, if f.engaged { 3.0 } else { 1.5 }),
-            };
-            let stroke = egui::Stroke::new(width, colour);
-            let box_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(f.x * rect.width(), f.y * rect.height()),
-                egui::vec2(f.w * rect.width(), f.h * rect.height()),
-            );
-            painter.rect_stroke(box_rect, 2, stroke, egui::StrokeKind::Outside);
-            painter.text(
-                box_rect.left_bottom() + egui::vec2(0.0, 2.0),
-                egui::Align2::LEFT_TOP,
-                format!("{} {:.2}", f.label, f.score),
-                egui::FontId::proportional(12.0),
-                colour,
-            );
+        if panel.show_tracking {
+            let school = (src.school)();
+            crate::tracking::draw_overlay(&painter, rect, &state.faces, school.as_ref(), now, 1.1);
+        } else {
+            for f in &preview.faces {
+                let colour = face_colour(f);
+                let box_rect = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(f.x * rect.width(), f.y * rect.height()),
+                    egui::vec2(f.w * rect.width(), f.h * rect.height()),
+                );
+                painter.rect_stroke(
+                    box_rect,
+                    2,
+                    egui::Stroke::new(1.5, colour),
+                    egui::StrokeKind::Outside,
+                );
+            }
         }
     }
+    ui.checkbox(&mut panel.show_tracking, "Tracking overlay");
     let rows = face_rows(preview, |t| state.faces.seen_since(t), now);
     if rows.is_empty() {
         ui.weak("no faces in view");
@@ -476,6 +492,7 @@ mod tests {
             known_count: Some(Box::new(|| 4)),
             heard: Box::new(|| Some("is the bus late".to_owned())),
             school: Box::new(|| None),
+            name_of: None,
         };
         assert_eq!((full.heard)().as_deref(), Some("is the bus late"));
         assert_eq!((empty.heard)(), None);

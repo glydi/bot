@@ -97,6 +97,7 @@ pub mod router;
 pub mod settings;
 pub mod state;
 pub mod strip;
+pub mod tracking;
 pub mod visitor;
 
 use std::sync::Arc;
@@ -297,6 +298,9 @@ impl FaceApp {
             while let Some(o) = ring.try_recv() {
                 self.state.on_observation(&o, now);
             }
+        }
+        if let Some(name_of) = &self.sources.name_of {
+            self.state.faces.tracking.resolve_names(name_of);
         }
         self.state.tick(now);
         if self.state.attends != self.attends_seen {

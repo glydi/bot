@@ -9,7 +9,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Command, MODALITY_CAMERA_PREVIEW, Observation, Payload, Preview};
+use common::{Command, EntityHint, MODALITY_CAMERA_PREVIEW, Observation, Payload, Preview};
+
+/// `sense_vision::MODALITY_FACE_AMBIGUOUS` (act-ui does not depend on the
+/// sense): `Payload::Text` "<idA>\t<idB>" on a track.
+pub const MODALITY_FACE_AMBIGUOUS: &str = "face_ambiguous";
+/// `sense_vision::MODALITY_FACE_ENROL_PROGRESS`: `Payload::Level` k/16.
+pub const MODALITY_FACE_ENROL_PROGRESS: &str = "face_enrol_progress";
 use smol_str::SmolStr;
 
 use crate::behaviour::{Behaviour, Overlay, Reaction};
@@ -94,10 +100,14 @@ pub struct Faces {
     /// the newest preview are dropped: an id is never reused, so a face
     /// that comes back is a new row.
     pub since: HashMap<u32, Instant>,
+    /// Trails, lost tracks, ambiguity and enrolment, for the overlay.
+    pub tracking: crate::tracking::Tracking,
 }
 
 impl Faces {
-    fn update(&mut self, preview: Arc<Preview>, now: Instant) {
+    pub(crate) fn update(&mut self, preview: Arc<Preview>, now: Instant) {
+        self.tracking
+            .on_preview(self.preview.as_deref(), &preview, now);
         let mut since = HashMap::with_capacity(preview.faces.len());
         for f in &preview.faces {
             since.insert(f.track, self.since.get(&f.track).copied().unwrap_or(now));
@@ -303,6 +313,22 @@ impl UiState {
                     && let Ok(preview) = Arc::clone(p).downcast::<Preview>()
                 {
                     self.faces.update(preview, now);
+                }
+            }
+            // Too close to two known people to name: "Sony or Kalyan?".
+            MODALITY_FACE_AMBIGUOUS => {
+                if let Some(EntityHint::Track(t) | EntityHint::KnownOnTrack(_, t)) = &o.entity
+                    && let Some(text) = o.payload.as_text()
+                {
+                    self.faces.tracking.on_ambiguous(*t, text, now);
+                }
+            }
+            // Enrolment burst progress on a just-named track.
+            MODALITY_FACE_ENROL_PROGRESS => {
+                if let Some(EntityHint::Track(t) | EntityHint::KnownOnTrack(_, t)) = &o.entity
+                    && let Payload::Level(l) = o.payload
+                {
+                    self.faces.tracking.on_enrol(*t, l, now);
                 }
             }
             // Music heard (see the crate docs for the contract): sway.

@@ -239,6 +239,13 @@ pub const SECTIONS: &[Section] = &[
                 default: "1",
             },
             Field {
+                key: "GLYDI_SHOW_TRACKING",
+                label: "Tracking overlay",
+                help: "Boxes, trails, names and the In view list over the camera picture.",
+                kind: Kind::Toggle,
+                default: "1",
+            },
+            Field {
                 key: "GLYDI_FACE_THRESHOLD",
                 label: "Face threshold",
                 help: "How close a face must match before a name is used.",

@@ -39,6 +39,10 @@ fn main() {
     let strip_shot = args.iter().any(|a| a == "--strip-shot");
     let faces = args.iter().any(|a| a == "--faces") || strip_shot;
     let no_strip = args.iter().any(|a| a == "--no-strip");
+    // `--panel`: the face-less home screen (the chest panel), with the
+    // tracking overlay and the school badge.
+    let panel = args.iter().any(|a| a == "--panel");
+    let faces = faces || panel;
     // `--react <name>`: play that reaction over the held state every
     // 2.5 s (the yawn is 1.6 s; the pause between lets it read as one).
     let react = args
@@ -94,6 +98,7 @@ fn main() {
     let config = UiConfig {
         debug: debug || (faces && !strip_shot),
         strip: !no_strip,
+        face: !panel,
         tab: if faces {
             act_ui::Tab::Faces
         } else {
@@ -189,6 +194,7 @@ fn drive(
                                 t0.elapsed().as_secs_f32(),
                             )))),
                     );
+                    tracking_demo(obs_tx, t0);
                 }
                 if music && tick % 62 == 0 {
                     obs_tx.send(
@@ -225,6 +231,25 @@ fn drive(
             }
         }
     }
+}
+
+/// The stranger is too close to two people to name, and dev is being
+/// learned (one enrolment sample a second, 16 to a burst).
+fn tracking_demo(obs_tx: &common::RingSender, t0: Instant) {
+    obs_tx.send(
+        Observation::new("cam0", "face_ambiguous", Instant::now())
+            .with_entity(common::EntityHint::Track(4))
+            .with_payload(Payload::Text("person:sony\tperson:kalyan".to_owned())),
+    );
+    let k = (t0.elapsed().as_secs() % 16 + 1) as f32 / 16.0;
+    obs_tx.send(
+        Observation::new("cam0", "face_enrol_progress", Instant::now())
+            .with_entity(common::EntityHint::KnownOnTrack(
+                common::EntityId::new("person:dev"),
+                5,
+            ))
+            .with_payload(Payload::Level(k)),
+    );
 }
 
 /// Length of the [`speech_level`] pattern, seconds.
@@ -318,7 +343,7 @@ fn synthetic_preview(t: f32) -> common::Preview {
             score: 0.87,
             track: 3,
             engaged: true,
-            focused: false,
+            focused: true,
             waving: false,
         },
         common::PreviewFace {
@@ -330,6 +355,18 @@ fn synthetic_preview(t: f32) -> common::Preview {
             score: 0.71,
             track: 4,
             engaged: false,
+            focused: false,
+            waving: false,
+        },
+        common::PreviewFace {
+            x: 0.44,
+            y: 0.40 + 0.05 * (t * 1.3).cos(),
+            w: 0.12,
+            h: 0.22,
+            label: "dev".to_owned(),
+            score: 0.64,
+            track: 5,
+            engaged: true,
             focused: false,
             waving: false,
         },
@@ -400,6 +437,31 @@ fn demo_sources(faces: bool) -> Sources {
         // What the strip's "heard" line shows; the "said" line comes
         // from the driver's own `spoke` observations.
         heard: Box::new(|| Some("does the library shut at six".to_owned())),
-        school: Box::new(|| None),
+        school: Box::new(move || faces.then(demo_school)),
+        name_of: Some(Box::new(|id: &str| {
+            id.strip_prefix("person:").map(str::to_owned)
+        })),
     }
+}
+
+/// A school link with a mark for each demo person.
+fn demo_school() -> act_ui::visitor::SchoolView {
+    use act_ui::visitor::{MarkState, SchoolView, TodayInfo};
+    let mut v = SchoolView {
+        online: true,
+        last_sync: Some("08:15".to_owned()),
+        synced_utc: Some(act_ui::tracking::utc_now() - 340),
+        queued: 1,
+        today: Some(TodayInfo {
+            open: true,
+            reason: None,
+            events: vec!["Science fair".to_owned()],
+        }),
+        ..SchoolView::default()
+    };
+    v.marks
+        .insert("ana".to_owned(), MarkState::Sent("08:02".to_owned()));
+    v.marks
+        .insert("dev".to_owned(), MarkState::Pending("08:10".to_owned()));
+    v
 }
