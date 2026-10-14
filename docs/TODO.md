@@ -46,3 +46,10 @@
 - Test campaign (cd4b3c8) was stopped while running the e2e eval on the extra cases; resume: run scripts/scenarios_more.py, the fuzz suites and the eval, collect the bug list.
 - Known failing: deliberate voice guards `leaks_are_caught`, `voice_guards_are_total_and_bounded` (from the new fuzz tests).
 - Slow-path reasoning can be backwards ("pick up Imran first" though Aisha finishes earlier); add reasoning-correctness checks to the eval.
+
+## Jetson audit (2026-10-14)
+docs/jetson-memory-map.md rewritten (CPU-provider totals ~4.3 GB headless), docs/jetson-readiness.md added,
+env.jetson: GPU flags 0 until the TRT build, GLYDI_PARTIAL_MS=0, RSS 2816/3584, MIN_FREE 2048, WAVE 0.
+Code follow-ups for rust/: aarch64 default buffalo_s; CPU-aware/windowed partials; whisper fallback lazy;
+speculative reply aborted must cancel the Ollama stream (one slot); warn when chat/understand/memory model
+differs from the local model on aarch64; optional kokoro int8 for the CPU provider.

@@ -7,13 +7,15 @@ name: rust
 
 on:
   push:
-    branches: [main]
+    branches: [main, jetson-ready]
     paths:
       - "rust/**"
+      - "deploy/jetson/**"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
       - "rust/**"
+      - "deploy/jetson/**"
       - ".github/workflows/rust.yml"
 
 env:
@@ -122,4 +124,36 @@ jobs:
           # in /usr/include (clang searches <sysroot>/include for
           # exactly this Debian cross layout).
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include
-        run: cargo check -p glydi --features vision,kokoro --target aarch64-unknown-linux-gnu
+        # Every workspace crate (school, accel, memory, mind, bench, ...),
+        # not only what glydi pulls in, so a new crate cannot slip past.
+        run: >
+          cargo check --workspace --all-targets
+          --features glydi/vision,glydi/kokoro
+          --target aarch64-unknown-linux-gnu
+
+  jetson-build:
+    name: release build, Jetson feature set (native arm64)
+    # GitHub's arm64 Ubuntu 22.04 runner: same OS and arch as JetPack 6,
+    # so this links for real (the cross job above only type-checks).
+    # Builds exactly what deploy/jetson/install.sh builds.
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends             build-essential cmake clang libclang-dev pkg-config             libasound2-dev libssl-dev espeak-ng libespeak-ng1             libxkbcommon-dev libwayland-dev libx11-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: jetson-build
+
+      - name: cargo build --release -p glydi --features vision,kokoro
+        run: cargo build --release -p glydi --features vision,kokoro
+
+      - name: the binary starts
+        run: ./target/release/glydi --help

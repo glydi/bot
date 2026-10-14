@@ -109,7 +109,13 @@ fetch_pack() {
 }
 if [ "$want" = all ] || [ "$want" = faces ]; then
     fetch_pack buffalo_s w600k_mbf.onnx
-    fetch_pack buffalo_l w600k_r50.onnx
+    # buffalo_l (ResNet50) does not fit the Jetson's CPU provider; skip it
+    # on aarch64 unless asked (GLYDI_FETCH_BUFFALO_L=1, for TRT trials).
+    if [ "$(uname -m)" != aarch64 ] || [ "${GLYDI_FETCH_BUFFALO_L:-0}" = 1 ]; then
+        fetch_pack buffalo_l w600k_r50.onnx
+    else
+        echo "skip    buffalo_l on aarch64 (GLYDI_FETCH_BUFFALO_L=1 to fetch)"
+    fi
 fi
 
 # ECAPA has no published ONNX: it is exported from SpeechBrain once.
