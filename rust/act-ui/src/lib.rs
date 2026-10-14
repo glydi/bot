@@ -93,6 +93,8 @@ pub mod debug;
 pub mod expression;
 pub mod face;
 pub mod panel;
+pub mod register;
+pub mod register_view;
 pub mod router;
 pub mod settings;
 pub mod state;
@@ -112,6 +114,7 @@ pub use behaviour::{Behaviour, Overlay, Reaction};
 pub use debug::{Panel, Sources, Tab};
 pub use expression::{Expression, FaceState};
 pub use panel::Screen;
+pub use register::{NameCheck, PersonRow, Registration, Registry};
 pub use router::{CommandRouter, RouterHandle};
 pub use state::{Attend, Faces, UiState};
 pub use strip::{PreviewTexture, StripRow, strip_rows};
@@ -163,6 +166,9 @@ pub struct UiConfig {
     /// Set by the panel's "save and restart": the binary checks it after
     /// the window closes and starts itself again.
     pub restart: Option<Arc<AtomicBool>>,
+    /// Open the panel on one registration screen (`offer`, `form`,
+    /// `same`, `capture`, `done`, `people`): the example's screenshots.
+    pub register_demo: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -179,6 +185,7 @@ impl Default for UiConfig {
             fullscreen: false,
             env_path: None,
             restart: None,
+            register_demo: None,
         }
     }
 }
@@ -283,8 +290,13 @@ impl FaceApp {
             panel: debug::Panel::on(config.tab),
             attends_seen: 0,
             quit: config.quit.clone(),
-            screens: (!config.face)
-                .then(|| panel::Panel::new(config.env_path.clone(), config.restart.clone())),
+            screens: (!config.face).then(|| {
+                let mut p = panel::Panel::new(config.env_path.clone(), config.restart.clone());
+                if let Some(which) = &config.register_demo {
+                    p.register_demo(which, now);
+                }
+                p
+            }),
         }
     }
 

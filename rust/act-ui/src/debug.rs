@@ -58,6 +58,9 @@ pub struct Sources {
     /// of an ambiguous face. Called once per new ambiguous pair, not per
     /// frame. `None`: the ids are shown as they are.
     pub name_of: Option<NameOf>,
+    /// The local gallery for the panel's registration flow and People
+    /// page (see [`crate::register`]). `None`: no registration card.
+    pub registry: Option<std::sync::Arc<dyn crate::register::Registry>>,
 }
 
 impl Sources {
@@ -72,6 +75,7 @@ impl Sources {
             heard: Box::new(|| None),
             school: Box::new(|| None),
             name_of: None,
+            registry: None,
         }
     }
 }
@@ -493,6 +497,7 @@ mod tests {
             heard: Box::new(|| Some("is the bus late".to_owned())),
             school: Box::new(|| None),
             name_of: None,
+            registry: None,
         };
         assert_eq!((full.heard)().as_deref(), Some("is the bus late"));
         assert_eq!((empty.heard)(), None);

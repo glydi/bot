@@ -9,6 +9,7 @@ pub mod app;
 pub mod check;
 pub mod config;
 pub mod health;
+pub mod registry;
 pub mod school;
 pub mod tee;
 pub mod text;

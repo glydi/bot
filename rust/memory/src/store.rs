@@ -1146,7 +1146,7 @@ impl Store {
     /// 12 hex chars, like `uuid4().hex[:12]` (Python) and 6 random bytes
     /// (Go). Seeded from the name and the clock through a randomly keyed
     /// hasher, and re-drawn on the (astronomically unlikely) collision.
-    fn new_id(&self, name: &str) -> EntityId {
+    pub(crate) fn new_id(&self, name: &str) -> EntityId {
         let names = self.names.read();
         loop {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -1640,6 +1640,23 @@ impl Store {
     /// Drop what was stashed for `track` (it left, or was merged).
     pub fn drop_stash(&self, track: u32) {
         self.stash.lock().by_track.remove(&track);
+    }
+
+    /// Take everything stashed for `track` as `(faces, face crops,
+    /// voices)`, leaving nothing behind. For the panel's registration
+    /// ([`Store::register_track`]).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn take_stash(
+        &self,
+        track: u32,
+    ) -> Option<(Vec<Vec<f32>>, Vec<Option<Vec<u8>>>, Vec<Vec<f32>>)> {
+        self.stash.lock().by_track.remove(&track).map(|s| {
+            (
+                s.face.into_iter().collect(),
+                s.face_crops.into_iter().collect(),
+                s.voice.into_iter().collect(),
+            )
+        })
     }
 
     /// How many stranger tracks have samples stashed.

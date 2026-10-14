@@ -11,6 +11,9 @@
 //!     cargo run -p act-ui --example face -- --faces         # the presence strip, no panel
 //!     cargo run -p act-ui --example face -- --no-strip      # only the face
 //!     cargo run -p act-ui --example face -- --strip-shot    # the docs/presence-strip.png pose
+//!     cargo run -p act-ui --example face -- --register      # panel: a stranger, the card in 1.5 s
+//!     cargo run -p act-ui --example face -- --register form # one registration screen held:
+//!                                                           # offer form same capture done people
 //!
 //! Runs on the main thread, like the binary must. The screenshots in
 //! `docs/` come from `--state <name>`, captured a few seconds in; the
@@ -41,7 +44,15 @@ fn main() {
     let no_strip = args.iter().any(|a| a == "--no-strip");
     // `--panel`: the face-less home screen (the chest panel), with the
     // tracking overlay and the school badge.
-    let panel = args.iter().any(|a| a == "--panel");
+    // `--register [screen]`: the panel with a stranger looking at it and
+    // a fake local gallery; with a screen name, that screen held.
+    let register = args.iter().position(|a| a == "--register").map(|i| {
+        args.get(i + 1)
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .unwrap_or_default()
+    });
+    let panel = args.iter().any(|a| a == "--panel") || register.is_some();
     let faces = faces || panel;
     // `--react <name>`: play that reaction over the held state every
     // 2.5 s (the yawn is 1.6 s; the pause between lets it read as one).
@@ -62,11 +73,12 @@ fn main() {
         .position(|a| a == "--state")
         .and_then(|i| args.get(i + 1))
         .or_else(|| {
-            // A bare state name, skipping the value of `--react`.
+            // A bare state name, skipping the value of `--react` and
+            // `--register`.
             let mut skip = false;
             args.iter().find(|a| {
                 let take = !skip && !a.starts_with("--");
-                skip = *a == "--react";
+                skip = *a == "--react" || *a == "--register";
                 take
             })
         })
@@ -88,9 +100,17 @@ fn main() {
     let _router = router.spawn().unwrap_or_else(|e| panic!("router: {e}"));
     let (obs_tx, obs_rx) = ObservationRing::bounded(64);
 
-    std::thread::spawn(move || drive(hold, react, music, faces, strip_shot, &queue, &obs_tx));
+    let stranger = register.is_some();
+    std::thread::spawn(move || {
+        drive(
+            hold, react, music, faces, strip_shot, stranger, &queue, &obs_tx,
+        );
+    });
 
-    let sources = demo_sources(faces);
+    let mut sources = demo_sources(faces);
+    if register.is_some() {
+        sources.registry = Some(std::sync::Arc::new(DemoRegistry::default()));
+    }
 
     // The panel is off by default, as in the binary: the face is the
     // product and the panel is for whoever is debugging it.
@@ -104,6 +124,7 @@ fn main() {
         } else {
             act_ui::Tab::Face
         },
+        register_demo: register.filter(|r| !r.is_empty()),
         ..UiConfig::default()
     };
     if let Err(e) = run_ui(&config, ui_rx, Some(obs_rx), sources) {
@@ -116,12 +137,18 @@ fn main() {
 /// speech-shaped level while speaking so the mouth has something to
 /// follow; a reaction every 2.5 s with `--react`, a beat every 1.25 s
 /// with `--music`.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 fn drive(
     hold: Option<Expression>,
     react: Option<act_ui::Reaction>,
     music: bool,
     faces: bool,
     strip_shot: bool,
+    stranger: bool,
     queue: &CommandQueue,
     obs_tx: &common::RingSender,
 ) {
@@ -190,11 +217,30 @@ fn drive(
                 if faces && tick % 10 == 0 {
                     obs_tx.send(
                         Observation::new("cam0", common::MODALITY_CAMERA_PREVIEW, Instant::now())
-                            .with_payload(Payload::Opaque(std::sync::Arc::new(synthetic_preview(
-                                t0.elapsed().as_secs_f32(),
-                            )))),
+                            .with_payload(Payload::Opaque(std::sync::Arc::new({
+                                let mut p = synthetic_preview(t0.elapsed().as_secs_f32());
+                                if stranger {
+                                    // The stranger steps up and looks.
+                                    for f in &mut p.faces {
+                                        f.focused = f.track == 4;
+                                        f.engaged = f.track == 4;
+                                    }
+                                }
+                                p
+                            }))),
                     );
-                    tracking_demo(obs_tx, t0);
+                    if stranger {
+                        // Burst progress on the stranger, for the capture
+                        // screen: climbing to 9 of 16 and held there.
+                        let k = (t0.elapsed().as_secs() + 3).min(9) as f32 / 16.0;
+                        obs_tx.send(
+                            Observation::new("cam0", "face_enrol_progress", Instant::now())
+                                .with_entity(common::EntityHint::Track(4))
+                                .with_payload(Payload::Level(k)),
+                        );
+                    } else {
+                        tracking_demo(obs_tx, t0);
+                    }
                 }
                 if music && tick % 62 == 0 {
                     obs_tx.send(
@@ -441,6 +487,82 @@ fn demo_sources(faces: bool) -> Sources {
         name_of: Some(Box::new(|id: &str| {
             id.strip_prefix("person:").map(str::to_owned)
         })),
+        registry: None,
+    }
+}
+
+/// The example's local gallery: Ana with a face, Rohan by name only,
+/// Sony with a face (so "Sony" asks "Are you the same Sony?").
+struct DemoRegistry {
+    people: std::sync::Mutex<Vec<act_ui::PersonRow>>,
+}
+
+impl Default for DemoRegistry {
+    fn default() -> Self {
+        let row = |id: &str, name: &str, role: &str, samples| act_ui::PersonRow {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            role: role.to_owned(),
+            samples,
+            registered: 1_791_000_000,
+        };
+        Self {
+            people: std::sync::Mutex::new(vec![
+                row("person:ana", "Ana", "teacher", 14),
+                row("person:dev", "Dev", "student", 16),
+                row("person:rohan", "Rohan", "student", 0),
+                row("person:sony", "Sony", "parent", 9),
+            ]),
+        }
+    }
+}
+
+impl act_ui::Registry for DemoRegistry {
+    fn check_name(&self, name: &str) -> act_ui::NameCheck {
+        let people = self
+            .people
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match people.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
+            Some(p) if p.samples > 0 => act_ui::NameCheck::SameName(p.id.clone()),
+            Some(p) => act_ui::NameCheck::Attach(p.id.clone()),
+            None => act_ui::NameCheck::Free,
+        }
+    }
+    fn register(
+        &self,
+        _track: u32,
+        target: Option<&str>,
+        reg: &act_ui::Registration,
+    ) -> Result<(String, usize), String> {
+        eprintln!("register {reg:?} -> {target:?}");
+        Ok((target.unwrap_or("person:new").to_owned(), 3))
+    }
+    fn bind_more(&self, _track: u32, _id: &str) -> usize {
+        0
+    }
+    fn declined(&self, track: u32) {
+        eprintln!("declined on track {track}");
+    }
+    fn people(&self) -> Vec<act_ui::PersonRow> {
+        self.people
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|p| p.samples > 0)
+            .cloned()
+            .collect()
+    }
+    fn clear_faces(&self, id: &str) -> bool {
+        eprintln!("clear faces of {id}");
+        true
+    }
+    fn forget(&self, id: &str) -> bool {
+        self.people
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|p| p.id != id);
+        true
     }
 }
 

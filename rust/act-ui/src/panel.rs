@@ -36,6 +36,8 @@ pub enum Screen {
     Home,
     /// The settings form.
     Settings,
+    /// Registered people, with re-capture and delete (from Settings).
+    People,
 }
 
 /// The panel's own state.
@@ -66,6 +68,8 @@ pub struct Panel {
     pub show_tracking: bool,
     /// Whether the ERP details card is open (a tap on the badge).
     erp_open: bool,
+    /// The registration flow ("Would you like me to remember you?").
+    pub register: crate::register_view::RegisterUi,
 }
 
 /// Camera width on the home screen, logical pixels.
@@ -107,6 +111,17 @@ impl Panel {
             ),
             show_tracking: crate::tracking::show_tracking_from_env(),
             erp_open: false,
+            register: crate::register_view::RegisterUi::default(),
+        }
+    }
+
+    /// Open on one registration screen, for screenshots (see
+    /// [`crate::UiConfig::register_demo`]).
+    pub fn register_demo(&mut self, which: &str, now: Instant) {
+        if which == "people" {
+            self.screen = Screen::People;
+        } else if let Some(step) = crate::register_view::demo_step(which, now) {
+            self.register.flow.show(step, now);
         }
     }
 
@@ -157,11 +172,37 @@ impl Panel {
             style(ui.ctx());
             self.styled = true;
         }
+        let registry = sources.registry.clone();
+        self.register.tick(state, registry.as_deref(), now);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(crate::PAGE).inner_margin(24.0))
-            .show(ui, |ui| match self.screen {
-                Screen::Home => self.home(ui, state, sources, now),
-                Screen::Settings => self.settings(ui),
+            .show(ui, |ui| {
+                // A registration takes the whole screen over home; the
+                // operator's pages are left alone.
+                if self.screen == Screen::Home && self.register.active() {
+                    let camera = self.preview.ensure(ui.ctx(), &state.faces);
+                    self.register
+                        .show(ui, state, registry.as_ref(), camera, now);
+                    return;
+                }
+                match self.screen {
+                    Screen::Home => self.home(ui, state, sources, now),
+                    Screen::Settings => self.settings(ui),
+                    Screen::People => {
+                        if crate::register_view::people_page(
+                            ui,
+                            &mut self.register,
+                            registry.as_ref(),
+                            now,
+                        ) {
+                            self.screen = if self.register.active() {
+                                Screen::Home
+                            } else {
+                                Screen::Settings
+                            };
+                        }
+                    }
+                }
             });
     }
 
@@ -322,6 +363,13 @@ impl Panel {
             }
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Settings").size(28.0).color(INK));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if big_button(ui, "People").clicked() {
+                    self.screen = Screen::People;
+                    self.register.notice = None;
+                    self.register.confirm_delete = None;
+                }
+            });
         });
         ui.add_space(8.0);
 

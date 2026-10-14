@@ -28,6 +28,7 @@ pub mod extract;
 pub mod gallery;
 pub mod graph;
 pub mod hygiene;
+pub mod register;
 pub mod social;
 pub mod store;
 pub mod worker;
@@ -38,6 +39,7 @@ pub use deliberate::tools::Reminder;
 pub use extract::{EXTRACT_PROMPT, Extracted, SUMMARY_PROMPT, is_small_talk, parse};
 pub use gallery::FaceGallery;
 pub use hygiene::{Merged, canon_name, plausible_name};
+pub use register::{NameStatus, Profile, RegisteredPerson};
 pub use social::{
     CHECK_IN_WORDS, OFTEN_WITH, OFTEN_WITH_MIN_OVERLAP, OFTEN_WITH_MIN_VISITS, event_in,
     relation_sentence,

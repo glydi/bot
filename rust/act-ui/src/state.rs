@@ -145,6 +145,13 @@ pub struct UiState {
     /// actually played, which is the only honest source: a `say` command
     /// may be cancelled by a barge-in before a word of it is heard.
     pub said: Option<String>,
+    /// Bumped by each `ui` command `register` (the conversation heard a
+    /// yes to "shall I remember you?"); the panel offers the card when it
+    /// changes. See [`crate::register`].
+    pub register_asks: u64,
+    /// The track that `register` named (`Payload::Text` of the track
+    /// number, `"12"` or `"track:12"`); `None` is the focused stranger.
+    pub register_track: Option<u32>,
     /// Speaker levels waiting out the output latency, with when each is due.
     pending_levels: VecDeque<(Instant, f32)>,
     /// See [`lip_sync_delay`].
@@ -174,6 +181,8 @@ impl UiState {
             behaviour,
             faces: Faces::default(),
             said: None,
+            register_asks: 0,
+            register_track: None,
             pending_levels: VecDeque::with_capacity(16),
             lip_sync: lip_sync_delay(),
         }
@@ -241,6 +250,16 @@ impl UiState {
                 } else {
                     tracing::warn!(%name, "ui: unknown reaction");
                 }
+            }
+            // Show the registration card: the person said yes to
+            // "shall I remember you?". The track, if the command names
+            // one, as `Text("12")` or `Text("track:12")`.
+            "register" => {
+                self.register_track = cmd
+                    .payload
+                    .as_text()
+                    .and_then(|t| t.trim().trim_start_matches("track:").parse::<u32>().ok());
+                self.register_asks += 1;
             }
             "listening" => self.face.set_hearing(true, now),
             "thinking" => self.face.set_thinking(true, now),

@@ -512,6 +512,13 @@ impl App {
         // thread, so a microphone stuck behind the permission prompt no
         // longer stands between the person and the window.
         let mut sources = ui_sources(&reflex, &timeline, Arc::clone(&store), epoch);
+        // The panel's "Would you like me to remember you?" flow and its
+        // People page, over the same local store (crate::registry).
+        sources.registry = Some(Arc::new(crate::registry::StoreRegistry::new(
+            Arc::clone(&store),
+            obs_tx.clone(),
+            Arc::clone(&clock),
+        )));
         if let Some(school) = school.clone() {
             sources.school = Box::new(move || Some(school.view()));
         }
