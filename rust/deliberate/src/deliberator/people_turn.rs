@@ -146,9 +146,8 @@ impl Session {
         // and another known face is in view while the focus is not them):
         // no name at all. Live: "Hello Kalyan!" to Sony.
         let explicit = speaker.is_some_and(|s| !s.is_track());
-        if !explicit
-            && let Some(i) = &id
-            && self.name_ambiguous(i)
+        if let Some(i) = &id
+            && ((!explicit && self.name_ambiguous(i)) || self.face_unsure(i))
         {
             tracing::info!(%i, "recognition ambiguous: no name used");
             return (id, None);
@@ -167,9 +166,48 @@ impl Session {
     /// Whether saying `id`'s name could be a wrong guess: another known
     /// face is in view and the camera's focus is not `id`.
     pub(super) fn name_ambiguous(&self, id: &EntityId) -> bool {
+        if self.face_unsure(id) {
+            return true;
+        }
         let view = (self.snapshot)();
         let others = view.people.iter().any(|p| p.is_known() && &p.id != id);
         others && view.working.focus.as_ref() != Some(id)
+    }
+
+    /// The camera reported, within [`super::FACE_AMBIGUOUS_TTL`], that the
+    /// face in focus could be `id` or someone else (or `id` is that track).
+    pub(super) fn face_unsure(&self, id: &EntityId) -> bool {
+        self.face_ambiguous
+            .as_ref()
+            .is_some_and(|(track, ids, at)| {
+                self.clock.now().saturating_duration_since(*at) < super::FACE_AMBIGUOUS_TTL
+                    && (ids.contains(id) || track == id)
+            })
+    }
+
+    /// "Are you Sony or Kalyan?", once per visit, while the camera cannot
+    /// tell the two apart on the face in focus; `None` otherwise.
+    pub(super) fn ask_which(&mut self, id: &EntityId) -> Option<String> {
+        if !self.face_unsure(id) {
+            return None;
+        }
+        if self.visit.asked_which {
+            tracing::info!(%id, "face ambiguous: asked already, no name, no hello");
+            return None;
+        }
+        let (track, ids, _) = self.face_ambiguous.clone()?;
+        let named: Vec<(EntityId, String)> = ids
+            .iter()
+            .filter_map(|i| self.facts.name_of(i).map(|n| (i.clone(), n)))
+            .collect();
+        if named.len() < 2 {
+            return None;
+        }
+        self.visit.asked_which = true;
+        let line = format!("Are you {} or {}?", named[0].1, named[1].1);
+        self.visit.awaiting = Some(Awaiting::WhichOf(track, named));
+        self.sync_expect_name();
+        Some(line)
     }
 
     /// Known people in view, and an unknown face that is not the speaker.
@@ -341,7 +379,28 @@ impl Session {
         // "my brother is coming ..." then "his name is Joel".
         let late = understand::third_person_name(text)
             .and_then(|n| self.visit.mentioned_kin.take().map(|w| (n, w)));
+        // "Are you Sony or Kalyan?" answered: the face is bound to the one
+        // they named, and this turn is a hello to them.
+        let which = match &self.visit.awaiting {
+            Some(Awaiting::WhichOf(track, named)) => {
+                let said = understand::words(text);
+                named
+                    .iter()
+                    .find(|(_, n)| said.contains(&n.to_lowercase()))
+                    .map(|(who, n)| (track.clone(), who.clone(), n.clone()))
+            }
+            _ => None,
+        };
+        if let Some((track, who, n)) = &which {
+            self.visit.awaiting = None;
+            self.face_ambiguous = None;
+            self.name_companion(track, n);
+            self.current_person = Some((who.clone(), n.clone()));
+            me = Some(who.clone());
+            my_name = Some(n.clone());
+        }
         let awaited = match (&self.visit.awaiting, bare_name(text)) {
+            _ if which.is_some() => Some(Understanding::of("greet")),
             _ if late.is_some() => late.map(|(n, w)| {
                 let mut u = Understanding::of("tell_relation");
                 u.people.push(Mention {
@@ -982,7 +1041,12 @@ impl Session {
         if let Some(hook) = self.people.as_ref().and_then(|p| p.expecting_name.as_ref()) {
             hook(matches!(
                 self.visit.awaiting,
-                Some(Awaiting::Name | Awaiting::Companion | Awaiting::RelationName(_))
+                Some(
+                    Awaiting::Name
+                        | Awaiting::Companion
+                        | Awaiting::RelationName(_)
+                        | Awaiting::WhichOf(..)
+                )
             ));
         }
     }
@@ -2468,6 +2532,60 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// `face_ambiguous`: the camera cannot tell Sony from Kalyan on the
+    /// face in focus. No hello by either name, the question once, and the
+    /// answer binds the face.
+    #[tokio::test]
+    async fn ambiguous_face_asks_once_and_binds_the_answer() {
+        let mut r = rig(vec![]);
+        let sony = r.facts.add_person("Sony");
+        let kalyan = r.facts.add_person("Kalyan");
+        let track = EntityId::for_track(4);
+        *r.room.lock() = vec![face("track:4", None)];
+        let now = r.s.clock.now();
+        r.s.face_ambiguous = Some((track.clone(), vec![sony.clone(), kalyan.clone()], now));
+        let shutdown = CancellationToken::new();
+        let current = Arc::new(Mutex::new(None));
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            for who in [&sony, &kalyan] {
+                let j = format!(
+                    r#"{{"decision":"greet","name":"x","entity":"{}","goal":"greet"}}"#,
+                    who.as_str()
+                );
+                let cmd = Command::new(
+                    super::super::INTENT_TARGET,
+                    super::super::INTENT_KIND,
+                    Priority::Reflex,
+                )
+                .with_payload(Payload::Text(j));
+                r.s.on_intent(cmd, &mut r.rx, &shutdown, &current).await;
+                said.extend(
+                    std::iter::from_fn(|| r.q.try_pop())
+                        .filter(|c| c.kind == "say")
+                        .map(|c| c.payload.as_text().unwrap_or("").to_owned()),
+                );
+            }
+            r.clock.advance(Duration::from_secs(1));
+        }
+        assert_eq!(said, vec!["Are you Sony or Kalyan?".to_owned()], "{said:?}");
+        // While unsure (the camera keeps reporting it), even a
+        // voice-matched speaker is not named.
+        let now = r.s.clock.now();
+        r.s.face_ambiguous = Some((track.clone(), vec![sony.clone(), kalyan.clone()], now));
+        let l = r.say("hello", Some(&sony)).await;
+        assert!(!l.contains("Sony") && !l.contains("Kalyan"), "{l}");
+        // The answer binds the face and greets the one named.
+        r.s.visit.awaiting = Some(Awaiting::WhichOf(
+            track,
+            vec![(sony, "Sony".into()), (kalyan.clone(), "Kalyan".into())],
+        ));
+        let l = r.say("I'm Kalyan", None).await;
+        assert!(l.contains("Kalyan"), "{l}");
+        assert_eq!(r.s.current_person.as_ref().map(|c| &c.0), Some(&kalyan));
+        assert!(r.s.face_ambiguous.is_none());
     }
 
     fn json(intent: &str, people: &str, facts: &str) -> String {

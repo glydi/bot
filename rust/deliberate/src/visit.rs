@@ -57,6 +57,8 @@ pub struct Visit {
     pub awaiting: Option<Awaiting>,
     /// The people moment (greeting from the graph) was said.
     pub greeted: bool,
+    /// "Are you Sony or Kalyan?" was asked this visit (once).
+    pub asked_which: bool,
     /// People they told about before giving their own name ("this is my
     /// sister Priya" from a stranger): stored once the name comes.
     pub pending_people: Vec<crate::understand::Mention>,
@@ -71,6 +73,9 @@ pub enum Awaiting {
     Companion,
     /// The name of "my sister" (the word).
     RelationName(String),
+    /// Which of two known people the face in focus is: the track and the
+    /// candidates, after "Are you Sony or Kalyan?".
+    WhichOf(EntityId, Vec<(EntityId, String)>),
 }
 
 /// Most people the notebook keeps as reference targets.

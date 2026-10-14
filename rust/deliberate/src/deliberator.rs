@@ -69,6 +69,11 @@ pub const INTENT_TARGET: &str = "deliberate";
 /// Command kind of a planner intent; the payload is the JSON documented in
 /// `mind::plan`.
 pub const INTENT_KIND: &str = "intent";
+/// `sense_vision::MODALITY_FACE_AMBIGUOUS`: the face in focus could be
+/// either of two known people (payload "<idA>\t<idB>", entity the track).
+pub const FACE_AMBIGUOUS: &str = "face_ambiguous";
+/// How long one `face_ambiguous` report holds without a new one.
+pub const FACE_AMBIGUOUS_TTL: Duration = Duration::from_secs(3);
 
 /// Target of the command we emit after a successful `remember_name`, so
 /// the binary can fold a `name_binding` observation into the world.
@@ -715,6 +720,9 @@ pub struct Session {
     spec: crate::speculate::Speculator,
     /// What a confirmed speculation handed to the turn being answered.
     prepared: Option<crate::speculate::Prepared>,
+    /// The camera cannot tell two known people apart on the face in focus
+    /// (`face_ambiguous`): the track, the two ids, when last reported.
+    face_ambiguous: Option<(EntityId, Vec<EntityId>, Instant)>,
 }
 
 impl Session {
@@ -735,6 +743,7 @@ impl Session {
         Self {
             spec,
             prepared: None,
+            face_ambiguous: None,
             backend,
             // The reach tools the environment allows, run for real; the
             // policy is read once here and `specs()` describes exactly
@@ -1439,6 +1448,17 @@ impl Session {
             let returned = intent
                 .returned_after_secs
                 .is_some_and(|s| s >= VISIT_GAP.as_secs());
+            // The camera cannot tell who this is: never a name; the
+            // question once, then nothing.
+            if greeting
+                && let Some(id) = entity.as_ref()
+                && self.face_unsure(id)
+            {
+                let line = self.ask_which(id)?;
+                let mut p = Proactive::new(Moment::StrangerSettled, line);
+                p.entity.clone_from(&entity);
+                return Some(Planned::Turn(p));
+            }
             if greeting && let Some(id) = entity.as_ref().filter(|i| !i.is_track()) {
                 if returned {
                     self.greeted_at.remove(id);
@@ -3361,6 +3381,24 @@ impl Session {
                         let req = |t: &str| Some(self.chat_request(t, name.as_deref()));
                         spec.on_partial(p, || notebook, req);
                         self.spec = spec;
+                    }
+                    continue;
+                }
+                FACE_AMBIGUOUS => {
+                    // "<idA>\t<idB>" on the track the camera is unsure of.
+                    if let (Some(track), Some(t)) = (
+                        o.entity.as_ref().and_then(common::EntityHint::track),
+                        o.payload.as_text(),
+                    ) {
+                        let ids: Vec<EntityId> = t
+                            .split('\t')
+                            .map(str::trim)
+                            .filter(|x| !x.is_empty())
+                            .map(EntityId::new)
+                            .collect();
+                        if ids.len() >= 2 {
+                            self.face_ambiguous = Some((EntityId::for_track(track), ids, now));
+                        }
                     }
                     continue;
                 }
