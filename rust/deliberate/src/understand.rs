@@ -528,6 +528,42 @@ fn name_word(w: &str) -> bool {
 pub fn first_name_in(text: &str) -> Option<String> {
     let w = words(text);
     let s: Vec<&str> = w.iter().map(String::as_str).collect();
+    // "namaste beta, I am Kamala", "hi, this is Kavya": greetings first.
+    let s: Vec<&str> = s
+        .iter()
+        .copied()
+        .skip_while(|x| {
+            matches!(
+                *x,
+                "hi" | "hello"
+                    | "hey"
+                    | "namaste"
+                    | "namaskar"
+                    | "beta"
+                    | "ji"
+                    | "good"
+                    | "morning"
+                    | "afternoon"
+                    | "evening"
+                    | "glydi"
+            )
+        })
+        .collect();
+    // "this is Kavya" / "this is Mrs Kapoor" said of oneself (not "this
+    // is my sister ...", a relation).
+    if let ["this", "is", n, rest @ ..] = s.as_slice()
+        && *n != "my"
+        && rest.len() <= 1
+    {
+        if let (Some(t), Some(m)) = (title_word(n), rest.first())
+            && name_word(m)
+        {
+            return Some(format!("{t} {}", cap(m)));
+        }
+        if rest.is_empty() && name_word(n) {
+            return Some(cap(n));
+        }
+    }
     let after = match s.as_slice() {
         ["my", "name", "is", rest @ ..]
         | ["my", "name's", rest @ ..]
@@ -1572,6 +1608,18 @@ mod tests {
                 assert_eq!(r.u.intent, "chit_chat", "{what}");
             }
         }
+    }
+
+    #[test]
+    fn signed_sums_are_everyday() {
+        assert_eq!(rules("what is minus five plus three").unwrap().intent, "everyday");
+        assert_eq!(rules("what is 10 divided by 0").map(|u| u.intent).as_deref(), Some("everyday"));
+        assert_eq!(rules("hi, this is Kavya").unwrap().people[0].name, "Kavya");
+        assert_eq!(rules("this is Mrs Kapoor").unwrap().people[0].name, "Mrs Kapoor");
+        assert_eq!(
+            rules("namaste beta, I am Kamala, Rohan's grandmother").unwrap().people[0].name,
+            "Kamala"
+        );
     }
 
     #[test]

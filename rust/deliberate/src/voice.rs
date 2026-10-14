@@ -1835,6 +1835,10 @@ pub fn roleplay_request(text: &str) -> bool {
         " ignore previous instructions ",
         " forget your instructions ",
         " your system prompt ",
+        " your schema ",
+        " json schema ",
+        " your prompt ",
+        " your instructions ",
         " developer mode ",
         " jailbreak ",
     ]

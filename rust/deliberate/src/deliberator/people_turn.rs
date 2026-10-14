@@ -99,7 +99,8 @@ const REPHRASE: &[&str] = &[
     "tell_name",
     "correct_name",
     "forget_me",
-    "everyday",
+    // Not "everyday": sums, dates and times are said exactly (the model
+    // turned "can't divide by zero" into "Got it, a tricky one").
     "out_of_zone",
     "unclear",
 ];
@@ -410,6 +411,17 @@ impl Session {
                 });
                 u
             }),
+            (Some(Awaiting::Name), _)
+                if bare_name(text).is_none()
+                    && crate::voice::spelled_name(text, true).is_some() =>
+            {
+                let mut u = Understanding::of("tell_name");
+                u.people.push(Mention {
+                    name: crate::voice::spelled_name(text, true).unwrap_or_default(),
+                    ..Mention::default()
+                });
+                Some(u)
+            }
             (Some(Awaiting::Name), Some(n)) => {
                 let mut u = Understanding::of("tell_name");
                 u.people.push(Mention {
@@ -1910,7 +1922,7 @@ fn everyday_answer(text: &str) -> String {
         if v == super::DIVIDE_BY_ZERO {
             return "That can't be done: you can't divide by zero.".to_owned();
         }
-        return format!("That's {v}.");
+        return format!("That's {}.", group_digits(&v));
     }
     if t.contains("yesterday") {
         return format!("Yesterday was {}.", super::local_clock_yesterday());
@@ -2019,17 +2031,11 @@ fn reasons_about(text: &str) -> bool {
     .any(|w| t.contains(w))
 }
 
-/// Whether a question leans on something they said earlier this visit:
+/// Whether a question compares over what they said earlier this visit:
 /// it shares a name or a content word with one of their earlier lines, or
 /// it compares ("which", "whose", "first", "older", "how many") after they
 /// told the bot facts.
 fn refers_to_told(text: &str, visit: &crate::visit::Visit) -> bool {
-    const STOP: &[&str] = &[
-        "what", "which", "whose", "who", "when", "where", "how", "should", "could", "would",
-        "will", "can", "the", "a", "an", "is", "are", "do", "does", "did", "i", "my", "me", "of",
-        "them", "they", "to", "for", "first", "last", "this", "that", "it", "and", "or", "you",
-        "your", "have", "has", "one", "pick", "up", "today", "week", "after", "before",
-    ];
     let told: Vec<String> = visit
         .exchanges
         .iter()
@@ -2039,13 +2045,6 @@ fn refers_to_told(text: &str, visit: &crate::visit::Visit) -> bool {
         return false;
     }
     let w = understand::words(text);
-    let shared = w
-        .iter()
-        .filter(|x| x.len() > 2 && !STOP.contains(&x.as_str()))
-        .any(|x| {
-            told.iter()
-                .any(|t| t.trim_end_matches("'s") == x.trim_end_matches("'s"))
-        });
     let t = format!(" {} ", w.join(" "));
     let compares = [
         " which ",
@@ -2063,7 +2062,30 @@ fn refers_to_told(text: &str, visit: &crate::visit::Visit) -> bool {
     ]
     .iter()
     .any(|c| t.contains(c));
-    shared || (compares && visit.exchanges.len() >= 2)
+    compares && visit.exchanges.len() >= 2
+}
+
+/// "9999800001" -> "9,999,800,001": a long number read as a number, not
+/// as a phone number.
+fn group_digits(v: &str) -> String {
+    let (sign, rest) = v.strip_prefix('-').map_or(("", v), |r| ("-", r));
+    let (int, frac) = rest
+        .split_once('.')
+        .map_or((rest, None), |(i, f)| (i, Some(f)));
+    if int.len() < 5 || !int.bytes().all(|b| b.is_ascii_digit()) {
+        return v.to_owned();
+    }
+    let mut out = String::new();
+    for (i, c) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    match frac {
+        Some(f) => format!("{sign}{out}.{f}"),
+        None => format!("{sign}{out}"),
+    }
 }
 
 /// The most words any spoken reply carries.
