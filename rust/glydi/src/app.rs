@@ -410,7 +410,12 @@ impl App {
                     people: if parts.legacy_lanes {
                         None
                     } else {
-                        people_first(config)
+                        // With a screen, strangers are offered the
+                        // registration card instead of a spoken name question.
+                        people_first(config).map(|mut p| {
+                            p.register_panel = !parts.headless;
+                            p
+                        })
                     },
                     // Every answered turn and its reward, for offline
                     // learning (`GLYDI_LEARN=0` turns it off).
@@ -2143,6 +2148,8 @@ fn people_first(config: &Config) -> Option<deliberate::People> {
         handoff: deliberate::handoff::from_env(),
         think_ack: std::env::var("GLYDI_THINK_ACK").is_ok_and(|v| v.trim() == "1"),
         deep: deep_backend(config),
+        // Set by the caller when there is a screen.
+        register_panel: false,
         expecting_name: Some(Arc::new(|on| {
             if let Some(flag) = NAME_EXPECTED.get() {
                 flag.store(on, std::sync::atomic::Ordering::Relaxed);

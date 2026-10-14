@@ -78,6 +78,8 @@ pub enum Awaiting {
     /// Which of two known people the face in focus is: the track and the
     /// candidates, after "Are you Sony or Kalyan?".
     WhichOf(EntityId, Vec<(EntityId, String)>),
+    /// "Would you like me to remember you?" (the stranger's track).
+    RememberOffer(Option<EntityId>),
 }
 
 /// Most people the notebook keeps as reference targets.

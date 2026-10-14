@@ -72,6 +72,11 @@ pub const INTENT_KIND: &str = "intent";
 /// `sense_vision::MODALITY_FACE_AMBIGUOUS`: the face in focus could be
 /// either of two known people (payload "<idA>\t<idB>", entity the track).
 pub const FACE_AMBIGUOUS: &str = "face_ambiguous";
+/// The panel registered someone (`glydi::registry`): entity
+/// `KnownOnTrack(id, track)`, payload `Text(name)`.
+pub const REGISTRATION: &str = "registration";
+/// "Not now" on the panel's card: entity `Track(t)`.
+pub const REGISTRATION_DECLINED: &str = "registration_declined";
 /// How long one `face_ambiguous` report holds without a new one.
 pub const FACE_AMBIGUOUS_TTL: Duration = Duration::from_secs(3);
 
@@ -723,6 +728,9 @@ pub struct Session {
     /// The camera cannot tell two known people apart on the face in focus
     /// (`face_ambiguous`): the track, the two ids, when last reported.
     face_ambiguous: Option<(EntityId, Vec<EntityId>, Instant)>,
+    /// The track the utterance being answered came from, when its
+    /// speaker is a stranger (for the registration card).
+    pub(super) utterance_track: Option<EntityId>,
 }
 
 impl Session {
@@ -744,6 +752,7 @@ impl Session {
             spec,
             prepared: None,
             face_ambiguous: None,
+            utterance_track: None,
             backend,
             // The reach tools the environment allows, run for real; the
             // policy is read once here and `specs()` describes exactly
@@ -1582,7 +1591,15 @@ impl Session {
                     self.visit.awaiting = Some(crate::visit::Awaiting::Name);
                 }
                 self.pending_name = Some((entity.clone(), self.clock.now()));
-                let mut p = Proactive::new(Moment::StrangerSettled, ASK_NAME_LINE);
+                // With the screen's registration card, one short line
+                // pointing at it, not a spoken name question as well.
+                let line = if self.register_panel() {
+                    self.visit.awaiting = None;
+                    crate::deliberator::people_turn::TAP_REGISTER
+                } else {
+                    ASK_NAME_LINE
+                };
+                let mut p = Proactive::new(Moment::StrangerSettled, line);
                 p.entity = entity;
                 Some(Planned::Turn(p))
             }
@@ -3384,6 +3401,33 @@ impl Session {
                     }
                     continue;
                 }
+                REGISTRATION if o.source == "panel" => {
+                    if let (Some(id), Some(name)) = (
+                        o.entity
+                            .as_ref()
+                            .and_then(common::EntityHint::known)
+                            .cloned(),
+                        o.payload.as_text().map(str::trim).filter(|n| !n.is_empty()),
+                    ) {
+                        let name = name.to_owned();
+                        self.registered(&id, &name);
+                    }
+                    continue;
+                }
+                REGISTRATION_DECLINED => {
+                    // "Not now" on the card: no name question this visit.
+                    self.name_declined = true;
+                    self.visit_asked_name = true;
+                    if matches!(
+                        self.visit.awaiting,
+                        Some(
+                            crate::visit::Awaiting::Name | crate::visit::Awaiting::RememberOffer(_)
+                        )
+                    ) {
+                        self.visit.awaiting = None;
+                    }
+                    continue;
+                }
                 FACE_AMBIGUOUS => {
                     // "<idA>\t<idB>" on the track the camera is unsure of.
                     if let (Some(track), Some(t)) = (
@@ -3501,6 +3545,12 @@ impl Session {
                 Some(id) => id.clone(),
                 None => EntityId::for_track(h.track().unwrap_or_default()),
             });
+            self.utterance_track = o
+                .entity
+                .as_ref()
+                .filter(|h| h.known().is_none())
+                .and_then(common::EntityHint::track)
+                .map(EntityId::for_track);
             // The hook the mind asked for travels the same way: it is
             // for this utterance if it names its speaker and is fresh.
             self.hook = self.hook_for.take().is_some_and(|(id, at)| {
@@ -5072,6 +5122,164 @@ mod tests {
         assert!(before.iter().all(|c| c.kind != "say"), "{before:?}");
         assert_eq!(calls, 2, "the final is understood afresh");
         assert!(after.iter().any(|c| c.kind == "say"), "{after:?}");
+    }
+
+    /// A spawned people-mode deliberator with the registration screen;
+    /// `steps` are fed in order, and what it said / sent to the ui comes
+    /// back, per step.
+    fn panel_run(steps: Vec<Observation>, facts: Arc<InMemoryFacts>) -> Vec<Vec<(String, String)>> {
+        let (obs_tx, obs_rx) = crossbeam_channel::bounded::<Observation>(8);
+        let llm = MockLlm::new(vec![]);
+        let commands = Arc::new(CommandQueue::new());
+        let mut config = model_config();
+        config.people = Some(crate::People {
+            register_panel: true,
+            ..crate::People::default()
+        });
+        config.attention = false;
+        let handle = Deliberator::spawn_with(
+            llm,
+            config,
+            obs_rx,
+            room_with(vec![]),
+            facts,
+            commands.clone(),
+            Arc::new(FakeClock::new()),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        for o in steps {
+            obs_tx.send(o).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            out.push(
+                std::iter::from_fn(|| commands.try_pop())
+                    .filter(|c| c.kind == "say" || c.target == "ui" && c.kind == "register")
+                    .map(|c| {
+                        (
+                            c.kind.to_string(),
+                            c.payload.as_text().unwrap_or("").to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        drop(obs_tx);
+        handle.shutdown();
+        out
+    }
+
+    fn panel_obs(modality: &str, entity: EntityHint, payload: Payload) -> Observation {
+        Observation::new("panel", modality, Instant::now())
+            .with_entity(entity)
+            .with_payload(payload)
+    }
+
+    fn heard(text: &str, entity: Option<EntityHint>) -> Observation {
+        let o = Observation::new("mic0", UTTERANCE, Instant::now())
+            .with_payload(Payload::Text(text.into()));
+        match entity {
+            Some(e) => o.with_entity(e),
+            None => o,
+        }
+    }
+
+    #[test]
+    fn a_panel_registration_is_greeted_once_and_never_asked_its_name() {
+        let facts = Arc::new(InMemoryFacts::new());
+        let ravi = facts.add_person("Ravi");
+        let reg = panel_obs(
+            REGISTRATION,
+            EntityHint::KnownOnTrack(ravi.clone(), 5),
+            Payload::Text("Ravi".into()),
+        );
+        let out = panel_run(
+            vec![
+                reg.clone(),
+                reg,
+                heard("hello", Some(EntityHint::Known(ravi))),
+            ],
+            facts,
+        );
+        assert_eq!(
+            out[0],
+            vec![("say".to_owned(), "Nice to meet you, Ravi!".to_owned())]
+        );
+        assert!(out[1].is_empty(), "{:?}", out[1]);
+        let said: Vec<&str> = out[2].iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            said.iter()
+                .all(|t| !t.contains("name") && !t.contains("remember you")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_card_stops_the_name_question() {
+        let facts = Arc::new(InMemoryFacts::new());
+        let out = panel_run(
+            vec![
+                panel_obs(REGISTRATION_DECLINED, EntityHint::Track(7), Payload::None),
+                heard("hello", Some(EntityHint::Track(7))),
+            ],
+            facts,
+        );
+        let said: Vec<&str> = out[1].iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            said.iter()
+                .all(|t| !t.contains("name") && !t.contains("remember you")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_yes_to_the_offer_opens_the_card_for_that_track() {
+        let facts = Arc::new(InMemoryFacts::new());
+        let out = panel_run(
+            vec![
+                heard("hello", Some(EntityHint::Track(9))),
+                heard("yes please", Some(EntityHint::Track(9))),
+            ],
+            facts,
+        );
+        assert_eq!(
+            out[0],
+            vec![(
+                "say".to_owned(),
+                crate::deliberator::people_turn::REMEMBER_OFFER.to_owned()
+            )]
+        );
+        assert!(
+            out[1].contains(&("register".to_owned(), "track:9".to_owned())),
+            "{:?}",
+            out[1]
+        );
+        assert!(
+            out[1].contains(&(
+                "say".to_owned(),
+                crate::deliberator::people_turn::TAP_REGISTER.to_owned()
+            )),
+            "{:?}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn with_the_panel_the_unprompted_line_points_at_the_screen() {
+        let mut config = model_config();
+        config.people = Some(crate::People {
+            register_panel: true,
+            ..crate::People::default()
+        });
+        let mut r = rig_with(vec![], vec![], config);
+        let p = r.session.plan_intent(&intent(
+            r#"{"decision":"ask_name","entity":"track:3","goal":"ask_name"}"#,
+        ));
+        match p {
+            Some(Planned::Turn(p)) => {
+                assert_eq!(p.canned, crate::deliberator::people_turn::TAP_REGISTER);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn intent(json: &str) -> Command {

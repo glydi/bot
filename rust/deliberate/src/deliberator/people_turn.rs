@@ -47,6 +47,9 @@ pub struct People {
     /// own, a relation's or a companion's), so the hearing side may read a
     /// bare one- or two-word reply as a name (`NameFixer::expect_name`).
     pub expecting_name: Option<ExpectName>,
+    /// The chest screen can register people (`registration` flow): the
+    /// bot offers that instead of asking a stranger's name aloud.
+    pub register_panel: bool,
 }
 
 /// See [`People::expecting_name`].
@@ -69,6 +72,7 @@ impl Default for People {
             think_ack: false,
             deep: None,
             expecting_name: None,
+            register_panel: false,
         }
     }
 }
@@ -81,6 +85,10 @@ pub const CLARIFY: &[&str] = &[
 ];
 /// Asked of a stranger once per visit.
 pub const ASK_NAME: &str = "Hello! I'm Glydi. What's your name?";
+/// A stranger greeting the bot, with the registration screen.
+pub const REMEMBER_OFFER: &str = "Hello! I'm Glydi. Would you like me to remember you?";
+/// The screen's card is the way in: one short line, no name question.
+pub const TAP_REGISTER: &str = "Tap Register on my screen and I'll remember you!";
 /// Asked when an unknown face stands beside someone known.
 pub const WHO_FRIEND: &str = "Who's your friend?";
 /// One "Sorry?" for a fragment per this long; silence otherwise.
@@ -241,6 +249,39 @@ impl Session {
             .map(|p| p.id.clone())
             .find(|id| Some(id) != speaker && Some(id) != focus.as_ref());
         (known, stranger)
+    }
+
+    /// Whether the chest screen can register people.
+    pub(super) fn register_panel(&self) -> bool {
+        self.people.as_ref().is_some_and(|p| p.register_panel)
+    }
+
+    /// Open the screen's registration card for `track` (or the focused
+    /// stranger).
+    pub(super) fn open_register(&self, track: Option<&EntityId>) {
+        let mut cmd = Command::new("ui", "register", Priority::Deliberate);
+        if let Some(t) = track.filter(|t| t.is_track()) {
+            cmd = cmd.with_payload(Payload::Text(t.as_str().to_owned()));
+        }
+        tracing::info!(track = ?track, "registration card requested");
+        self.commands.push(cmd);
+    }
+
+    /// The panel registered `id` as `name` (on `track`): one hello, and
+    /// they are the person in front now; never asked their name.
+    pub(super) fn registered(&mut self, id: &EntityId, name: &str) {
+        self.visit.awaiting = None;
+        self.visit_asked_name = true;
+        self.current_person = Some((id.clone(), name.to_owned()));
+        self.visit.name = Some(name.to_owned());
+        if self.greeted_this_visit(id) && self.visit.key.as_ref() == Some(id) {
+            return;
+        }
+        self.visit.key = Some(id.clone());
+        self.visit.greeted = true;
+        self.greeted_at.insert(id.clone(), self.clock.now());
+        self.attention_at = Some(self.clock.now());
+        self.speak_line(format!("Nice to meet you, {name}!"));
     }
 
     /// Whether `id` had their hello in this visit (the visit's own flag,
@@ -422,6 +463,41 @@ impl Session {
             self.visit.name.clone_from(&my_name);
         }
         // An answer the bot was waiting for, by rule.
+        // "Would you like me to remember you?" answered.
+        if let Some(Awaiting::RememberOffer(track)) = self.visit.awaiting.clone() {
+            let w = understand::words(text).join(" ");
+            let yes = matches!(
+                w.as_str(),
+                "yes"
+                    | "yeah"
+                    | "yep"
+                    | "ok"
+                    | "okay"
+                    | "sure"
+                    | "yes please"
+                    | "please"
+                    | "of course"
+            );
+            let no = matches!(
+                w.as_str(),
+                "no" | "nope" | "no thanks" | "not now" | "no thank you"
+            );
+            if yes || no {
+                self.visit.awaiting = None;
+                let line = if yes {
+                    self.open_register(track.as_ref());
+                    TAP_REGISTER
+                } else {
+                    self.name_declined = true;
+                    "No problem!"
+                };
+                self.speak_line(line.to_owned());
+                self.ui("idle");
+                return Ok(TurnEnd::Done);
+            }
+            // Anything else (a name, a question) is taken as it is.
+            self.visit.awaiting = None;
+        }
         // "my brother is coming ..." then "his name is Joel".
         let late = understand::third_person_name(text)
             .and_then(|n| self.visit.mentioned_kin.take().map(|w| (n, w)));
@@ -664,6 +740,15 @@ impl Session {
                 // and never the name question to someone we know.
                 (Some(_), None) => "Hello!".to_owned(),
                 _ if self.visit_asked_name => "Hello again!".to_owned(),
+                _ if self.register_panel() => {
+                    self.visit_asked_name = true;
+                    let track = speaker
+                        .filter(|s| s.is_track())
+                        .cloned()
+                        .or_else(|| self.utterance_track.clone());
+                    self.visit.awaiting = Some(Awaiting::RememberOffer(track));
+                    REMEMBER_OFFER.to_owned()
+                }
                 _ => {
                     self.visit_asked_name = true;
                     self.visit.awaiting = Some(Awaiting::Name);
@@ -2276,6 +2361,7 @@ mod tests {
                 think_ack: true,
                 deep: None,
                 expecting_name: Some(expect_hook),
+                register_panel: false,
             }),
             ..Config::default()
         };
