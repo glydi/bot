@@ -264,7 +264,10 @@ impl Panel {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if matches!(welcome, Welcome::Known { .. }) {
-                            ui.label(egui::RichText::new("\u{2713}").size(22.0).color(GOOD));
+                            // A drawn dot: the screen font has no tick glyph.
+                            let (r, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 22.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 6.0, GOOD);
                         }
                         ui.label(
                             egui::RichText::new(welcome.detail(&clock, school_view.as_ref()))
