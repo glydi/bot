@@ -836,11 +836,31 @@ impl AudioSense {
                             "parakeet v2 is English-only; language forced to en"
                         );
                     }
-                    let mut p = Parakeet::open(dir, &config.ort_lib, config.whisper_threads)?;
-                    if config.warm_up {
-                        p.warm_up()?;
+                    let parakeet = Parakeet::open(dir, &config.ort_lib, config.whisper_threads)
+                        .and_then(|mut p| {
+                            if config.warm_up {
+                                p.warm_up()?;
+                            }
+                            Ok(p)
+                        });
+                    match (parakeet, &config.whisper_model) {
+                        (Ok(p), _) => Some(Box::new(p) as Box<dyn Transcriber>),
+                        // Whisper is loaded only now, when Parakeet failed:
+                        // never beside it (~120 MB on the board).
+                        (Err(e), Some(w)) => {
+                            tracing::warn!(error = %e, "parakeet failed to load; whisper fallback");
+                            let mut w = Whisper::open_with_language(
+                                w,
+                                config.whisper_threads,
+                                config.language.as_deref(),
+                            )?;
+                            if config.warm_up {
+                                w.warm_up()?;
+                            }
+                            Some(Box::new(w))
+                        }
+                        (Err(e), None) => return Err(e),
                     }
-                    Some(Box::new(p))
                 }
                 (SttKind::Remote, _, dir) => {
                     let mut r = remote::RemoteStt::new(config.stt_url.clone(), Vec::new());

@@ -35,7 +35,7 @@ for exactly this: GPU flags 0, `GLYDI_PARTIAL_MS=0`, buffalo_s, no pose.
 | Parakeet TDT 0.6B v2 int8: encoder (file 622) + decoder/joint + nemo128 | `GLYDI_STT=parakeet` | 750 | est RTF 0.15-0.25 on 6 cores: a 3 s utterance 0.45-0.75 s for the final transcript (PC GPU: 100-200 ms) | yes, but the final pass is the latency floor |
 | partial transcripts (re-encode the utterance so far every N ms) | `GLYDI_PARTIAL_MS` | 0 | at 400 ms: a tick at 2 s speech ~0.4 s, at 5 s ~1 s: **over 100 % of the period**, 3-4 cores busy while the person talks, the final pass waits behind it | **no: set 0** |
 | at-pause speculation (one Parakeet pass at the first quiet frame) | always on with a recogniser | 0 | one extra pass per turn, same cost as the final; pays off when it matches | yes |
-| whisper tiny.en fallback (ggml, loaded beside Parakeet) | `GLYDI_WHISPER_MODEL` | 120 | idle unless Parakeet fails | yes |
+| whisper tiny.en fallback (ggml, loaded only if Parakeet fails to load) | `GLYDI_WHISPER_MODEL` | 0 (120 when used) | none unless Parakeet fails | yes |
 | Silero VAD + smart-turn v3.2 + YAMNet sounds/affect + AEC | | 80 | VAD every 32 ms (<1 % core), YAMNet ~1 s windows (~3 %), smart-turn once per pause (~20 ms) | yes |
 | RNNoise | `GLYDI_DENOISE=rnnoise` (off) | 1 | 1-2 % of one core | yes |
 | ECAPA speaker id (only if exported) | `GLYDI_VOICE_MODEL` | 100 | one pass per utterance, ~50-100 ms | yes |
@@ -53,14 +53,14 @@ for exactly this: GPU flags 0, `GLYDI_PARTIAL_MS=0`, buffalo_s, no pose.
 
 | | MB |
 | --- | ---: |
-| glydi process RSS (STT 750 + fallback 120 + audio 80 + ECAPA 100 + Kokoro 470 + vision 130 + process 320) | ~1 970 |
+| glydi process RSS (STT 750 + audio 80 + ECAPA 100 + Kokoro 470 + vision 130 + process 320) | ~1 850 |
 | Ollama with glydi-1.5b | ~1 600 |
 | OS | ~700 |
-| **total, headless** | **~4 270** |
-| **total, cage kiosk** | **~4 390** |
-| **total, GNOME/X11 kiosk** | **~5 270** |
-| headroom of 7 400 (page cache for the GGUF and ONNX files, KV growth, load peaks) | 2 100-3 100 |
-| with `qwen2.5:3b` instead | +800: headless 5 070 (headroom 2.3 GB), GNOME 6 070 (1.3 GB: too tight) |
+| **total, headless** | **~4 150** |
+| **total, cage kiosk** | **~4 270** |
+| **total, GNOME/X11 kiosk** | **~5 150** |
+| headroom of 7 400 (page cache for the GGUF and ONNX files, KV growth, load peaks) | 2 250-3 250 |
+| with `qwen2.5:3b` instead | +800: headless 4 950 (headroom 2.45 GB), GNOME 5 950 (1.45 GB: too tight) |
 
 ### After the TensorRT onnxruntime build (target)
 
@@ -126,7 +126,7 @@ conversation quality on the board says so.
   choice; Piper stays the fallback if Kokoro on the board misses the
   first-audio budget even after TRT.
 - **whisper.cpp for STT.** Parakeet is more accurate on the same words;
-  whisper tiny.en stays loaded only as the fallback.
+  whisper tiny.en is loaded only when Parakeet fails to load.
 - **Depth-camera ROI gating, mic-array DoA.** No such hardware yet.
 - **ROS 2.** The Rust daemon is the bus; a ROS graph adds latency and
   memory with no second node to talk to.
