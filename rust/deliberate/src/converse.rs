@@ -163,13 +163,28 @@ pub fn resolve(
         }
     }
     let pronoun = m.reference.as_deref().or(refers_to)?;
-    if matches!(
-        pronoun.trim(),
-        "she" | "he" | "her" | "him" | "they" | "them" | "that"
-    ) {
-        return visit.refs.last().cloned();
-    }
-    None
+    let want = match pronoun.trim() {
+        "she" | "her" | "woh" => Some('m'),
+        "he" | "him" | "his" => Some('f'),
+        "they" | "them" | "that" => None,
+        _ => return None,
+    };
+    // "she" never means someone known to be a he, and the other way round.
+    let excluded = |id: &EntityId| {
+        want.is_some_and(|not| visit.gender.iter().any(|(i, g)| i == id && *g == not))
+    };
+    // Someone known to match first ("she" -> the sister), then anyone
+    // not known to be the other.
+    let matches = |id: &EntityId| {
+        want.is_some_and(|not| visit.gender.iter().any(|(i, g)| i == id && *g != not))
+    };
+    visit
+        .refs
+        .iter()
+        .rev()
+        .find(|(i, _)| matches(i))
+        .or_else(|| visit.refs.iter().rev().find(|(i, _)| !excluded(i)))
+        .cloned()
 }
 
 /// The answer to "how is Rohan?" / "is my son here?" / "who is she?".

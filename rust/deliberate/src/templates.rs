@@ -315,6 +315,11 @@ fn emergency_kind(t: &str) -> Option<Emergency> {
 }
 
 /// Whether `t` asks about somebody else's private details.
+/// Someone else's private details (phone, address, marks...).
+pub fn asks_private_details(text: &str) -> bool {
+    asks_private(&normalise(text))
+}
+
 fn asks_private(t: &str) -> bool {
     let padded = format!(" {t} ");
     let has = |p: &str| padded.contains(p);

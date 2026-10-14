@@ -913,6 +913,38 @@ fn relation_statement(s: &[&str]) -> Option<Understanding> {
             .unwrap_or_default();
         return Some(tell(name, word));
     }
+    // "my sister's name is Priya", "my sister is called Priya", "Mrs Rao
+    // is my class teacher" (a describing word before the relation).
+    match s.as_slice() {
+        ["my", rel, "name", "is", name, ..] | ["my", rel, "name's", name, ..]
+            if rel.ends_with("'s")
+                && crate::people::Relation::from_word(rel.trim_end_matches("'s")).is_some()
+                && name_word(name) =>
+        {
+            return Some(tell(cap(name), rel.trim_end_matches("'s")));
+        }
+        ["my", rel, "is", "called" | "named", name, ..]
+            if crate::people::Relation::from_word(rel).is_some() && name_word(name) =>
+        {
+            return Some(tell(cap(name), rel));
+        }
+        [title, name, "is", "my", _, rel, ..]
+            if title_word(title).is_some()
+                && name_word(name)
+                && crate::people::Relation::from_word(rel).is_some() =>
+        {
+            return Some(tell(
+                format!("{} {}", title_word(title).unwrap_or_default(), cap(name)),
+                rel,
+            ));
+        }
+        [name, "is", "my", _, rel, ..]
+            if name_word(name) && crate::people::Relation::from_word(rel).is_some() =>
+        {
+            return Some(tell(cap(name), rel));
+        }
+        _ => {}
+    }
     match s.as_slice() {
         ["my", rel, "is", name, ..] | ["my", rel, name, ..]
             if crate::people::Relation::from_word(rel).is_some()
@@ -1511,6 +1543,18 @@ pub fn rules(text: &str) -> Option<Understanding> {
     }
     if has("who else") || has("who came") || has("who all came") || has("who has come") {
         return Some(Understanding::of("ask_about_person"));
+    }
+    // "who is Mrs Rao?", "where is Mr Iyer?": a title and a name.
+    if let ["who" | "where", "is", t, n] | ["who's" | "where's", t, n] = s.as_slice()
+        && let Some(title) = title_word(t)
+        && name_word(n)
+    {
+        let mut u = Understanding::of("ask_about_person");
+        u.people.push(Mention {
+            name: format!("{title} {}", cap(n)),
+            ..Mention::default()
+        });
+        return Some(u);
     }
     // "how is she", "is my son here", "where is Rohan", "who is she"
     let ask = match s.as_slice() {

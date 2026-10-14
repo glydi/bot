@@ -177,7 +177,17 @@ fn subject(line: &str) -> Option<String> {
 
 fn facts(told: &[String]) -> Vec<Said> {
     let mut out = Vec::new();
-    for line in told {
+    // "Aisha finishes at 3 and Imran at 5": one fact per clause.
+    let clauses: Vec<String> = told
+        .iter()
+        .flat_map(|l| {
+            l.split(" and ")
+                .flat_map(|c| c.split(", "))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for line in &clauses {
         let w = words(line);
         let Some(who) = subject(line) else { continue };
         // A day wins over a time ("exam is on Friday"); an age only with

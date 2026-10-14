@@ -51,6 +51,8 @@ pub struct Visit {
     pub called_back: bool,
     /// People referred to this visit, most recent last (for "she").
     pub refs: Vec<(EntityId, String)>,
+    /// Who "she" / "he" may mean: 'f' or 'm' per referred person.
+    pub gender: Vec<(EntityId, char)>,
     /// The last understood intent and its confidence.
     pub intent: Option<(String, f32)>,
     /// What the bot is waiting for an answer to.
@@ -80,6 +82,8 @@ pub enum Awaiting {
     WhichOf(EntityId, Vec<(EntityId, String)>),
     /// "Would you like me to remember you?" (the stranger's track).
     RememberOffer(Option<EntityId>),
+    /// "Are you someone new, or should I call you <name>?"
+    NewOrRename(String),
 }
 
 /// Most people the notebook keeps as reference targets.
@@ -128,6 +132,16 @@ impl Visit {
 
     /// `id` was just talked about: the target of the next "she".
     pub fn refer(&mut self, id: EntityId, name: &str) {
+        self.refer_as(id, name, None);
+    }
+
+    /// As [`Self::refer`], knowing whether "she" (`Some('f')`) or "he"
+    /// (`Some('m')`) may point at them.
+    pub fn refer_as(&mut self, id: EntityId, name: &str, gender: Option<char>) {
+        if let Some(g) = gender {
+            self.gender.retain(|(i, _)| i != &id);
+            self.gender.push((id.clone(), g));
+        }
         self.refs.retain(|(i, _)| i != &id);
         self.refs.push((id, name.to_owned()));
         if self.refs.len() > KEEP_REFS {
@@ -346,6 +360,80 @@ pub fn kin_mentioned(text: &str) -> Option<String> {
         .rev()
         .find(|p| p[0] == "my" && crate::people::Relation::from_word(&p[1]).is_some())
         .map(|p| p[1].clone())
+}
+
+/// 'f' / 'm' from a relation word or a title ("sister", "Mrs Rao"); None
+/// when the word does not say.
+pub fn gender_of(word: &str) -> Option<char> {
+    let w = word.trim().to_lowercase();
+    let first = w.split_whitespace().next().unwrap_or("");
+    match first.trim_end_matches('.') {
+        "mrs" | "ms" | "miss" | "madam" => return Some('f'),
+        "mr" | "sir" => return Some('m'),
+        _ => {}
+    }
+    let f = [
+        "sister",
+        "mother",
+        "mom",
+        "mum",
+        "mummy",
+        "daughter",
+        "wife",
+        "aunt",
+        "aunty",
+        "auntie",
+        "grandmother",
+        "grandma",
+        "niece",
+        "girl",
+        "girlfriend",
+        "beti",
+        "behen",
+        "didi",
+        "maa",
+        "mausi",
+        "bua",
+        "chachi",
+        "mami",
+        "nani",
+        "dadi",
+        "patni",
+        "akka",
+        "amma",
+    ];
+    let m = [
+        "brother",
+        "father",
+        "dad",
+        "papa",
+        "daddy",
+        "son",
+        "husband",
+        "uncle",
+        "grandfather",
+        "grandpa",
+        "nephew",
+        "boy",
+        "boyfriend",
+        "beta",
+        "bhai",
+        "bhaiya",
+        "chacha",
+        "mama",
+        "nana",
+        "dada",
+        "pati",
+        "appa",
+        "anna",
+    ];
+    if f.contains(&w.as_str()) {
+        Some('f')
+    } else if m.contains(&w.as_str()) {
+        Some('m')
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

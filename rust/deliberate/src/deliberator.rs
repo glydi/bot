@@ -731,6 +731,9 @@ pub struct Session {
     /// The track the utterance being answered came from, when its
     /// speaker is a stranger (for the registration card).
     pub(super) utterance_track: Option<EntityId>,
+    /// "Are you someone new, or should I call you X?" answered: the
+    /// understanding the next step of the turn takes.
+    pub(super) pending_rename: Option<crate::understand::Understanding>,
 }
 
 impl Session {
@@ -753,6 +756,7 @@ impl Session {
             prepared: None,
             face_ambiguous: None,
             utterance_track: None,
+            pending_rename: None,
             backend,
             // The reach tools the environment allows, run for real; the
             // policy is read once here and `specs()` describes exactly

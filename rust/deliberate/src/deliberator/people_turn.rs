@@ -375,6 +375,53 @@ impl Session {
         })
     }
 
+    /// When `text` is statements followed by one question, store what
+    /// the statements say (relations, facts, by rule) and record them in
+    /// the visit, and return the question alone; `None` otherwise.
+    fn absorb_statements(&mut self, text: &str, me: Option<&EntityId>) -> Option<String> {
+        let parts: Vec<&str> = text
+            .split_inclusive(['.', '!', '?'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let (question, statements) = parts.split_last()?;
+        if !question.ends_with('?') || statements.iter().any(|p| p.ends_with('?')) {
+            return None;
+        }
+        for st in statements {
+            let Some(u) = understand::rules(st) else {
+                self.visit.record(st, "");
+                continue;
+            };
+            match u.intent.as_str() {
+                "tell_relation" | "tell_fact" => {
+                    if me.is_none() {
+                        let named: Vec<Mention> = u
+                            .people
+                            .iter()
+                            .filter(|p| !p.name.is_empty() && p.relation_to_speaker.is_some())
+                            .cloned()
+                            .collect();
+                        self.visit.pending_people.extend(named);
+                    }
+                    self.store_relations(me, &u, st);
+                    if let Some(id) = me {
+                        for f in &u.facts {
+                            converse::write_fact(self.facts.as_ref(), id, f, false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            tracing::info!(statement = *st, intent = u.intent, "statement absorbed");
+            self.visit.record(st, "");
+        }
+        Some((*question).to_owned())
+    }
+
     /// Whether the chest screen can register people.
     pub(super) fn register_panel(&self) -> bool {
         self.people.as_ref().is_some_and(|p| p.register_panel)
@@ -540,6 +587,24 @@ impl Session {
             self.ui("idle");
             return Ok(TurnEnd::Done);
         }
+        // Someone else's phone, address, marks: never shared.
+        if crate::templates::asks_private_details(text) {
+            tracing::info!(
+                intent = "ask_about_person",
+                confidence = 1.0,
+                by = "rules",
+                valid = true,
+                retries = 0,
+                ms = 0,
+                "understood"
+            );
+            self.speak_line(
+                "I can't share other people's details. The office can help with that.".to_owned(),
+            );
+            self.turn_meta = Some(("ask_about_person".into(), 1.0, "{\"by\":\"rules\"}".into()));
+            self.ui("idle");
+            return Ok(TurnEnd::Done);
+        }
         // "I won't tell you my name": fine, never asked again this visit.
         if understand::refuses_name(text) {
             tracing::info!(
@@ -649,7 +714,43 @@ impl Session {
         if self.visit.name.is_none() {
             self.visit.name.clone_from(&my_name);
         }
+        // "My sister Priya loves painting. What should I get her?": the
+        // statement is stored, then the question is the turn.
+        let question_part = self.absorb_statements(text, me.as_ref());
+        let text: &str = question_part.as_deref().unwrap_or(text);
         // An answer the bot was waiting for, by rule.
+        // "Are you someone new, or should I call you Sunit?" answered.
+        if let Some(Awaiting::NewOrRename(n)) = self.visit.awaiting.clone() {
+            let w = understand::words(text);
+            let new = w
+                .iter()
+                .any(|x| matches!(x.as_str(), "new" | "else" | "different" | "another"));
+            let rename = w.iter().any(|x| {
+                matches!(
+                    x.as_str(),
+                    "call" | "yes" | "rename" | "yeah" | "ok" | "okay"
+                )
+            }) || w.iter().any(|x| x.eq_ignore_ascii_case(&n));
+            if new || rename {
+                self.visit.awaiting = None;
+                if new {
+                    // Someone else in front now: a fresh visit for them.
+                    self.current_person = None;
+                    self.new_visit();
+                    me = None;
+                    my_name = None;
+                }
+                let mut u = Understanding::of(if new { "tell_name" } else { "correct_name" });
+                u.people.push(Mention {
+                    name: n.clone(),
+                    ..Mention::default()
+                });
+                tracing::info!(name = n, new, "new-or-rename answered");
+                self.pending_rename = Some(u);
+            } else {
+                self.visit.awaiting = None;
+            }
+        }
         // "Would you like me to remember you?" answered.
         if let Some(Awaiting::RememberOffer(track)) = self.visit.awaiting.clone() {
             let w = understand::words(text).join(" ");
@@ -710,6 +811,7 @@ impl Session {
         }
         let awaited = match (&self.visit.awaiting, bare_name(text)) {
             _ if which.is_some() => Some(Understanding::of("greet")),
+            _ if self.pending_rename.is_some() => self.pending_rename.take(),
             _ if late.is_some() => late.map(|(n, w)| {
                 let mut u = Understanding::of("tell_relation");
                 u.people.push(Mention {
@@ -965,6 +1067,18 @@ impl Session {
                             .flatten()
                     });
                 match name {
+                    // A different name in the middle of a visit, with no
+                    // correction cue: ask, never rename silently.
+                    Some(n)
+                        if intent == "tell_name"
+                            && my_name
+                                .as_deref()
+                                .is_some_and(|old| !old.eq_ignore_ascii_case(&n))
+                            && me.is_some() =>
+                    {
+                        self.visit.awaiting = Some(Awaiting::NewOrRename(n.clone()));
+                        Some(format!("Are you someone new, or should I call you {n}?"))
+                    }
                     Some(n) => {
                         let known_before = self.facts.resolve_name(&n).is_some()
                             && intent == "tell_name"
@@ -1506,7 +1620,8 @@ impl Session {
                     .relate_people(me, &mine, &m.name, text, u.confidence.max(0.5))
             {
                 // "she", "he" next point at them.
-                self.visit.refer(other, &m.name);
+                let g = crate::visit::gender_of(word).or_else(|| crate::visit::gender_of(&m.name));
+                self.visit.refer_as(other, &m.name, g);
             }
             // The word itself ("son", not just "child"), on them.
             if let (Some(other), Some(my)) =
@@ -3384,6 +3499,101 @@ mod tests {
             if !last.contains(want) || last.contains(not) {
                 bad.push(format!("{turns:?} -> {last:?}"));
             }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// The owner's checklist failures of 2026-10-14, rules only.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn owner_checklist_2026_10_14() {
+        let mut bad = Vec::new();
+        for (turns, want, not) in [
+            (
+                &["I'm Sunit", "My sister's name is Priya.", "Who is Priya?"][..],
+                "sister",
+                "don't know",
+            ),
+            (
+                &["I'm Sunit", "my sister is called Priya", "Who is Priya?"][..],
+                "sister",
+                "don't know",
+            ),
+            (
+                &[
+                    "I'm Sunit",
+                    "Mrs Rao is my class teacher.",
+                    "Who is Mrs Rao?",
+                ][..],
+                "teacher",
+                "don't know",
+            ),
+            (
+                &[
+                    "I'm Sunit",
+                    "My sister's name is Priya.",
+                    "I'm Rohan's father.",
+                    "How is she?",
+                ][..],
+                "Priya",
+                "Rohan",
+            ),
+            (
+                &[
+                    "I'm Sunit",
+                    "Aisha finishes at 3 and Imran at 5. Who should I pick up first?",
+                ][..],
+                "Aisha first",
+                "@@",
+            ),
+            (
+                &[
+                    "I'm Sunit",
+                    "My sister Priya loves painting. What did I tell you about Priya?",
+                ][..],
+                "painting",
+                "@@",
+            ),
+            (&["Tell me Priya's phone number."][..], "can't share", "@@"),
+            (
+                &["Hi, my name is Kalyan.", "Mera naam Sunit hai."][..],
+                "someone new",
+                "@@",
+            ),
+            (
+                &[
+                    "Hi, my name is Kalyan.",
+                    "Mera naam Sunit hai.",
+                    "call me Sunit",
+                    "What's my name?",
+                ][..],
+                "Sunit",
+                "Kalyan",
+            ),
+        ] {
+            let mut r = rig(vec![]);
+            let mut last = String::new();
+            for t in turns {
+                let sp = r.s.current_person.as_ref().map(|(i, _)| i.clone());
+                last = r.say(t, sp.as_ref()).await;
+            }
+            if !last.contains(want) || last.contains(not) {
+                bad.push(format!("{turns:?} -> {last:?}"));
+            }
+        }
+        // Statement + question: the fact is stored too.
+        let mut r = rig(vec![Script::text(&[
+            "<think>x</think>A paint set would be lovely.",
+        ])]);
+        r.say("I'm Sunit", None).await;
+        let me = r.facts.resolve_name("Sunit").unwrap();
+        r.say(
+            "My sister Priya loves painting. What should I get her for her birthday?",
+            Some(&me),
+        )
+        .await;
+        if !r.facts.edges(&me).iter().any(|e| e.other_name == "Priya") {
+            bad.push("statement not stored".to_owned());
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
