@@ -3181,6 +3181,7 @@ mod tests {
     /// Eval round 0 misses (cases.jsonl), rules only: what each sequence
     /// must say last.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn eval_round0_sequences() {
         let mut bad = Vec::new();
         for (turns, want, not) in [

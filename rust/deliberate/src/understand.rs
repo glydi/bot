@@ -1399,11 +1399,14 @@ pub fn rules(text: &str) -> Option<Understanding> {
     }
     // "how is she", "is my son here", "where is Rohan", "who is she"
     let ask = match s.as_slice() {
-        ["is", "my", rel, ..]
-        | ["has" | "did", "my", rel, ..]
-        | ["what", "are" | "is", "my", rel, "called" | "names" | "name"]
+        ["is", "my", rel, ..] | ["has" | "did", "my", rel, ..] => Some(vec!["my", *rel]),
+        ["what", "are" | "is", "my", rel, "called" | "names" | "name"]
         | ["what's", "my", rel, "called" | "name"]
-        | ["who", "are" | "is", "my", rel]
+            if crate::people::Relation::from_word(rel).is_some() =>
+        {
+            Some(vec!["my", *rel])
+        }
+        ["who", "are" | "is", "my", rel]
         | ["how", "is", "my", rel, ..]
         | ["how's", "my", rel, ..]
         | ["where", "is", "my", rel, ..]
