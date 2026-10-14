@@ -98,17 +98,19 @@ impl Relation {
             return Some(Self::Other(k.1.to_owned()));
         }
         Some(match w.as_str() {
-            "son" | "daughter" | "child" | "children" | "kid" | "boy" | "girl" | "child_of" => {
-                Self::ChildOf
-            }
+            "son" | "daughter" | "child" | "children" | "kid" | "boy" | "girl" | "child_of"
+            | "beti" | "beta" | "bachcha" | "bacha" => Self::ChildOf,
             "father" | "mother" | "dad" | "mum" | "mom" | "parent" | "papa" | "mama" | "amma"
-            | "appa" | "mummy" | "daddy" | "parent_of" => Self::ParentOf,
+            | "appa" | "mummy" | "daddy" | "parent_of" | "pita" | "maa" | "mata" | "pitaji"
+            | "mataji" => Self::ParentOf,
             "brother" | "sister" | "sibling" | "sibling_of" | "didi" | "bhaiya" | "bhai"
-            | "akka" => Self::SiblingOf,
-            "friend" | "best friend" | "friend_of" => Self::FriendOf,
+            | "akka" | "behen" | "bahen" | "bahan" => Self::SiblingOf,
+            "friend" | "best friend" | "friend_of" | "dost" => Self::FriendOf,
             "teacher" | "teacher_of" => Self::TeacherOf,
             "student" | "pupil" | "student_of" => Self::StudentOf,
-            "wife" | "husband" | "spouse" | "spouse_of" => Self::SpouseOf,
+            "wife" | "husband" | "spouse" | "spouse_of" | "pati" | "patni" | "biwi" => {
+                Self::SpouseOf
+            }
             "neighbour" | "neighbor" => Self::Other("neighbour".to_owned()),
             _ => return None,
         })

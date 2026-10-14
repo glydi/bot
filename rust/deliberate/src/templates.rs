@@ -169,6 +169,11 @@ pub fn is_urgent(text: &str) -> bool {
 
 /// "Shut up", "be quiet": always heard, whoever it is aimed at in a
 /// crowd -- going quiet on a stray one costs nothing.
+/// "shut up", "be quiet": the person wants silence.
+pub fn wants_quiet(text: &str) -> bool {
+    asks_quiet(&normalise(text))
+}
+
 fn asks_quiet(t: &str) -> bool {
     let words = t.split_whitespace().count();
     words <= 4

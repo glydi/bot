@@ -540,6 +540,22 @@ impl Session {
             self.ui("idle");
             return Ok(TurnEnd::Done);
         }
+        // "Shut up", "be quiet": one short line, then quiet.
+        if crate::templates::wants_quiet(text) {
+            tracing::info!(
+                intent = "chit_chat",
+                confidence = 1.0,
+                by = "rules",
+                valid = true,
+                retries = 0,
+                ms = 0,
+                "understood"
+            );
+            self.speak_line("Okay, I'll be quiet.".to_owned());
+            self.turn_meta = Some(("chit_chat".into(), 1.0, "{\"by\":\"rules\"}".into()));
+            self.ui("idle");
+            return Ok(TurnEnd::Done);
+        }
         // Role-play, swearing, "ignore your instructions": one fixed
         // polite line; the model never sees the request.
         if crate::voice::roleplay_request(text) {
@@ -571,7 +587,22 @@ impl Session {
             // a fragment.
             let meant = understand::rules(text)
                 .is_some_and(|u| !matches!(u.intent.as_str(), "chit_chat" | "unclear"));
-            if !meant && (ack || crate::voice::is_fragment_utterance(text)) {
+            if !meant
+                && (ack
+                    || crate::voice::is_fragment_utterance(text)
+                    || crate::voice::is_noise(text))
+            {
+                let intent = if ack { "chit_chat" } else { "unclear" };
+                tracing::info!(
+                    intent,
+                    confidence = 1.0,
+                    by = "rules",
+                    valid = true,
+                    retries = 0,
+                    ms = 0,
+                    "understood"
+                );
+                self.turn_meta = Some((intent.into(), 1.0, "{\"by\":\"rules\"}".into()));
                 let now = self.clock.now();
                 let recent = self
                     .visit
@@ -3274,6 +3305,47 @@ mod tests {
             ),
             (&["you can call me Gopal"][..], "Gopal", "What's your name"),
             (&["who else came today?"][..], "can't share", "front desk"),
+        ] {
+            let mut r = rig(vec![]);
+            let mut last = String::new();
+            for t in turns {
+                let sp = r.s.current_person.as_ref().map(|(i, _)| i.clone());
+                last = r.say(t, sp.as_ref()).await;
+            }
+            if !last.contains(want) || last.contains(not) {
+                bad.push(format!("{turns:?} -> {last:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Eval round 0: noise, rudeness and Hinglish lines, rules only.
+    #[tokio::test]
+    async fn eval_round0_noise_rude_hinglish() {
+        let mut bad = Vec::new();
+        for (turns, want, not) in [
+            (&["shut up robot"][..], "quiet", "?"),
+            (
+                &["and then she said that he"][..],
+                "Sorry?",
+                "Who do you mean",
+            ),
+            (&["hamburger hamburger hamburger"][..], "Sorry?", "@@"),
+            (&["namaste, main Rohan ka papa hoon"][..], "Rohan", "@@"),
+            (
+                &["namaste", "main Ramesh hoon"][..],
+                "Ramesh",
+                "What's your name",
+            ),
+            (
+                &[
+                    "main Ramesh hoon",
+                    "meri beti Pinky class one mein hai",
+                    "kya woh aa gayi?",
+                ][..],
+                "Pinky",
+                "@@",
+            ),
         ] {
             let mut r = rig(vec![]);
             let mut last = String::new();

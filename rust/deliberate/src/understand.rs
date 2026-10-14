@@ -642,8 +642,10 @@ pub fn first_name_in(text: &str) -> Option<String> {
         | ["hi", "my", "name", "is", rest @ ..]
         | ["hello", "my", "name", "is", rest @ ..]
         | ["myself", rest @ ..] => rest,
-        // Hinglish: "mera naam Arjun hai" (never "mera naam kya hai").
+        // Hinglish: "mera naam Arjun hai" (never "mera naam kya hai"),
+        // "main Ramesh hoon".
         ["mera", "naam", n, ..] if *n != "kya" => &s[2..3],
+        ["main" | "mai", n, "hoon" | "hu" | "hun" | "hai"] if *n != "theek" => &s[1..2],
         _ => return None,
     };
     // A title stays with the surname: "I'm Mr Iyer" is Mr Iyer, not "Mr".
@@ -1228,6 +1230,10 @@ pub fn rules(text: &str) -> Option<Understanding> {
                     | "ok"
                     | "okay"
                     | "hey"
+                    | "namaste"
+                    | "namaskar"
+                    | "hi"
+                    | "hello"
             )
         })
         .count();
@@ -1269,6 +1275,56 @@ pub fn rules(text: &str) -> Option<Understanding> {
             }
             return Some(u);
         }
+    }
+    // Hinglish relations: "main Rohan ka papa hoon" (I am Rohan's
+    // father), "meri beti Pinky class one mein hai" (my daughter Pinky).
+    if let ["main" | "mai", owner, "ka" | "ki" | "ke", rel, ..] = s.as_slice()
+        && name_word(owner)
+        && crate::people::Relation::from_word(rel).is_some()
+    {
+        let mut u = Understanding::of("tell_relation");
+        u.people.push(Mention {
+            name: cap(owner),
+            relation_to_speaker: Some(inverse_word(rel)),
+            reference: Some(format!("{}'s {rel}", cap(owner))),
+        });
+        return Some(u);
+    }
+    if let ["meri" | "mera" | "mere", rel, n, ..] = s.as_slice()
+        && crate::people::Relation::from_word(rel).is_some()
+        && name_word(n)
+        && *n != "naam"
+    {
+        let mut u = Understanding::of("tell_relation");
+        u.people.push(Mention {
+            name: cap(n),
+            relation_to_speaker: Some((*rel).to_owned()),
+            reference: Some(format!("my {rel}")),
+        });
+        return Some(u);
+    }
+    // "kya woh aa gayi?" (has she come?): about the one just mentioned.
+    if matches!(s.as_slice(), ["kya", "woh" | "wo" | "vo", ..]) {
+        let mut u = Understanding::of("ask_about_person");
+        u.refers_to = Some("she".to_owned());
+        u.people.push(Mention {
+            reference: Some("she".to_owned()),
+            ..Mention::default()
+        });
+        return Some(u);
+    }
+    // About the robot itself, kind or rude: chit-chat ("you are silly",
+    // "this robot is useless", "you're so cool").
+    if matches!(
+        s.as_slice(),
+        ["you", "are", ..]
+            | ["you're", ..]
+            | ["this", "robot", "is", ..]
+            | ["robot", "is", ..]
+            | ["you", "is", ..]
+    ) && !asks(text)
+    {
+        return Some(Understanding::of("chit_chat"));
     }
     // "this is my sister Priya", "meet my friend Sony", "my son Rohan"
     for start in [

@@ -1818,7 +1818,41 @@ const FUNCTION_WORDS: &[&str] = &[
 /// "So me", "And then the").
 pub fn is_fragment_utterance(text: &str) -> bool {
     let w = crate::understand::words(text);
-    if w.is_empty() || w.len() > 3 || text.trim_end().ends_with('?') {
+    if w.is_empty() || text.trim_end().ends_with('?') {
+        return false;
+    }
+    // A sentence that stops on a subject or a joining word was cut off:
+    // "and then she said that he".
+    let dangling = |x: &str| {
+        matches!(
+            x,
+            "the"
+                | "a"
+                | "an"
+                | "and"
+                | "or"
+                | "but"
+                | "that"
+                | "he"
+                | "she"
+                | "they"
+                | "we"
+                | "my"
+                | "your"
+                | "to"
+                | "of"
+                | "with"
+                | "because"
+                | "if"
+                | "then"
+                | "his"
+                | "her"
+        )
+    };
+    if (3..=8).contains(&w.len()) && w.last().is_some_and(|l| dangling(l)) {
+        return true;
+    }
+    if w.len() > 3 {
         return false;
     }
     let content = w

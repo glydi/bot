@@ -2466,7 +2466,18 @@ impl Session {
     ) -> Result<TurnEnd, LlmError> {
         // Transcriber noise ("[Music]", "uh", "the the the"): no answer,
         // no record, no attention, no context.
-        if crate::voice::is_noise(text) {
+        // In people mode words that read as noise ("hamburger hamburger
+        // hamburger", "the the the", an emoji) still get the one short
+        // "Sorry?" the fragment rule allows; only bracketed tags and empty
+        // or filler-only lines are dropped.
+        let wordy = text
+            .chars()
+            .any(|c| c.is_alphanumeric() || (c as u32) > 0x2000)
+            && !text.trim_start().starts_with(['[', '('])
+            && crate::understand::words(text)
+                .iter()
+                .any(|w| w.len() > 2 && !matches!(w.as_str(), "uhh" | "umm" | "hmm" | "mmm"));
+        if crate::voice::is_noise(text) && !(self.people.is_some() && wordy) {
             tracing::info!(text, "noise dropped");
             return Ok(TurnEnd::Done);
         }
