@@ -2265,12 +2265,13 @@ fn apply_crowd(cfg: &mut AudioConfig, speaking: Option<Arc<common::SpeakingBoard
     }
     // Streaming transcription while the person talks (`partial_transcript`
     // every N ms of new speech, for speculative thinking); 0 turns it off.
-    if let Some(ms) = std::env::var("GLYDI_PARTIAL_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-    {
-        cfg.partial_every_ms = ms;
-    }
+    // Off by default when the recogniser runs on the CPU (the Orin
+    // without GLYDI_STT_GPU): re-encoding the growing utterance there costs
+    // more than the period. GLYDI_PARTIAL_MS overrides either way.
+    cfg.partial_every_ms = partial_ms(
+        std::env::var("GLYDI_PARTIAL_MS").ok().as_deref(),
+        std::env::var(sense_audio::parakeet::GPU_ENV).is_ok_and(|v| v.trim() == "1"),
+    );
 }
 
 #[cfg(test)]
@@ -2296,8 +2297,29 @@ mod start_retry_tests {
     }
 }
 
+/// `partial_every_ms`: `GLYDI_PARTIAL_MS` when set, else the default with
+/// the recogniser on the GPU and 0 (off) on the CPU.
+fn partial_ms(env: Option<&str>, stt_gpu: bool) -> u32 {
+    env.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(if stt_gpu {
+            sense_audio::DEFAULT_PARTIAL_MS
+        } else {
+            0
+        })
+}
+
 #[cfg(test)]
 mod one_model_tests {
+    #[test]
+    fn partials_default_off_on_the_cpu() {
+        assert_eq!(super::partial_ms(None, false), 0);
+        assert_eq!(
+            super::partial_ms(None, true),
+            sense_audio::DEFAULT_PARTIAL_MS
+        );
+        assert_eq!(super::partial_ms(Some("300"), false), 300);
+    }
+
     #[test]
     fn other_models_are_named() {
         assert!(super::other_models("a", "a", "a", "a", Some("off")).is_empty());

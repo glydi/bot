@@ -171,6 +171,42 @@ pub struct Stats {
     pub growing_us_total: AtomicU64,
     /// Microseconds of the last mid-speech partial.
     pub growing_us_last: AtomicU64,
+    /// Samples the last mid-speech partial transcribed (its cost per
+    /// sample predicts the next one's).
+    pub growing_samples_last: AtomicU64,
+    /// A mid-speech partial is being transcribed right now.
+    pub growing_busy: std::sync::atomic::AtomicBool,
+    /// Ticks skipped: the last partial still running, or the next one
+    /// predicted over [`PARTIAL_BUDGET`].
+    pub growing_skipped: AtomicU64,
+}
+
+/// The most a mid-speech partial may be predicted to take. The worker is
+/// one thread: a partial that is running when the turn ends holds the
+/// final transcript back by what is left of it, so none starts that would
+/// take longer than this (on the Orin's CPU a 5 s buffer took ~1 s).
+pub const PARTIAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a partial over `samples` may start, given the last one's cost.
+/// Never while one runs; never when it is predicted over `budget`.
+pub(crate) fn partial_may_start(
+    stats: &Stats,
+    samples: usize,
+    budget: std::time::Duration,
+) -> bool {
+    if stats.growing_busy.load(Ordering::Acquire) {
+        return false;
+    }
+    let (us, n) = (
+        stats.growing_us_last.load(Ordering::Relaxed),
+        stats.growing_samples_last.load(Ordering::Relaxed),
+    );
+    if n == 0 {
+        return true;
+    }
+    // Encoder cost grows a little faster than linearly with length.
+    let predicted = us as f64 * (samples as f64 / n as f64).max(1.0);
+    predicted <= budget.as_micros() as f64
 }
 
 /// One finished utterance, on its way to the worker.
@@ -644,8 +680,12 @@ impl Pipeline {
                         && voiced_len >= grown_at + self.partial_every_samples
                     {
                         grown_at = voiced_len;
-                        next_spec_id += 1;
-                        self.grow(next_spec_id, &utterance[..voiced_len]);
+                        if partial_may_start(&self.stats, voiced_len, PARTIAL_BUDGET) {
+                            next_spec_id += 1;
+                            self.grow(next_spec_id, &utterance[..voiced_len]);
+                        } else {
+                            self.stats.growing_skipped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 } else if quiet == self.speculate_after_frames && live_spec.is_none() {
                     next_spec_id += 1;
@@ -1089,10 +1129,15 @@ impl Worker {
         let Some(stt) = self.stt.as_mut() else {
             return;
         };
+        self.stats.growing_busy.store(true, Ordering::Release);
         let t0 = Instant::now();
         let text = stt.transcribe(&spec.samples);
         let took = t0.elapsed();
+        self.stats.growing_busy.store(false, Ordering::Release);
         let us = took.as_micros() as u64;
+        self.stats
+            .growing_samples_last
+            .store(spec.samples.len() as u64, Ordering::Relaxed);
         self.stats.growing_runs.fetch_add(1, Ordering::Relaxed);
         self.stats.growing_us_total.fetch_add(us, Ordering::Relaxed);
         self.stats.growing_us_last.store(us, Ordering::Relaxed);
@@ -1678,6 +1723,20 @@ mod tests {
             }
             self.stats
         }
+    }
+
+    #[test]
+    fn a_partial_never_starts_over_budget_or_while_one_runs() {
+        let st = Stats::default();
+        let b = std::time::Duration::from_millis(250);
+        assert!(partial_may_start(&st, 16_000, b), "nothing measured yet");
+        // 1 s took 100 ms: 2 s predicted 200 ms (ok), 3 s 300 ms (no).
+        st.growing_us_last.store(100_000, Ordering::Relaxed);
+        st.growing_samples_last.store(16_000, Ordering::Relaxed);
+        assert!(partial_may_start(&st, 32_000, b));
+        assert!(!partial_may_start(&st, 48_000, b));
+        st.growing_busy.store(true, Ordering::Relaxed);
+        assert!(!partial_may_start(&st, 16_000, b), "one is running");
     }
 
     #[test]
