@@ -434,10 +434,11 @@ pub fn answer(question: &str, told: &[String]) -> Option<String> {
             show(other.value)
         ),
         _ => format!(
-            "{} comes {cmp} {} at {}",
+            "{} at {}, {cmp} {} at {}",
+            best.who,
             show(best.value),
-            show(other.value),
-            other.who
+            other.who,
+            show(other.value)
         ),
     };
     Some(format!("{} {word}: {why}.", best.who))

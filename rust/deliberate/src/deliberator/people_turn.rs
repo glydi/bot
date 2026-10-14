@@ -251,6 +251,67 @@ impl Session {
         (known, stranger)
     }
 
+    /// "what did I tell you about Meera?" / "what do you know about
+    /// Meera?": their own words about her this visit (the lines naming
+    /// her and the she/he lines right after), in the second person, and
+    /// what is stored about her. `None` when the question is not that or
+    /// nothing is known.
+    pub(super) fn told_about(&self, text: &str) -> Option<String> {
+        let w = understand::words(text);
+        let j = w.join(" ");
+        let rest = [
+            "what did i tell you about ",
+            "what do you know about ",
+            "what have i told you about ",
+        ]
+        .iter()
+        .find_map(|p| j.strip_prefix(p))?;
+        let name = rest.split_whitespace().last()?.trim_end_matches("'s");
+        let cap = {
+            let mut c = name.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        };
+        let mut said: Vec<String> = Vec::new();
+        let mut following = false;
+        for e in &self.visit.exchanges {
+            let h = e.heard.trim().trim_end_matches(['.', '!']);
+            let hw = understand::words(h);
+            let names_her = hw.iter().any(|x| x.trim_end_matches("'s") == name);
+            let pronoun = matches!(
+                hw.first().map(String::as_str),
+                Some("she" | "he" | "they" | "she's" | "he's")
+            );
+            if names_her || (following && pronoun) {
+                said.push(second_person_line(h));
+                following = true;
+            } else {
+                following = false;
+            }
+        }
+        if let Some(id) = self.facts.resolve_name(&cap) {
+            for f in self
+                .facts
+                .recall(&id)
+                .into_iter()
+                .filter(|f| converse::shown(f))
+            {
+                let f = format!("{cap} {f}");
+                if !said
+                    .iter()
+                    .any(|s| s.to_lowercase().contains(&f.to_lowercase()))
+                {
+                    said.push(f);
+                }
+            }
+        }
+        if said.is_empty() {
+            return None;
+        }
+        Some(format!("You told me {}.", said.join(", and ")))
+    }
+
     /// "who are my children?" / "who are my friends?": all of them, by
     /// name; `None` when the question is not about a plural relation.
     pub(super) fn plural_relation_answer(
@@ -1101,6 +1162,17 @@ impl Session {
                 Some("Okay, I've forgotten you. Bye for now!".to_owned())
             }
             "everyday" => Some(everyday_answer(text)),
+            // "what did I tell you about Meera?": what they said, as said.
+            "deep" if let Some(a) = self.told_about(text) => {
+                tracing::info!(
+                    ms = 0,
+                    done = true,
+                    answer = a,
+                    by = "code",
+                    "slow path answered"
+                );
+                Some(a)
+            }
             // Times, days, ages, counts, allergies: worked out in code
             // from what they said this visit, exact and instant.
             "deep"
@@ -1114,7 +1186,13 @@ impl Session {
                         .collect::<Vec<_>>(),
                 ) =>
             {
-                tracing::info!(answer = a, "slow path answered in code");
+                tracing::info!(
+                    ms = 0,
+                    done = true,
+                    answer = a,
+                    by = "code",
+                    "slow path answered"
+                );
                 Some(a)
             }
             "deep" => match self
@@ -2324,6 +2402,22 @@ fn asks_name_only(text: &str) -> bool {
     .any(|p| t.contains(p))
 }
 
+/// "my daughter Meera has a show" -> "your daughter Meera has a show";
+/// "I am" -> "you are".
+fn second_person_line(line: &str) -> String {
+    line.split_whitespace()
+        .map(|w| match w.to_ascii_lowercase().as_str() {
+            "my" => "your".to_owned(),
+            "i" | "me" => "you".to_owned(),
+            "i'm" => "you're".to_owned(),
+            "am" => "are".to_owned(),
+            "mine" => "yours".to_owned(),
+            _ => w.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn second_person(fact: &str) -> String {
     let f = fact.trim().trim_end_matches('.');
     if f.starts_with("favourite ") {
@@ -2993,6 +3087,22 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn what_did_i_tell_you_about_someone_is_their_own_words() {
+        let mut r = rig(vec![]);
+        r.say("I'm Arjun", None).await;
+        let a = r.facts.resolve_name("Arjun").unwrap();
+        r.say("my daughter Meera has a dance show on Friday", Some(&a))
+            .await;
+        r.say("she is very nervous about it", Some(&a)).await;
+        let l = r.say("what did I tell you about Meera?", Some(&a)).await;
+        assert!(
+            l.contains("your daughter Meera has a dance show on Friday"),
+            "{l}"
+        );
+        assert!(l.contains("nervous"), "{l}");
     }
 
     fn json(intent: &str, people: &str, facts: &str) -> String {

@@ -514,7 +514,9 @@ def judge(name: str, results: list[dict]) -> list[str]:
         if r["expect"].get("deep"):
             if r.get("route") != "slow":
                 gaps.append(f"{tag}: not on the slow path (route {r.get('route')}) -> {reply!r}")
-            elif not any(h in reply.lower() for h in HOLD_WORDS):
+            # A holding line covers a slow answer; one worked out in code
+            # (instant) needs none.
+            elif not any(h in reply.lower() for h in HOLD_WORDS) and (r.get("deep_ms") or 0) > 1500:
                 gaps.append(f"{tag}: no holding line -> {reply!r}")
             if r.get("deep_ms") is None or r["deep_ms"] < 0 or r["deep_ms"] > DEEP_CAP_MS:
                 gaps.append(f"{tag}: slow answer took {r.get('deep_ms')} ms, cap {DEEP_CAP_MS}")
