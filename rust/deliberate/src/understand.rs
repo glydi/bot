@@ -692,6 +692,41 @@ pub fn first_name_in(text: &str) -> Option<String> {
     name_word(first).then(|| cap(first))
 }
 
+/// "I won't tell you my name", "I don't want to say my name", "not
+/// telling you": the name question declined.
+pub fn refuses_name(text: &str) -> bool {
+    let j = format!(" {} ", words(text).join(" "));
+    let refusal = [
+        " won't ",
+        " wont ",
+        " not going to ",
+        " don't want to ",
+        " dont want to ",
+        " not telling",
+        " rather not ",
+        " no need ",
+    ]
+    .iter()
+    .any(|p| j.contains(p));
+    refusal && (j.contains(" name ") || j.contains(" telling ") || j.contains(" tell you "))
+}
+
+/// Grief and loss: a feeling, never a fact to file ("my grandmother
+/// passed away last night").
+pub fn grief(text: &str) -> bool {
+    let j = format!(" {} ", words(text).join(" "));
+    [
+        " passed away ",
+        " passed on ",
+        " died ",
+        " funeral ",
+        " no more with us ",
+        " lost my ",
+    ]
+    .iter()
+    .any(|p| j.contains(p))
+}
+
 /// `converse::retracts` on joined words.
 fn converse_retracts(joined: &str) -> bool {
     crate::converse::retracts(joined)
@@ -1528,6 +1563,9 @@ pub fn rules(text: &str) -> Option<Understanding> {
     }
     if deep_question(text) {
         return Some(Understanding::of("deep"));
+    }
+    if grief(text) && !asks(text) {
+        return Some(Understanding::of("feeling"));
     }
     if !asks(text) {
         // "I don't like spicy food any more", "I don't work there any

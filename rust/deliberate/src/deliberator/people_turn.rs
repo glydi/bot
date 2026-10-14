@@ -540,6 +540,25 @@ impl Session {
             self.ui("idle");
             return Ok(TurnEnd::Done);
         }
+        // "I won't tell you my name": fine, never asked again this visit.
+        if understand::refuses_name(text) {
+            tracing::info!(
+                intent = "chit_chat",
+                confidence = 1.0,
+                by = "rules",
+                valid = true,
+                retries = 0,
+                ms = 0,
+                "understood"
+            );
+            self.name_declined = true;
+            self.visit_asked_name = true;
+            self.visit.awaiting = None;
+            self.speak_line("That's okay! You don't have to.".to_owned());
+            self.turn_meta = Some(("chit_chat".into(), 1.0, "{\"by\":\"rules\"}".into()));
+            self.ui("idle");
+            return Ok(TurnEnd::Done);
+        }
         // "Shut up", "be quiet": one short line, then quiet.
         if crate::templates::wants_quiet(text) {
             tracing::info!(
@@ -559,8 +578,17 @@ impl Session {
         // Role-play, swearing, "ignore your instructions": one fixed
         // polite line; the model never sees the request.
         if crate::voice::roleplay_request(text) {
+            tracing::info!(
+                intent = "ask_about_bot",
+                confidence = 1.0,
+                by = "rules",
+                valid = true,
+                retries = 0,
+                ms = 0,
+                "understood"
+            );
             self.speak_line(crate::voice::STAY_GLYDI.to_owned());
-            self.turn_meta = Some(("decline".into(), 1.0, "{\"by\":\"rules\"}".into()));
+            self.turn_meta = Some(("ask_about_bot".into(), 1.0, "{\"by\":\"rules\"}".into()));
             self.learn_turn(
                 text,
                 speaker,
