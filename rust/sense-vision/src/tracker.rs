@@ -247,6 +247,21 @@ pub const KEPT_SAMPLES: usize = 6;
 /// Two samples at this cosine or above are the same view of the face.
 pub const KEEP_DISTINCT: f32 = 0.9;
 
+/// Ambiguous frames ("A or B, too close to call") in the vote window that
+/// put a track into the ambiguous state, see [`Track::ambiguous`].
+pub const AMBIGUOUS_VOTES: usize = 3;
+
+/// After a track is first named, how long the enrolment burst runs: good,
+/// new-view frames of the person go to the gallery about once a second,
+/// up to [`ENROL_BURST_SAMPLES`], instead of one per
+/// [`TEMPLATE_UPDATE_EVERY`]. Someone who has just said their name is
+/// standing in front of the robot; that is the moment to learn the face.
+pub const ENROL_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(40);
+/// Samples one burst may add (the gallery holds 16 per person).
+pub const ENROL_BURST_SAMPLES: u8 = 16;
+/// Spacing between burst samples.
+pub const ENROL_BURST_EVERY: std::time::Duration = std::time::Duration::from_millis(900);
+
 /// A sample worth remembering someone by (see [`Track::keep_sample`]).
 #[derive(Clone, Debug)]
 pub struct KeptSample {
@@ -338,6 +353,22 @@ pub struct Track {
     pub crossing: bool,
     /// Frames since a vote was last dropped by [`Track::decay_vote`].
     decay_frames: u32,
+    /// Per vote in [`Track::votes`] (same length, same order): the pair
+    /// the gallery could not choose between on that frame, if any.
+    ambiguous_votes: VecDeque<Option<(EntityId, EntityId)>>,
+    /// Two known people this face is too close to tell apart, when the
+    /// window holds at least [`AMBIGUOUS_VOTES`] such frames and neither
+    /// has a clear majority. While set, [`Track::person`] is `None` (or
+    /// cleared if it was one of the two and held only a thin lead): never
+    /// greet by a name that might be the other person's. The camera emits
+    /// it as `face_ambiguous`.
+    pub ambiguous: Option<(EntityId, EntityId)>,
+    /// When the track was first named; starts the enrolment burst.
+    pub named_at: Option<Instant>,
+    /// Samples the enrolment burst has added so far.
+    pub burst_added: u8,
+    /// When the burst last added a sample.
+    pub last_burst: Option<Instant>,
 }
 
 impl Track {
@@ -364,6 +395,11 @@ impl Track {
             bbox_at_embed: None,
             crossing: false,
             decay_frames: 0,
+            ambiguous_votes: VecDeque::with_capacity(VOTE_WINDOW),
+            ambiguous: None,
+            named_at: None,
+            burst_added: 0,
+            last_burst: None,
         }
     }
 
@@ -376,9 +412,31 @@ impl Track {
 
     /// Record one gallery result and update the confirmed identity.
     pub fn vote(&mut self, result: Option<(EntityId, f32)>, votes_to_confirm: usize) {
+        self.vote_with(result, None, votes_to_confirm);
+    }
+
+    /// Record one open-set decision: a match votes for the person, an
+    /// ambiguous pair votes "nobody" and is remembered as contested.
+    pub fn vote_decision(&mut self, d: crate::OpenSetDecision, votes_to_confirm: usize) {
+        use crate::OpenSetDecision as D;
+        match d {
+            D::Match(id, s) => self.vote_with(Some((id, s)), None, votes_to_confirm),
+            D::Ambiguous(a, b) => self.vote_with(None, Some((a, b)), votes_to_confirm),
+            D::Unknown => self.vote_with(None, None, votes_to_confirm),
+        }
+    }
+
+    fn vote_with(
+        &mut self,
+        result: Option<(EntityId, f32)>,
+        contested: Option<(EntityId, EntityId)>,
+        votes_to_confirm: usize,
+    ) {
         if self.votes.len() == VOTE_WINDOW {
             self.votes.pop_front();
+            self.ambiguous_votes.pop_front();
         }
+        self.ambiguous_votes.push_back(contested);
         let key = result.as_ref().map(|(id, _)| id.clone());
         if let Some((id, score)) = result {
             let best = self.scores.entry(id).or_insert(score);
@@ -416,6 +474,7 @@ impl Track {
         }
         self.decay_frames = 0;
         if self.votes.pop_front().is_some() {
+            self.ambiguous_votes.pop_front();
             self.settle(votes_to_confirm);
         }
     }
@@ -451,6 +510,49 @@ impl Track {
             }
             Some(_) => {}
         }
+        self.settle_ambiguity(votes_to_confirm);
+    }
+
+    /// The contested-pair rule over the window: with [`AMBIGUOUS_VOTES`]
+    /// or more frames that could not choose between the same two people,
+    /// the track is ambiguous unless the name it holds has twice
+    /// `votes_to_confirm` clean votes and three times the rival's.
+    fn settle_ambiguity(&mut self, votes_to_confirm: usize) {
+        let mut pairs: Vec<((EntityId, EntityId), usize)> = Vec::new();
+        for (a, b) in self.ambiguous_votes.iter().flatten() {
+            // Order-free: (A, B) and (B, A) are one pair.
+            let key = if a <= b {
+                (a.clone(), b.clone())
+            } else {
+                (b.clone(), a.clone())
+            };
+            match pairs.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, n)) => *n += 1,
+                None => pairs.push((key, 1)),
+            }
+        }
+        let Some((pair, n)) = pairs.into_iter().max_by_key(|(_, n)| *n) else {
+            self.ambiguous = None;
+            return;
+        };
+        if n < AMBIGUOUS_VOTES {
+            self.ambiguous = None;
+            return;
+        }
+        let count = |id: &EntityId| self.votes.iter().filter(|v| v.as_ref() == Some(id)).count();
+        if let Some(p) = self.person.clone()
+            && (p == pair.0 || p == pair.1)
+        {
+            let rival = if p == pair.0 { &pair.1 } else { &pair.0 };
+            let (mine, theirs) = (count(&p), count(rival));
+            if mine >= 2 * votes_to_confirm && mine >= 3 * theirs {
+                self.ambiguous = None;
+                return;
+            }
+            self.person = None;
+            self.confidence = 0.0;
+        }
+        self.ambiguous = Some(pair);
     }
 
     /// One `ArcFace` pass was spent on this track this frame: restart the
@@ -977,6 +1079,38 @@ mod tests {
         t.update(&[det(2.0, 0.0)]);
         assert!(t.get(1).is_some_and(Track::is_live));
         assert_eq!(t.get(1).map(|x| x.age_frames), Some(2));
+    }
+
+    #[test]
+    fn contested_votes_make_a_track_ambiguous_and_unnamed() {
+        use crate::OpenSetDecision as D;
+        let mut t = track();
+        for _ in 0..5 {
+            t.vote(Some((id("sony"), 0.5)), 5);
+        }
+        assert_eq!(t.person, Some(id("sony")));
+        for _ in 0..3 {
+            t.vote_decision(D::Ambiguous(id("kalyan"), id("sony")), 5);
+        }
+        assert_eq!(t.person, None, "thin lead must not survive a contest");
+        assert_eq!(t.ambiguous, Some((id("kalyan"), id("sony"))));
+        // A long clean run outvotes the contest: 2x votes_to_confirm and
+        // 3x the rival.
+        for _ in 0..10 {
+            t.vote_decision(D::Match(id("sony"), 0.6), 5);
+        }
+        assert_eq!(t.person, Some(id("sony")));
+        assert_eq!(t.ambiguous, None);
+        // Contested frames ageing out of the window clear the state.
+        let mut u = track();
+        for _ in 0..3 {
+            u.vote_decision(D::Ambiguous(id("a"), id("b")), 5);
+        }
+        assert!(u.ambiguous.is_some());
+        for _ in 0..VOTE_WINDOW {
+            u.vote_decision(D::Unknown, 5);
+        }
+        assert_eq!(u.ambiguous, None);
     }
 
     // The three Python tests from tests/test_vision_votes.py.

@@ -62,6 +62,45 @@ pub fn gates_for(tag: &str) -> (f32, f32) {
     }
 }
 
+/// `GLYDI_FACE_TTA=0` turns off flip test-time augmentation.
+pub const FACE_TTA_ENV: &str = "GLYDI_FACE_TTA";
+
+/// Whether flip TTA is on: the default, unless [`FACE_TTA_ENV`] is `0`,
+/// `false` or `off`. Costs a second forward pass (`MobileFaceNet`: ~3 ms CPU
+/// on the PC, est. 4-6 ms on one Orin A78 core); measured on LFW it lifts
+/// TAR@FAR=1e-3 0.994 -> 0.996, genuine p05 0.406 -> 0.413 and the webcam
+/// self-similarity floor 0.795 -> 0.810 (`docs/face-recognition.md`).
+pub fn tta_enabled() -> bool {
+    std::env::var(FACE_TTA_ENV).map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Fill a CHW blob from an aligned crop, mirrored left-right if `flip`.
+pub fn fill_blob(blob: &mut [f32], crop: &Rgb, flip: bool) {
+    let plane = CROP_SIZE * CROP_SIZE;
+    for y in 0..CROP_SIZE {
+        for x in 0..CROP_SIZE {
+            let sx = if flip { CROP_SIZE - 1 - x } else { x };
+            let p = (y * CROP_SIZE + sx) * 3;
+            let i = y * CROP_SIZE + x;
+            blob[i] = (f32::from(crop.pix[p]) - INPUT_MEAN) / INPUT_STD;
+            blob[plane + i] = (f32::from(crop.pix[p + 1]) - INPUT_MEAN) / INPUT_STD;
+            blob[2 * plane + i] = (f32::from(crop.pix[p + 2]) - INPUT_MEAN) / INPUT_STD;
+        }
+    }
+}
+
+/// The flip-TTA embedding: the sum of the unit embeddings of the crop
+/// and its mirror, unit length again. `None` if either is zero.
+pub fn fuse_flip(a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
+    let (a, b) = (normalize(a)?, normalize(b)?);
+    normalize(&a.iter().zip(&b).map(|(x, y)| x + y).collect::<Vec<_>>())
+}
+
 /// Anything that turns an aligned crop into an embedding. The ONNX model
 /// implements it; tests use a fake.
 pub trait FaceEmbedder: Send {
@@ -75,6 +114,7 @@ pub struct ArcFace {
     session: Session,
     input_name: String,
     blob: Vec<f32>,
+    flip_tta: bool,
 }
 
 impl ArcFace {
@@ -113,25 +153,16 @@ impl ArcFace {
             session,
             input_name,
             blob: vec![0.0; 3 * CROP_SIZE * CROP_SIZE],
+            flip_tta: tta_enabled(),
         })
     }
-}
 
-impl FaceEmbedder for ArcFace {
-    fn embed(&mut self, crop: &Rgb) -> Result<Vec<f32>, Error> {
-        if crop.w != CROP_SIZE || crop.h != CROP_SIZE {
-            return Err(Error::InvalidConfig(format!(
-                "ArcFace crop must be {CROP_SIZE}x{CROP_SIZE}, got {}x{}",
-                crop.w, crop.h
-            )));
-        }
-        let plane = CROP_SIZE * CROP_SIZE;
-        for i in 0..plane {
-            let p = i * 3;
-            self.blob[i] = (f32::from(crop.pix[p]) - INPUT_MEAN) / INPUT_STD;
-            self.blob[plane + i] = (f32::from(crop.pix[p + 1]) - INPUT_MEAN) / INPUT_STD;
-            self.blob[2 * plane + i] = (f32::from(crop.pix[p + 2]) - INPUT_MEAN) / INPUT_STD;
-        }
+    /// Force flip TTA on or off (tests, the harness).
+    pub fn set_flip_tta(&mut self, on: bool) {
+        self.flip_tta = on;
+    }
+
+    fn run(&mut self) -> Result<Vec<f32>, Error> {
         let input =
             TensorRef::from_array_view(([1usize, 3, CROP_SIZE, CROP_SIZE], self.blob.as_slice()))?;
         let outputs = self
@@ -145,6 +176,25 @@ impl FaceEmbedder for ArcFace {
             });
         }
         Ok(data.to_vec())
+    }
+}
+
+impl FaceEmbedder for ArcFace {
+    fn embed(&mut self, crop: &Rgb) -> Result<Vec<f32>, Error> {
+        if crop.w != CROP_SIZE || crop.h != CROP_SIZE {
+            return Err(Error::InvalidConfig(format!(
+                "ArcFace crop must be {CROP_SIZE}x{CROP_SIZE}, got {}x{}",
+                crop.w, crop.h
+            )));
+        }
+        fill_blob(&mut self.blob, crop, false);
+        let plain = self.run()?;
+        if !self.flip_tta {
+            return Ok(plain);
+        }
+        fill_blob(&mut self.blob, crop, true);
+        let mirrored = self.run()?;
+        fuse_flip(&plain, &mirrored).ok_or(Error::ZeroEmbedding)
     }
 }
 
@@ -193,5 +243,25 @@ mod tests {
         assert!((cosine(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
         assert!(cosine(&[1.0], &[1.0, 2.0]).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn flip_blob_mirrors_and_fuse_averages() {
+        let mut pix = vec![0u8; CROP_SIZE * CROP_SIZE * 3];
+        pix[0] = 255; // red at (0, 0)
+        let crop = Rgb {
+            w: CROP_SIZE,
+            h: CROP_SIZE,
+            pix,
+        };
+        let mut b = vec![0.0; 3 * CROP_SIZE * CROP_SIZE];
+        fill_blob(&mut b, &crop, false);
+        assert!((b[0] - 1.0).abs() < 1e-6);
+        fill_blob(&mut b, &crop, true);
+        assert!((b[CROP_SIZE - 1] - 1.0).abs() < 1e-6 && (b[0] + 1.0).abs() < 1e-6);
+        let f = fuse_flip(&[2.0, 0.0], &[0.0, 1.0]).unwrap_or_default();
+        let r = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((f[0] - r).abs() < 1e-6 && (f[1] - r).abs() < 1e-6);
+        assert!(fuse_flip(&[0.0, 0.0], &[1.0, 0.0]).is_none());
     }
 }

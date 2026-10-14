@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use common::EntityId;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, params};
-use sense_audio::voiceid::open_set_match;
+use sense_audio::voiceid::{OpenSetDecision, open_set_decide, open_set_match, template_score};
 
 use crate::Error;
 
@@ -279,17 +279,27 @@ impl Index {
                 want: self.dim,
             });
         }
-        let mut best: HashMap<&EntityId, f32> = HashMap::new();
+        // Best two cosines per person (see `template_score`).
+        let mut best: HashMap<&EntityId, (f32, f32, u32)> = HashMap::new();
         for (id, row) in self.ids.iter().zip(self.rows.chunks_exact(self.dim)) {
             // Both sides are L2-normalised, so the dot product is the cosine.
             let dot: f32 = row.iter().zip(probe).map(|(a, b)| a * b).sum();
-            let e = best.entry(id).or_insert(f32::MIN);
-            if dot > *e {
-                *e = dot;
+            let e = best.entry(id).or_insert((f32::MIN, f32::MIN, 0));
+            e.2 += 1;
+            if dot > e.0 {
+                e.1 = e.0;
+                e.0 = dot;
+            } else if dot > e.1 {
+                e.1 = dot;
             }
         }
-        let mut ranked: Vec<(EntityId, f32)> =
-            best.into_iter().map(|(id, s)| (id.clone(), s)).collect();
+        let mut ranked: Vec<(EntityId, f32)> = best
+            .into_iter()
+            .filter_map(|(id, (a, b, n))| {
+                let two: &[f32] = if n >= 2 { &[a, b] } else { &[a] };
+                template_score(two.iter().copied()).map(|s| (id.clone(), s))
+            })
+            .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(ranked)
     }
@@ -791,7 +801,10 @@ impl Store {
         let probe = normalise(emb)?;
         let ranked = self.index(m).read().search(&probe)?;
         let g = self.gates(m);
-        let out = open_set_match(&ranked, g.threshold, g.margin);
+        let out = match m {
+            Modality::Face => open_set_decide(&ranked, g.threshold, g.margin).matched(),
+            Modality::Voice => open_set_match(&ranked, g.threshold, g.margin),
+        };
         // Why someone was or was not recognised, in the log, at most once
         // a second per modality: a live gallery had the owner's face
         // split across two people (one of them called "No", enrolled from
@@ -815,6 +828,18 @@ impl Store {
             );
         }
         Ok(out)
+    }
+
+    /// The face decision with ambiguity kept (see [`open_set_decide`]):
+    /// what the camera votes on. [`Store::identify`] is its `Match` arm.
+    pub fn decide_face(&self, emb: &[f32]) -> Result<OpenSetDecision, Error> {
+        if let Some((id, s)) = self.identify(emb, Modality::Face)? {
+            return Ok(OpenSetDecision::Match(id, s));
+        }
+        let probe = normalise(emb)?;
+        let ranked = self.face.read().search(&probe)?;
+        let g = self.face_gates;
+        Ok(open_set_decide(&ranked, g.threshold, g.margin))
     }
 
     /// Whether a "no match" line is due for this modality (one a second).

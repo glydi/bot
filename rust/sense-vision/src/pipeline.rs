@@ -34,6 +34,15 @@ pub const MODALITY_FACE_EMBEDDING: &str = "face_embedding";
 /// The aligned 112x112 RGB crop (`Payload::Opaque(Arc<Vec<u8>>)`) of the
 /// `face_embedding` sent just before it on the same track.
 pub const MODALITY_FACE_CROP: &str = "face_crop";
+/// A track whose face is too close to two known people to name:
+/// `Payload::Text` of the two ids joined by a tab, entity `EntityHint::Track`. Sent on
+/// the face tick while [`crate::tracker::Track::ambiguous`] holds; the
+/// conversation must not greet by either name (it may ask).
+pub const MODALITY_FACE_AMBIGUOUS: &str = "face_ambiguous";
+/// Enrolment burst progress for a just-named track: `Payload::Level`
+/// (samples added / [`crate::tracker::ENROL_BURST_SAMPLES`]), entity
+/// `EntityHint::KnownOnTrack`. One per sample added.
+pub const MODALITY_FACE_ENROL_PROGRESS: &str = "face_enrol_progress";
 /// Modality carrying both attention scores at once as
 /// `Payload::Opaque(Arc<FaceAttention>)`, for a consumer that knows this
 /// crate (the UI's debug panel).
@@ -658,7 +667,8 @@ fn process_frame(
             continue;
         };
         let unit: Arc<[f32]> = Arc::from(unit);
-        let single = gallery.best_match(&unit);
+        let decision = gallery.decide(&unit);
+        let single = decision.clone().matched();
         // How good this sighting is to *remember* someone by: straight
         // on, close, sharp, and a confident detection. Recognition uses
         // every sample; enrolment and template updates only good ones
@@ -680,15 +690,68 @@ fn process_frame(
             // motion blur, a half turn) is retried as the mean of the
             // track's last few, a steadier probe; the vote window then
             // decides over the track, not the frame.
-            let matched = single.clone().or_else(|| {
-                t.mean_embedding(cfg.smooth_frames)
-                    .and_then(|m| gallery.best_match(&m))
-            });
-            t.vote(matched, cfg.votes_to_confirm);
+            // An ambiguous frame stays ambiguous unless the steadier
+            // probe settles it.
+            let decision = match decision {
+                crate::OpenSetDecision::Match(..) => decision,
+                other => match t
+                    .mean_embedding(cfg.smooth_frames)
+                    .map(|m| gallery.decide(&m))
+                {
+                    Some(m @ crate::OpenSetDecision::Match(..)) => m,
+                    Some(crate::OpenSetDecision::Ambiguous(a, b))
+                        if matches!(other, crate::OpenSetDecision::Unknown) =>
+                    {
+                        crate::OpenSetDecision::Ambiguous(a, b)
+                    }
+                    _ => other,
+                },
+            };
+            t.vote_decision(decision, cfg.votes_to_confirm);
+            if t.person.is_some() && t.named_at.is_none() {
+                t.named_at = Some(clock.now());
+            }
             t.note_embedded();
             let crop_bytes: Arc<[u8]> = Arc::from(crop.pix.as_slice());
+            let now = clock.now();
+            let bursting = t.named_at.is_some_and(|at| {
+                now.saturating_duration_since(at) < crate::tracker::ENROL_BURST_WINDOW
+            }) && t.burst_added < crate::tracker::ENROL_BURST_SAMPLES;
             if t.person.is_none() {
                 t.keep_sample(Arc::clone(&unit), quality, Some(crop_bytes));
+            } else if bursting
+                && let (Some((id, score)), Some(person)) = (&single, &t.person)
+                && id == person
+                && *score >= cfg.template_update_score - 0.10
+                && quality >= crate::attention::KEEP_SAMPLE
+                && t.last_burst.is_none_or(|at| {
+                    now.saturating_duration_since(at) >= crate::tracker::ENROL_BURST_EVERY
+                })
+            {
+                // Enrolment burst: just named, still in front of the
+                // camera; the gallery refuses views it already has.
+                t.last_burst = Some(now);
+                if gallery.update(id, &unit, Some(&crop_bytes)) {
+                    t.burst_added += 1;
+                    info!(
+                        track = a.track,
+                        entity = %id,
+                        added = t.burst_added,
+                        of = crate::tracker::ENROL_BURST_SAMPLES,
+                        "face enrolment sample"
+                    );
+                    let obs = Observation::new(
+                        cfg.source_name.clone(),
+                        MODALITY_FACE_ENROL_PROGRESS,
+                        now,
+                    )
+                    .with_entity(EntityHint::KnownOnTrack(id.clone(), t.id))
+                    .with_payload(Payload::Level(
+                        f32::from(t.burst_added) / f32::from(crate::tracker::ENROL_BURST_SAMPLES),
+                    ));
+                    bump(&stats.evicted, tx.send(obs) as u64);
+                    bump(&stats.observations, 1);
+                }
             } else if let (Some((id, score)), Some(person)) = (&single, &t.person)
                 && id == person
                 && *score >= cfg.template_update_score
@@ -781,6 +844,15 @@ fn emit(
             .with_payload(Payload::Direction { azimuth_deg });
         bump(&stats.evicted, tx.send(obs) as u64);
         bump(&stats.observations, 1);
+        if t.person.is_none()
+            && let Some((a, b)) = &t.ambiguous
+        {
+            let obs = Observation::new(cfg.source_name.clone(), MODALITY_FACE_AMBIGUOUS, now)
+                .with_entity(EntityHint::Track(t.id))
+                .with_payload(Payload::Text(format!("{a}	{b}")));
+            bump(&stats.evicted, tx.send(obs) as u64);
+            bump(&stats.observations, 1);
+        }
 
         let att: FaceAttention = t.attention.scores();
         let attention = [

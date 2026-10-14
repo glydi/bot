@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use common::EntityId;
 use parking_lot::RwLock;
 
+pub use sense_audio::voiceid::OpenSetDecision;
+use sense_audio::voiceid::{open_set_decide, template_score};
+
 use crate::Error;
 use crate::arcface::{EMBEDDING_DIM, normalize};
 
@@ -28,6 +31,15 @@ pub trait FaceGallery: Send + Sync {
     /// The person this embedding belongs to, with the similarity score, or
     /// `None` if nobody passes the threshold and margin gates.
     fn best_match(&self, emb: &[f32]) -> Option<(EntityId, f32)>;
+    /// The full open-set decision, with "two people too close to call"
+    /// kept apart from "nobody". Default: from [`FaceGallery::best_match`]
+    /// (never ambiguous).
+    fn decide(&self, emb: &[f32]) -> OpenSetDecision {
+        self.best_match(emb)
+            .map_or(OpenSetDecision::Unknown, |(id, s)| {
+                OpenSetDecision::Match(id, s)
+            })
+    }
     /// Add an embedding for a person. Several per person are expected (the
     /// Python config enrols 6, spread across poses); matching takes the
     /// best score per person.
@@ -78,14 +90,13 @@ impl InMemoryFaceGallery {
         let mut best: Vec<(EntityId, f32)> = rows
             .iter()
             .filter_map(|(id, embs)| {
-                embs.iter()
-                    .filter(|e| e.len() == probe.len())
-                    // Both sides are unit length, so a dot is the cosine.
-                    .map(|e| e.iter().zip(&probe).map(|(a, b)| a * b).sum::<f32>())
-                    .fold(None, |acc: Option<f32>, s| {
-                        Some(acc.map_or(s, |a| a.max(s)))
-                    })
-                    .map(|s| (id.clone(), s))
+                template_score(
+                    embs.iter()
+                        .filter(|e| e.len() == probe.len())
+                        // Both sides are unit length, so a dot is the cosine.
+                        .map(|e| e.iter().zip(&probe).map(|(a, b)| a * b).sum::<f32>()),
+                )
+                .map(|s| (id.clone(), s))
             })
             .collect();
         best.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -105,9 +116,12 @@ impl InMemoryFaceGallery {
 
 impl FaceGallery for InMemoryFaceGallery {
     fn best_match(&self, emb: &[f32]) -> Option<(EntityId, f32)> {
-        // The same two-gate rule the voice gallery and the SQLite store
-        // apply; shared so a face and a voice are judged alike.
-        sense_audio::voiceid::open_set_match(&self.ranked(emb), self.threshold, self.margin)
+        self.decide(emb).matched()
+    }
+
+    fn decide(&self, emb: &[f32]) -> OpenSetDecision {
+        // The same rule the SQLite store applies (contested margin).
+        open_set_decide(&self.ranked(emb), self.threshold, self.margin)
     }
 
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), Error> {
@@ -173,6 +187,43 @@ mod tests {
         ambiguous[1] = 1.0;
         assert!(g.best_match(&ambiguous).is_none());
         assert!(g.best_match(&unit(5)).is_none());
+    }
+
+    #[test]
+    fn two_close_people_are_ambiguous_not_unknown() {
+        let g = InMemoryFaceGallery::default();
+        g.enrol(&id("sony"), &unit(0)).ok();
+        g.enrol(&id("kalyan"), &unit(1)).ok();
+        // 0.47 vs 0.45: both over the floor, gap 0.02.
+        let mut p = vec![0.0; EMBEDDING_DIM];
+        p[0] = 0.47;
+        p[1] = 0.45;
+        p[2] = (1.0f32 - 0.47 * 0.47 - 0.45 * 0.45).sqrt();
+        assert_eq!(
+            g.decide(&p),
+            OpenSetDecision::Ambiguous(id("sony"), id("kalyan"))
+        );
+        assert!(g.best_match(&p).is_none());
+        // Gap 0.08 > margin 0.06, but the runner-up (0.36) is close to the
+        // floor: the contested rule wants 0.12.
+        p[0] = 0.44;
+        p[1] = 0.36;
+        p[2] = (1.0f32 - 0.44 * 0.44 - 0.36 * 0.36).sqrt();
+        assert!(matches!(g.decide(&p), OpenSetDecision::Ambiguous(..)));
+        // A clear winner with a far runner-up still matches at 0.06.
+        p[0] = 0.50;
+        p[1] = 0.10;
+        p[2] = (1.0f32 - 0.25 - 0.01).sqrt();
+        assert!(matches!(g.decide(&p), OpenSetDecision::Match(..)));
+        assert_eq!(g.decide(&unit(7)), OpenSetDecision::Unknown);
+    }
+
+    #[test]
+    fn best_two_samples_score_a_person() {
+        assert_eq!(template_score([]), None);
+        assert_eq!(template_score([0.4]), Some(0.4));
+        let s = template_score([0.2, 0.8, 0.4]).unwrap_or_default();
+        assert!((s - 0.7).abs() < 1e-6, "{s}");
     }
 
     #[test]

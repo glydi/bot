@@ -89,7 +89,7 @@ use smol_str::SmolStr;
 use tracing::{info, warn};
 
 pub use crate::attention::FaceAttention;
-pub use crate::gallery::{FaceGallery, InMemoryFaceGallery};
+pub use crate::gallery::{FaceGallery, InMemoryFaceGallery, OpenSetDecision};
 pub use crate::gesture::{GestureConfig, MODALITY_GESTURE, NOD, SHAKE, WAVE};
 pub use crate::image::{Gray, Rgb};
 pub use crate::objects::{
@@ -97,9 +97,9 @@ pub use crate::objects::{
     ObjectDetector, ObjectSeen, ObjectStats,
 };
 pub use crate::pipeline::{
-    MODALITY_FACE, MODALITY_FACE_ATTENTION, MODALITY_FACE_CROP, MODALITY_FACE_EMBEDDING,
-    MODALITY_FACING, MODALITY_LIP_MOTION, PREVIEW_ENGAGED_FACING, PREVIEW_EVERY, Parts, Stats,
-    build_preview,
+    MODALITY_FACE, MODALITY_FACE_AMBIGUOUS, MODALITY_FACE_ATTENTION, MODALITY_FACE_CROP,
+    MODALITY_FACE_EMBEDDING, MODALITY_FACE_ENROL_PROGRESS, MODALITY_FACING, MODALITY_LIP_MOTION,
+    PREVIEW_ENGAGED_FACING, PREVIEW_EVERY, Parts, Stats, build_preview,
 };
 // The preview type is `common`'s (so the UI can draw it without this
 // crate's model dependencies); re-exported for readers of this crate.

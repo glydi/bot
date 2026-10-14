@@ -681,3 +681,108 @@ fn lost_camera_is_reopened_with_backoff() {
     );
     assert!(h.stats().frames.load(Ordering::Relaxed) >= 20);
 }
+
+/// Embeds every crop as `base` (normalised by the pipeline) plus a
+/// different small component per call, so frames are distinct views.
+struct SeqEmbedder {
+    base: Vec<(usize, f32)>,
+    n: usize,
+}
+
+impl FaceEmbedder for SeqEmbedder {
+    fn embed(&mut self, _crop: &Rgb) -> Result<Vec<f32>, Error> {
+        let mut v = vec![0.0; EMBEDDING_DIM];
+        for &(i, x) in &self.base {
+            v[i] = x;
+        }
+        self.n += 1;
+        v[100 + self.n % 300] = 0.6;
+        Ok(v)
+    }
+}
+
+fn unit(i: usize) -> Vec<f32> {
+    let mut v = vec![0.0; EMBEDDING_DIM];
+    v[i] = 1.0;
+    v
+}
+
+fn spawn_seq(
+    gallery: Arc<InMemoryFaceGallery>,
+    base: Vec<(usize, f32)>,
+    frames: usize,
+) -> (sense_vision::VisionSenseHandle, common::RingReceiver) {
+    let (tx, rx) = ObservationRing::bounded(1024);
+    let clock = Arc::new(FakeClock::new());
+    let det = OneFace {
+        bbox: [200.0, 100.0, 360.0, 260.0],
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut p = parts(frames, Box::new(det));
+    p.embedder = Box::new(SeqEmbedder { base, n: 0 });
+    let handle = VisionSense::spawn_with(config(frames), clock, tx, gallery, p)
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    wait_finished(&handle);
+    (handle, rx)
+}
+
+#[test]
+fn a_face_between_two_known_people_is_ambiguous_and_never_named() {
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    let enrol = |n: &str, i: usize| {
+        sense_vision::FaceGallery::enrol(&*gallery, &EntityId::new(n), &unit(i))
+            .unwrap_or_else(|e| panic!("{e}"));
+    };
+    enrol("sony", 0);
+    enrol("kalyan", 1);
+    // ~0.55 / ~0.53 to the two after normalisation: both over the floor.
+    let (handle, rx) = spawn_seq(
+        Arc::clone(&gallery),
+        vec![(0, 0.47), (1, 0.45), (2, 0.5)],
+        12,
+    );
+    let obs = drain(&rx);
+    assert!(
+        obs.iter()
+            .all(|o| !matches!(o.entity, Some(EntityHint::KnownOnTrack(..)))),
+        "named while ambiguous"
+    );
+    let amb: Vec<&Observation> = obs
+        .iter()
+        .filter(|o| o.modality == sense_vision::MODALITY_FACE_AMBIGUOUS)
+        .collect();
+    assert!(!amb.is_empty(), "no face_ambiguous");
+    match &amb[0].payload {
+        // The pair is order-free, reported sorted.
+        Payload::Text(t) => assert_eq!(t, "kalyan\tsony"),
+        p => panic!("unexpected payload {p:?}"),
+    }
+    handle.stop();
+}
+
+#[test]
+fn a_just_named_track_feeds_the_enrolment_burst() {
+    let gallery = Arc::new(InMemoryFaceGallery::default());
+    sense_vision::FaceGallery::enrol(&*gallery, &EntityId::new("ana"), &unit(0))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (handle, rx) = spawn_seq(Arc::clone(&gallery), vec![(0, 1.0)], 12);
+    let obs = drain(&rx);
+    assert!(
+        obs.iter().any(
+            |o| matches!(&o.entity, Some(EntityHint::KnownOnTrack(id, _)) if id.as_str() == "ana")
+        ),
+        "never named"
+    );
+    let progress: Vec<f32> = obs
+        .iter()
+        .filter(|o| o.modality == sense_vision::MODALITY_FACE_ENROL_PROGRESS)
+        .filter_map(|o| match o.payload {
+            Payload::Level(l) => Some(l),
+            _ => None,
+        })
+        .collect();
+    // The fake clock stands still, so the 0.9 s spacing allows one.
+    assert_eq!(progress.len(), 1, "{progress:?}");
+    assert!((progress[0] - 1.0 / 16.0).abs() < 1e-6);
+    handle.stop();
+}

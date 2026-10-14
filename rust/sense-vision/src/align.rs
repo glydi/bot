@@ -169,9 +169,48 @@ pub fn norm_crop(src: &Rgb, lmk: &[[f32; 2]; 5], image_size: usize) -> Rgb {
     warp_affine(src, &estimate_norm(lmk, image_size), image_size, image_size)
 }
 
+/// A cheap head-pose proxy from the five SCRFD landmarks (eye L, eye R,
+/// nose, mouth L, mouth R): `(yaw, pitch)`. Yaw is the nose's sideways
+/// offset from the eye midpoint over the eye distance (0 frontal, about
+/// +-0.3 at a clear turn; LFW p95 |yaw| 0.31). Pitch is the nose's height
+/// between the eye line (0) and the mouth line (1): about 0.5 level,
+/// smaller looking up, larger looking down. Used to steer guided
+/// enrolment toward different views.
+pub fn head_pose(lmk: &[[f32; 2]; 5]) -> (f32, f32) {
+    let [el, er, no, ml, mr] = *lmk;
+    let mid = [f32::midpoint(el[0], er[0]), f32::midpoint(el[1], er[1])];
+    let eye_d = ((er[0] - el[0]).powi(2) + (er[1] - el[1]).powi(2))
+        .sqrt()
+        .max(1e-3);
+    let mouth = [f32::midpoint(ml[0], mr[0]), f32::midpoint(ml[1], mr[1])];
+    let span = ((mouth[0] - mid[0]).powi(2) + (mouth[1] - mid[1]).powi(2))
+        .sqrt()
+        .max(1e-3);
+    ((no[0] - mid[0]) / eye_d, (no[1] - mid[1]) / span)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_pose_reads_turns() {
+        let frontal = [
+            [40.0, 50.0],
+            [70.0, 50.0],
+            [55.0, 65.0],
+            [43.0, 80.0],
+            [67.0, 80.0],
+        ];
+        let (y, p) = head_pose(&frontal);
+        assert!(y.abs() < 1e-6 && (p - 0.5).abs() < 1e-6);
+        let mut turned = frontal;
+        turned[2][0] = 64.0;
+        assert!(head_pose(&turned).0 > 0.25);
+        let mut up = frontal;
+        up[2][1] = 58.0;
+        assert!(head_pose(&up).1 < 0.3);
+    }
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6

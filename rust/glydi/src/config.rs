@@ -39,8 +39,15 @@ pub const DEFAULT_WHISPER_MODEL: &str = "tiny.en";
 /// (SCRFD-10G + `ArcFace` `ResNet50`), which separates people clearly
 /// better than `buffalo_s` on LFW (`docs/face-recognition.md`). Falls back
 /// to [`FALLBACK_FACE_MODEL`] when the pack is not installed. The Jetson
-/// pins `buffalo_s` in `env.jetson` until its GPU runtime is built.
+/// pins `buffalo_s` in `env.jetson` until its GPU runtime is built, and
+/// the aarch64 build defaults to it too: on the Orin's CPU provider r50 is
+/// 250-400 ms per face; `MobileFaceNet` is ~10% of one A78 core at 15 fps.
+/// `GLYDI_FACE_MODEL=buffalo_l` with `GLYDI_TRT=1` once `TensorRT` is there.
+#[cfg(not(target_arch = "aarch64"))]
 pub const DEFAULT_FACE_MODEL: &str = "buffalo_l";
+/// See the non-aarch64 doc: the Jetson default is `buffalo_s`.
+#[cfg(target_arch = "aarch64")]
+pub const DEFAULT_FACE_MODEL: &str = "buffalo_s";
 /// The small pack: SCRFD-500M + `MobileFaceNet`.
 pub const FALLBACK_FACE_MODEL: &str = "buffalo_s";
 

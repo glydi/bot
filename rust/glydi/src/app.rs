@@ -1936,6 +1936,10 @@ impl sense_vision::FaceGallery for StoreFaces {
         memory::FaceGallery::best_match(&*self.0, emb)
     }
 
+    fn decide(&self, emb: &[f32]) -> sense_vision::OpenSetDecision {
+        memory::FaceGallery::decide(&*self.0, emb)
+    }
+
     fn enrol(&self, id: &EntityId, emb: &[f32]) -> Result<(), sense_vision::Error> {
         memory::FaceGallery::enrol(&*self.0, id.clone(), emb)
             .map_err(|e| sense_vision::Error::Model(e.to_string()))

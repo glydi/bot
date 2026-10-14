@@ -84,6 +84,11 @@ enum Cmd {
         /// Grab this many good frames from the camera for `--enrol`.
         #[arg(long = "from-camera", value_name = "N")]
         from_camera: Option<usize>,
+        /// With `--from-camera`: ask for views in turn on the console
+        /// (straight, one side, the other side, up, down) and only take a
+        /// frame that shows the asked-for view.
+        #[arg(long = "guided")]
+        guided: bool,
         /// Merge person B into person A (names or ids): faces, voices,
         /// facts, relations, episodes all move to A; B goes. Backs up the
         /// gallery first.
@@ -203,6 +208,7 @@ fn main() -> anyhow::Result<()> {
             enrol,
             image,
             from_camera,
+            guided,
             merge,
             prune_junk,
             yes,
@@ -214,6 +220,7 @@ fn main() -> anyhow::Result<()> {
                 enrol,
                 image,
                 from_camera,
+                guided,
                 merge,
                 prune_junk,
                 yes,
@@ -716,6 +723,7 @@ struct PeopleArgs {
     enrol: Option<String>,
     image: Vec<PathBuf>,
     from_camera: Option<usize>,
+    guided: bool,
     merge: Vec<String>,
     prune_junk: bool,
     yes: bool,
@@ -792,7 +800,14 @@ fn people(config: Option<&std::path::Path>, args: &PeopleArgs) -> anyhow::Result
             !args.image.is_empty() || args.from_camera.is_some(),
             "--enrol needs --image PATH or --from-camera N"
         );
-        enrol_face(&config, &store, name, &args.image, args.from_camera)?;
+        enrol_face(
+            &config,
+            &store,
+            name,
+            &args.image,
+            args.from_camera,
+            args.guided,
+        )?;
     }
     if args.reembed {
         reembed(&config, &store)?;
@@ -831,6 +846,8 @@ struct FaceSample {
     quality: f32,
     width: f32,
     score: f32,
+    /// `sense_vision::align::head_pose` of the landmarks.
+    pose: (f32, f32),
 }
 
 #[cfg(feature = "vision")]
@@ -864,6 +881,7 @@ impl FaceKit {
             quality,
             width: face.width(),
             score: face.score,
+            pose: sense_vision::align::head_pose(&face.landmarks),
         }))
     }
 }
@@ -879,6 +897,7 @@ fn enrol_face(
     name: &str,
     images: &[PathBuf],
     from_camera: Option<usize>,
+    guided: bool,
 ) -> anyhow::Result<()> {
     let mut kit = FaceKit::open(config)?;
     let mut samples: Vec<FaceSample> = Vec::new();
@@ -914,7 +933,7 @@ fn enrol_face(
         }
     }
     if let Some(want) = from_camera {
-        samples.extend(camera_samples(config, &mut kit, want)?);
+        samples.extend(camera_samples(config, &mut kit, want, guided)?);
     }
     anyhow::ensure!(!samples.is_empty(), "no usable face; nothing enrolled");
     let embs: Vec<&[f32]> = samples.iter().map(|s| s.emb.as_slice()).collect();
@@ -931,6 +950,7 @@ fn camera_samples(
     config: &Config,
     kit: &mut FaceKit,
     want: usize,
+    guided: bool,
 ) -> anyhow::Result<Vec<FaceSample>> {
     let mut cam = sense_vision::open_camera(config.camera_index, 1280, 720, 15).map_err(|e| {
         anyhow::anyhow!(
@@ -938,6 +958,9 @@ fn camera_samples(
             config.camera_index
         )
     })?;
+    if guided {
+        return guided_samples(&mut *cam, kit, want);
+    }
     println!("look at the camera; turn your head a little between frames");
     let started = std::time::Instant::now();
     let mut got: Vec<FaceSample> = Vec::new();
@@ -969,6 +992,89 @@ fn camera_samples(
     Ok(got)
 }
 
+/// The views `--guided` asks for, with the head-pose window each accepts
+/// (`sense_vision::align::head_pose`: yaw, pitch).
+#[cfg(feature = "vision")]
+type ViewFits = fn((f32, f32)) -> bool;
+
+/// See [`guided_samples`].
+#[cfg(feature = "vision")]
+const GUIDED_VIEWS: &[(&str, ViewFits)] = &[
+    ("look straight at the camera", |(y, p)| {
+        y.abs() < 0.12 && (0.35..0.65).contains(&p)
+    }),
+    ("turn your head a little to one side", |(y, _)| y < -0.15),
+    ("now a little to the other side", |(y, _)| y > 0.15),
+    ("tilt your chin up a little", |(y, p)| {
+        y.abs() < 0.2 && p < 0.42
+    }),
+    ("tilt your chin down a little", |(y, p)| {
+        y.abs() < 0.2 && p > 0.58
+    }),
+];
+
+/// `--from-camera N --guided`: N good frames spread over the views in
+/// [`GUIDED_VIEWS`], up to 20 s per view, each different from the rest.
+#[cfg(feature = "vision")]
+fn guided_samples(
+    cam: &mut dyn sense_vision::FrameSource,
+    kit: &mut FaceKit,
+    want: usize,
+) -> anyhow::Result<Vec<FaceSample>> {
+    let per_view = want.div_ceil(GUIDED_VIEWS.len()).max(1);
+    let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+    let mut got: Vec<FaceSample> = Vec::new();
+    for (i, (ask, fits)) in GUIDED_VIEWS.iter().enumerate() {
+        if got.len() >= want {
+            break;
+        }
+        println!("[{}/{}] {ask}", i + 1, GUIDED_VIEWS.len());
+        let started = std::time::Instant::now();
+        let mut here = 0;
+        let mut last_hint = std::time::Instant::now();
+        while here < per_view
+            && got.len() < want
+            && started.elapsed() < std::time::Duration::from_secs(20)
+        {
+            let Some(frame) = cam.next_frame(std::time::Duration::from_millis(500))? else {
+                continue;
+            };
+            let Some(s) = kit.largest(&frame.image)? else {
+                continue;
+            };
+            if !fits(s.pose) {
+                if last_hint.elapsed() > std::time::Duration::from_secs(3) {
+                    println!(
+                        "      ...{ask} (yaw {:+.2}, pitch {:.2})",
+                        s.pose.0, s.pose.1
+                    );
+                    last_hint = std::time::Instant::now();
+                }
+                continue;
+            }
+            // Turned faces score lower on the frontal-weighted quality;
+            // take them a notch below the live gate, never blurry ones.
+            if s.quality < sense_vision::attention::KEEP_SAMPLE * 0.8
+                || got.iter().any(|g| dot(&g.emb, &s.emb) >= 0.95)
+            {
+                continue;
+            }
+            println!(
+                "      got it: face {:.0} px, quality {:.2} ({}/{want})",
+                s.width,
+                s.quality,
+                got.len() + 1
+            );
+            got.push(s);
+            here += 1;
+        }
+        if here == 0 {
+            println!("      no usable frame for that view; moving on");
+        }
+    }
+    Ok(got)
+}
+
 /// `--reembed`: samples from another recogniser, through this one.
 #[cfg(feature = "vision")]
 fn reembed(config: &Config, store: &memory::Store) -> anyhow::Result<()> {
@@ -996,6 +1102,7 @@ fn enrol_face(
     _name: &str,
     _images: &[PathBuf],
     _from_camera: Option<usize>,
+    _guided: bool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("this build has no vision; rebuild with --features vision")
 }

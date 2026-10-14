@@ -187,6 +187,81 @@ pub fn open_set_match(
     Some((top_id.clone(), *top_score))
 }
 
+/// What an open-set probe came to: one person, two people too close to
+/// tell apart, or nobody.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpenSetDecision {
+    /// Passed both gates.
+    Match(EntityId, f32),
+    /// The best two are both close and the gap is too small to choose:
+    /// `(top, runner_up)`. Naming either would risk the wrong name.
+    Ambiguous(EntityId, EntityId),
+    /// Nobody above the floor (or an empty gallery).
+    Unknown,
+}
+
+impl OpenSetDecision {
+    /// The match, if there is one.
+    pub fn matched(self) -> Option<(EntityId, f32)> {
+        match self {
+            Self::Match(id, s) => Some((id, s)),
+            _ => None,
+        }
+    }
+}
+
+/// [`open_set_match`] with a contested rule, for faces: when the runner-up
+/// is itself within `margin` of the floor (two known people both close,
+/// the live Sony/Kalyan case at 0.47/0.45), the gap must be twice
+/// `margin`. A top score over the floor that fails its gap is
+/// [`OpenSetDecision::Ambiguous`] rather than a silent "nobody".
+pub fn open_set_decide(ranked: &[(EntityId, f32)], threshold: f32, margin: f32) -> OpenSetDecision {
+    let Some((top_id, top)) = ranked.first() else {
+        return OpenSetDecision::Unknown;
+    };
+    if *top < threshold {
+        return OpenSetDecision::Unknown;
+    }
+    let Some((second_id, second)) = ranked.get(1) else {
+        return OpenSetDecision::Match(top_id.clone(), *top);
+    };
+    let need = if *second >= threshold - margin {
+        2.0 * margin
+    } else {
+        margin
+    };
+    if top - second < need {
+        OpenSetDecision::Ambiguous(top_id.clone(), second_id.clone())
+    } else {
+        OpenSetDecision::Match(top_id.clone(), *top)
+    }
+}
+
+/// One person's score from their samples' cosines to a probe: the mean
+/// of the best sample and the mean of the best two (`0.75 * max + 0.25 *
+/// second`), plain max for a single sample. Measured on LFW (200 people,
+/// 3 samples each, `docs/face-recognition.md`): the best impostor p99
+/// drops 0.327 -> 0.309 while the genuine p05 stays 0.52, so a lone
+/// lucky sample of someone else counts for less. Empty -> `None`.
+pub fn template_score(scores: impl IntoIterator<Item = f32>) -> Option<f32> {
+    let (mut a, mut b) = (f32::MIN, f32::MIN);
+    let mut n = 0usize;
+    for s in scores {
+        n += 1;
+        if s > a {
+            b = a;
+            a = s;
+        } else if s > b {
+            b = s;
+        }
+    }
+    match n {
+        0 => None,
+        1 => Some(a),
+        _ => Some(0.75 * a + 0.25 * b),
+    }
+}
+
 /// Who a voice belongs to. The in-memory implementation lives here; the
 /// `memory` crate provides the SQLite-backed one.
 pub trait VoiceGallery: Send + Sync {

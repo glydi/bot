@@ -21,6 +21,15 @@ pub trait FaceGallery: Send + Sync {
     /// cosine score, or `None` if nobody passes the 0.36 threshold and 0.06
     /// margin gates.
     fn best_match(&self, emb: &[f32]) -> Option<(EntityId, f32)>;
+    /// The decision with "two people too close to call" kept apart from
+    /// "nobody". Default: from `best_match`.
+    fn decide(&self, emb: &[f32]) -> sense_audio::voiceid::OpenSetDecision {
+        use sense_audio::voiceid::OpenSetDecision;
+        self.best_match(emb)
+            .map_or(OpenSetDecision::Unknown, |(id, s)| {
+                OpenSetDecision::Match(id, s)
+            })
+    }
     /// Add an embedding for a person. Several per person are expected (the
     /// Python config enrols 6); matching takes the best score per person.
     fn enrol(&self, id: EntityId, emb: &[f32]) -> Result<(), Error>;
@@ -49,6 +58,13 @@ impl FaceGallery for Store {
                 None
             }
         }
+    }
+
+    fn decide(&self, emb: &[f32]) -> sense_audio::voiceid::OpenSetDecision {
+        self.decide_face(emb).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "face decision refused");
+            sense_audio::voiceid::OpenSetDecision::Unknown
+        })
     }
 
     fn enrol(&self, id: EntityId, emb: &[f32]) -> Result<(), Error> {
