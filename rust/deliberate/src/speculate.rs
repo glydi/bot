@@ -258,10 +258,23 @@ impl Speculator {
                 let mut stream = backend.chat(req);
                 // Forward in the background: the understanding is ready
                 // now and must not wait for the whole reply.
+                // Cancelled (the receiver dropped): stop at once and drop
+                // the stream, which closes the HTTP request -- Ollama has
+                // one slot, and the real turn must not queue behind a
+                // reply nobody will hear.
                 tokio::spawn(async move {
-                    while let Some(ev) = stream.next().await {
-                        if tx.send(ev).is_err() {
-                            break;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = tx.closed() => break,
+                            ev = stream.next() => match ev {
+                                Some(ev) => {
+                                    if tx.send(ev).is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            },
                         }
                     }
                 });
@@ -566,6 +579,64 @@ mod tests {
         s.cancel();
         assert!(s.on_final("tell me a joke").is_none(), "cancelled: gone");
         assert!(calls.load(Ordering::SeqCst) <= 1);
+    }
+
+    /// Ollama serves one request at a time: a cancelled speculation must
+    /// close its HTTP stream at once, or the real turn queues behind it.
+    /// A fake server streams one token and then holds the response open;
+    /// after `cancel` it must see the client hang up within a moment.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn a_cancelled_reply_closes_its_http_stream() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", l.local_addr().unwrap());
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<&'static str>();
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            );
+            let ev = "data: {\"choices\":[{\"delta\":{\"content\":\"Oh \"}}]}\n\n";
+            let _ = c.write_all(format!("{:x}\r\n{ev}\r\n", ev.len()).as_bytes());
+            let _ = c.flush();
+            seen_tx.send("streaming").unwrap();
+            // Hold the reply open; a read of 0 bytes is the client hanging up.
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let closed = matches!(c.read(&mut buf), Ok(0) | Err(_));
+            seen_tx
+                .send(if closed { "closed" } else { "open" })
+                .unwrap();
+        });
+        let backend: Arc<dyn ChatBackend> = Arc::new(
+            crate::backend::OpenAiBackend::new(&url, "m", None, Duration::from_secs(30)).unwrap(),
+        );
+        let u = Arc::new(ScriptedUnderstander::new(&[&json("chit_chat")]));
+        let mut s = Speculator::new(Some(u), Some(backend));
+        s.on_partial(&partial("tell me a joke", true), || "nb".into(), |_| req());
+        let got = tokio::task::spawn_blocking(move || {
+            let first = seen_rx.recv_timeout(Duration::from_secs(5));
+            (first, seen_rx)
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.0.unwrap(), "streaming");
+        let t = Instant::now();
+        s.cancel();
+        let rx = got.1;
+        let end = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, "closed");
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

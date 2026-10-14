@@ -2046,7 +2046,58 @@ mod tests {
 /// The people-first pipeline, unless `GLYDI_PEOPLE_FIRST=0`. The
 /// understander is `GLYDI_UNDERSTAND_MODEL` (default: the local model) on
 /// the local Ollama; the hand-off is `GLYDI_HANDOFF_URL` or one line.
+/// The one-model rule (docs/TODO.md "Standing rule"): on the board every
+/// role uses `GLYDI_LOCAL_MODEL`. The roles that name another model, as
+/// `(role, model)`.
+fn other_models(
+    local: &str,
+    chat: &str,
+    understand: &str,
+    memory: &str,
+    deep: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for (role, m) in [
+        ("chat", chat),
+        ("understand", understand),
+        ("memory", memory),
+    ] {
+        if m != local {
+            out.push((role, m.to_owned()));
+        }
+    }
+    if let Some(d) = deep
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && *d != "off" && *d != local)
+    {
+        out.push(("deep", d.to_owned()));
+    }
+    out
+}
+
 fn people_first(config: &Config) -> Option<deliberate::People> {
+    let local = std::env::var("GLYDI_LOCAL_MODEL").unwrap_or_else(|_| config.local_model.clone());
+    let understand = std::env::var("GLYDI_UNDERSTAND_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| config.local_model.clone());
+    let others = other_models(
+        local.trim(),
+        &config.local_model,
+        understand.trim(),
+        &config.memory_model,
+        std::env::var("GLYDI_DEEP_MODEL").ok().as_deref(),
+    );
+    if cfg!(target_arch = "aarch64") {
+        for (role, model) in &others {
+            tracing::warn!(
+                role,
+                model,
+                local = local.trim(),
+                "one-model rule: the board runs one resident LLM; this role names another"
+            );
+        }
+    }
     if std::env::var("GLYDI_PEOPLE_FIRST").is_ok_and(|v| v.trim() == "0") {
         tracing::info!("people-first off (GLYDI_PEOPLE_FIRST=0)");
         return None;
@@ -2242,5 +2293,19 @@ mod start_retry_tests {
         }
         assert_eq!(r.failed(), Duration::from_secs(30));
         assert_eq!(r.failures(), 111);
+    }
+}
+
+#[cfg(test)]
+mod one_model_tests {
+    #[test]
+    fn other_models_are_named() {
+        assert!(super::other_models("a", "a", "a", "a", Some("off")).is_empty());
+        assert!(super::other_models("a", "a", "a", "a", None).is_empty());
+        let o = super::other_models("a", "b", "a", "a", Some("qwen2.5:7b"));
+        assert_eq!(
+            o,
+            vec![("chat", "b".to_owned()), ("deep", "qwen2.5:7b".to_owned())]
+        );
     }
 }
