@@ -555,6 +555,7 @@ fn name_word(w: &str) -> bool {
 }
 
 /// "my name is X", "I'm X", "I am X", "call me X": the name.
+#[allow(clippy::too_many_lines)]
 pub fn first_name_in(text: &str) -> Option<String> {
     let w = words(text);
     let s: Vec<&str> = w.iter().map(String::as_str).collect();
@@ -576,6 +577,15 @@ pub fn first_name_in(text: &str) -> Option<String> {
                     | "afternoon"
                     | "evening"
                     | "glydi"
+                    | "no"
+                    | "wait"
+                    | "sorry"
+                    | "actually"
+                    | "oh"
+                    | "so"
+                    | "well"
+                    | "okay"
+                    | "ok"
             )
         })
         .collect();
@@ -597,6 +607,15 @@ pub fn first_name_in(text: &str) -> Option<String> {
         .collect();
     // "this is Kavya" / "this is Mrs Kapoor" said of oneself (not "this
     // is my sister ...", a relation).
+    // "this is Mr Iyer from the transport office": the name, then where
+    // they are from.
+    let s: Vec<&str> = match s
+        .iter()
+        .position(|w| matches!(*w, "from" | "speaking" | "here"))
+    {
+        Some(i) if s.starts_with(&["this", "is"]) && i >= 3 => s[..i].to_vec(),
+        _ => s,
+    };
     if let ["this", "is", n, rest @ ..] = s.as_slice()
         && *n != "my"
         && rest.len() <= 1
@@ -639,12 +658,41 @@ pub fn first_name_in(text: &str) -> Option<String> {
         [i, n, ..] if i.len() == 1 && name_word(n) => &after[1..],
         _ => after,
     };
+    // "I'm the new security guard, Bhim Singh": a role first, the name
+    // after the comma.
+    if after.first() == Some(&"the")
+        && let Some((_, tail)) = text.split_once(',')
+    {
+        let names: Vec<&str> = tail
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if (1..=2).contains(&names.len())
+            && names.iter().all(|w| {
+                w.chars().next().is_some_and(char::is_uppercase) && name_word(&w.to_lowercase())
+            })
+        {
+            return Some(
+                names
+                    .iter()
+                    .map(|w| cap(&w.to_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
     let first = after.first()?;
     // "I'm Rohan's father" is a relation, not a name.
     if first.ends_with("'s") {
         return None;
     }
     name_word(first).then(|| cap(first))
+}
+
+/// `converse::retracts` on joined words.
+fn converse_retracts(joined: &str) -> bool {
+    crate::converse::retracts(joined)
 }
 
 /// "two" -> 2 (small counts).
@@ -1305,9 +1353,56 @@ pub fn rules(text: &str) -> Option<Understanding> {
             _ => {}
         }
     }
+    // "do you know Mrs Rao?", "tell me everything you know about
+    // Ananya", "what do you know about Ananya?": about that person (the
+    // privacy rule decides what is said).
+    let about_named = |rest: &[&str]| -> Option<String> {
+        let rest: Vec<&str> = rest
+            .iter()
+            .copied()
+            .filter(|w| !matches!(*w, "everything" | "anything" | "you" | "know" | "about"))
+            .collect();
+        match rest.as_slice() {
+            [t, n] if title_word(t).is_some() && name_word(n) => {
+                Some(format!("{} {}", title_word(t).unwrap_or_default(), cap(n)))
+            }
+            [n] if name_word(n) && !matches!(*n, "me" | "myself") => Some(cap(n)),
+            _ => None,
+        }
+    };
+    let named = match s.as_slice() {
+        ["do", "you", "know", rest @ ..]
+        | ["what", "do", "you", "know", "about", rest @ ..]
+        | ["tell", "me", "about", rest @ ..]
+        | [
+            "tell",
+            "me",
+            "everything",
+            "you",
+            "know",
+            "about",
+            rest @ ..,
+        ]
+        | ["tell", "me", "what", "you", "know", "about", rest @ ..] => about_named(rest),
+        _ => None,
+    };
+    if let Some(n) = named {
+        let mut u = Understanding::of("ask_about_person");
+        u.people.push(Mention {
+            name: n,
+            ..Mention::default()
+        });
+        return Some(u);
+    }
+    if has("who else") || has("who came") || has("who all came") || has("who has come") {
+        return Some(Understanding::of("ask_about_person"));
+    }
     // "how is she", "is my son here", "where is Rohan", "who is she"
     let ask = match s.as_slice() {
         ["is", "my", rel, ..]
+        | ["has" | "did", "my", rel, ..]
+        | ["what", "are" | "is", "my", rel, "called" | "names" | "name"]
+        | ["what's", "my", rel, "called" | "name"]
         | ["who", "are" | "is", "my", rel]
         | ["how", "is", "my", rel, ..]
         | ["how's", "my", rel, ..]
@@ -1374,6 +1469,82 @@ pub fn rules(text: &str) -> Option<Understanding> {
     }
     if deep_question(text) {
         return Some(Understanding::of("deep"));
+    }
+    if !asks(text) {
+        // "I don't like spicy food any more", "I don't work there any
+        // more": a fact taken back.
+        if converse_retracts(&joined) && matches!(s.first(), Some(&("i" | "i'm" | "we"))) {
+            let kept: Vec<&str> = s
+                .iter()
+                .copied()
+                .filter(|w| {
+                    !matches!(
+                        *w,
+                        "don't"
+                            | "dont"
+                            | "do"
+                            | "not"
+                            | "no"
+                            | "longer"
+                            | "any"
+                            | "more"
+                            | "anymore"
+                    )
+                })
+                .collect();
+            let mut u = Understanding::of("tell_fact");
+            if let Some(f) = own_fact(&kept) {
+                u.facts.push(f);
+            } else if let Some(v) = kept.get(1).filter(|v| v.len() > 2) {
+                u.facts.push(third_person(v));
+            }
+            return Some(u);
+        }
+        // "she started dancing classes", "he loves cricket": about the
+        // person the pronoun points at.
+        if matches!(s.first(), Some(&("she" | "he" | "they"))) && s.len() >= 3 {
+            let p = s[0];
+            let mut u = Understanding::of("tell_fact");
+            u.refers_to = Some(p.to_owned());
+            u.people.push(Mention {
+                reference: Some(p.to_owned()),
+                ..Mention::default()
+            });
+            u.facts.push(s[1..].join(" "));
+            return Some(u);
+        }
+        // "Rohan has a cricket match on Sunday": a fact about someone
+        // named, as said.
+        if let [n, v, rest @ ..] = s.as_slice()
+            && rest.len() >= 2
+            && name_word(n)
+            && capitalised_in(text, n)
+            && matches!(
+                *v,
+                "has"
+                    | "is"
+                    | "likes"
+                    | "loves"
+                    | "plays"
+                    | "goes"
+                    | "studies"
+                    | "works"
+                    | "lives"
+                    | "learns"
+                    | "started"
+                    | "joined"
+                    | "got"
+                    | "won"
+            )
+        {
+            let mut u = Understanding::of("tell_fact");
+            u.people.push(Mention {
+                name: cap(n),
+                ..Mention::default()
+            });
+            u.facts.push(s[1..].join(" "));
+            return Some(u);
+        }
     }
     // A question about themselves is never a fact ("which class do I
     // study in?" was stored as "studys in"): it asks what we know.

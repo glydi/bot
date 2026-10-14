@@ -312,6 +312,30 @@ impl Session {
         Some(format!("You told me {}.", said.join(", and ")))
     }
 
+    /// The person a visitor without a name yet asks about, among those
+    /// they told me of this visit: by relation ("my brother"), or the
+    /// last one for a pronoun ("she").
+    fn pending_target(&self, u: &Understanding) -> Option<Mention> {
+        let pending = &self.visit.pending_people;
+        if let Some(r) = u
+            .people
+            .first()
+            .and_then(|m| m.relation_to_speaker.as_deref())
+        {
+            return pending
+                .iter()
+                .find(|p| p.relation_to_speaker.as_deref() == Some(r))
+                .cloned();
+        }
+        let pronoun = u
+            .refers_to
+            .as_deref()
+            .or_else(|| u.people.first().and_then(|m| m.reference.as_deref()))?;
+        matches!(pronoun, "she" | "he" | "her" | "him" | "they")
+            .then(|| pending.last().cloned())
+            .flatten()
+    }
+
     /// "who are my children?" / "who are my friends?": all of them, by
     /// name; `None` when the question is not about a plural relation.
     pub(super) fn plural_relation_answer(
@@ -828,7 +852,8 @@ impl Session {
             "router"
         );
         let salt = self.visit.exchanges.len() + text.len();
-        let last = self.said.all().last().copied();
+        let last_owned: Option<String> = self.said.all().last().map(|s| (*s).to_owned());
+        let last = last_owned.as_deref();
         let now = unix_now();
         let line: Option<String> = match intent {
             "greet" => Some(match (&me, &my_name) {
@@ -980,7 +1005,31 @@ impl Session {
                 let mut ops = Vec::new();
                 if let Some(id) = &me {
                     let replaces = converse::replaces(text);
-                    for f in &u.facts {
+                    // "now I like football more": the favourite they named
+                    // before is football now.
+                    let more = u
+                        .facts
+                        .iter()
+                        .find_map(|f| {
+                            f.strip_prefix("likes ")
+                                .and_then(|x| x.strip_suffix(" more"))
+                        })
+                        .map(str::to_owned);
+                    if let Some(new) = more
+                        && let Some(old) = self
+                            .facts
+                            .recall(id)
+                            .into_iter()
+                            .rev()
+                            .find(|h| h.starts_with("favourite ") && h.contains(" is "))
+                    {
+                        let (key, _) = old.split_once(" is ").unwrap_or((&old, ""));
+                        let updated = format!("{key} is {new}");
+                        self.facts.forget_fact(id, &old);
+                        self.facts.remember(id, &updated);
+                        ops.push(FactOp::Update(old));
+                    }
+                    for f in u.facts.iter().filter(|f| !f.ends_with(" more")) {
                         ops.push(converse::write_fact_replacing(
                             self.facts.as_ref(),
                             id,
@@ -1007,6 +1056,22 @@ impl Session {
             // "who are my children?": everyone with that relation.
             "ask_about_person" if let Some(l) = self.plural_relation_answer(text, me.as_ref()) => {
                 Some(l)
+            }
+            // Who came today is not for a visitor to know.
+            "ask_about_person" if u.people.is_empty() && u.refers_to.is_none() => Some(
+                "I can't share who comes in, but I can tell you about your own family.".to_owned(),
+            ),
+            // A visitor who has not given their name yet asks about the
+            // relation they told me ("my brother Vikram ...").
+            "ask_about_person"
+                if me.is_none()
+                    && let Some(m) = self.pending_target(&u) =>
+            {
+                Some(format!(
+                    "You told me your {} is {}.",
+                    m.relation_to_speaker.unwrap_or_default(),
+                    m.name
+                ))
             }
             "ask_about_person" => {
                 let target = u
@@ -1075,6 +1140,9 @@ impl Session {
                 "I'm Glydi, the robot at the door. I remember people, and who they come with."
                     .to_owned()
             }),
+            "ask_about_me" if let Some(l) = self.plural_relation_answer(text, me.as_ref()) => {
+                Some(l)
+            }
             "ask_about_me" => Some(match (&me, &my_name) {
                 // A specific question ("what is my favourite colour?"):
                 // answer just that, from the fact that matches it best.
@@ -1333,7 +1401,7 @@ impl Session {
     /// Store every relation the utterance gave; the confirmation line for
     /// the first, if any.
     fn store_relations(
-        &self,
+        &mut self,
         me: Option<&EntityId>,
         u: &Understanding,
         text: &str,
@@ -1374,8 +1442,13 @@ impl Session {
             };
             // `m` is `r` of me, so I am `r.inverse()` of `m`.
             let mine = r.inverse();
-            self.facts
-                .relate_people(me, &mine, &m.name, text, u.confidence.max(0.5));
+            if let Some(other) =
+                self.facts
+                    .relate_people(me, &mine, &m.name, text, u.confidence.max(0.5))
+            {
+                // "she", "he" next point at them.
+                self.visit.refer(other, &m.name);
+            }
             // The word itself ("son", not just "child"), on them.
             if let (Some(other), Some(my)) =
                 (self.facts.resolve_name(&m.name), self.facts.name_of(me))
@@ -3103,6 +3176,115 @@ mod tests {
             "{l}"
         );
         assert!(l.contains("nervous"), "{l}");
+    }
+
+    /// Eval round 0 misses (cases.jsonl), rules only: what each sequence
+    /// must say last.
+    #[tokio::test]
+    async fn eval_round0_sequences() {
+        let mut bad = Vec::new();
+        for (turns, want, not) in [
+            (
+                &[
+                    "this is my daughter Diya",
+                    "she started dancing classes",
+                    "how is she doing?",
+                ][..],
+                "Diya",
+                "Who do you mean",
+            ),
+            (
+                &["I'm Ravi", "my son is Aarav", "did he come in today?"][..],
+                "Aarav",
+                "don't know he",
+            ),
+            (
+                &[
+                    "I'm Ravi",
+                    "my wife Pooja works at the hospital",
+                    "who is she?",
+                ][..],
+                "Pooja",
+                "Who do you mean",
+            ),
+            (
+                &["I'm Asha, Diya's mother", "has my daughter come in?"][..],
+                "Diya",
+                "how's she",
+            ),
+            (
+                &["my brother Vikram studies here too", "where is my brother?"][..],
+                "Vikram",
+                "don't know",
+            ),
+            (
+                &[
+                    "I'm Aryan",
+                    "my favourite sport is cricket",
+                    "no wait, now I like football more",
+                    "what's my favourite sport?",
+                ][..],
+                "football",
+                "cricket",
+            ),
+            (
+                &[
+                    "I'm Kamala",
+                    "I work at Infosys",
+                    "I don't work there any more",
+                    "where do I work?",
+                ][..],
+                "",
+                "Infosys",
+            ),
+            (
+                &[
+                    "I'm Asha",
+                    "my son Aditya is in class four",
+                    "and my daughter Diya is in class one",
+                    "what are my children called?",
+                ][..],
+                "Diya",
+                "haven't",
+            ),
+            (
+                &["hi, this is Mr Iyer from the transport office"][..],
+                "Iyer",
+                "what's your name",
+            ),
+            (
+                &["I'm the new security guard, Bhim Singh"][..],
+                "Bhim",
+                "What's your name",
+            ),
+            (
+                &[
+                    "I'm Raju",
+                    "no no, my name is Rahul not Raju",
+                    "what's my name?",
+                ][..],
+                "Rahul",
+                "Raju",
+            ),
+            (
+                &["actually call me Prakash ji"][..],
+                "Prakash",
+                "What's your name",
+            ),
+            (&["you can call me Gopal"][..], "Gopal", "What's your name"),
+            (&["who else came today?"][..], "can't share", "front desk"),
+        ] {
+            let mut r = rig(vec![]);
+            let mut last = String::new();
+            for t in turns {
+                let sp = r.s.current_person.as_ref().map(|(i, _)| i.clone());
+                last = r.say(t, sp.as_ref()).await;
+            }
+            if !last.contains(want) || last.contains(not) {
+                bad.push(format!("{turns:?} -> {last:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     fn json(intent: &str, people: &str, facts: &str) -> String {
